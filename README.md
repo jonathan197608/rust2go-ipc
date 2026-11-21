@@ -64,9 +64,9 @@ If the connection drops, the reactor clears pending entries, restarts the Go ser
 
 ## Limitations
 
-- Transport is selected by compile target: UDS on Unix, TCP loopback elsewhere (override with `RUST2GO_IPC_TRANSPORT` / `RUST2GO_IPC_ENDPOINT`).
+- Transport is selected by compile target: UDS on Unix, TCP loopback elsewhere (override from the Rust side with `RUST2GO_IPC_TRANSPORT_OVERRIDE` / `RUST2GO_IPC_ENDPOINT_OVERRIDE`; the unsuffixed `RUST2GO_IPC_TRANSPORT` / `RUST2GO_IPC_ENDPOINT` variables are forwarded to the Go child).
 - Request/response payloads are capped at 64 MiB. Go responses over the cap are converted to error status.
-- `i128`/`u128` and nested lists are intentionally unsupported and fail at build time with an explicit message.
+- `i128`/`u128`, nested lists, and lists of empty structs are intentionally unsupported and fail at build time with an explicit message (an empty struct occupies zero wire bytes, so a non-empty list cannot round-trip).
 - The Rust process kills and reaps the Go child on normal exit via an atexit hook. A `SIGKILL`-style hard kill cannot be covered.
 - The Go server may still use cgo for unrelated business dependencies. This crate only removes cgo from the rust2go call path.
 

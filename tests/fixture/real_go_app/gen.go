@@ -105,10 +105,12 @@ func newPrimList[T any](r ListRef) []T {
 	if n <= 0 {
 		return nil
 	}
-	var zero T
-	sz := int(unsafe.Sizeof(zero))
-	src := unsafe.Slice((*byte)(r.ptr), n*sz)
-	return decodePrims[T](src, n)
+	// primList already decoded the little-endian wire bytes into a native,
+	// aligned []T. Decode again would be an identity on little-endian hosts
+	// but would byte-swap values on big-endian targets. Just copy the decoded
+	// elements.
+	src := unsafe.Slice((*T)(r.ptr), n)
+	return append([]T(nil), src...)
 }
 
 func newStringList(r ListRef) []string {
@@ -251,7 +253,11 @@ func primList[T any](d *dec) ListRef {
 }
 func stringList(d *dec) ListRef {
 	n := int(d.u64())
-	if n < 0 || n > (len(d.b)-d.p)/int(unsafe.Sizeof(StringRef{})) {
+	// A wire string is [u64 length][bytes]: minimum width is 8, not the
+	// 16-byte in-memory size of StringRef. Using the latter rejects valid
+	// lists of short strings.
+	const minStringWire = 8
+	if n < 0 || n > (len(d.b)-d.p)/minStringWire {
 		d.err = true
 		panic("rust2go-ipc: string list len out of bounds")
 	}
@@ -804,7 +810,7 @@ func restoreEmptyRequestRef(d *dec) EmptyRequestRef {
 
 func EmptyRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(EmptyRequestRef{}))
+	size := 0
 	if size == 0 {
 		size = 1
 	}
@@ -856,7 +862,7 @@ func restoreHashRequestRef(d *dec) HashRequestRef {
 
 func HashRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(HashRequestRef{}))
+	size := 8
 	if size == 0 {
 		size = 1
 	}
@@ -914,7 +920,7 @@ func restoreEsRequestRef(d *dec) EsRequestRef {
 
 func EsRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(EsRequestRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -969,7 +975,7 @@ func restoreUIMRequestRef(d *dec) UIMRequestRef {
 
 func UIMRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(UIMRequestRef{}))
+	size := 16
 	if size == 0 {
 		size = 1
 	}
@@ -1033,7 +1039,7 @@ func restoreTextRequestRef(d *dec) TextRequestRef {
 
 func TextRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(TextRequestRef{}))
+	size := 40
 	if size == 0 {
 		size = 1
 	}
@@ -1088,7 +1094,7 @@ func restoreAddressRequestRef(d *dec) AddressRequestRef {
 
 func AddressRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(AddressRequestRef{}))
+	size := 16
 	if size == 0 {
 		size = 1
 	}
@@ -1143,7 +1149,7 @@ func restoreLabelRequestRef(d *dec) LabelRequestRef {
 
 func LabelRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(LabelRequestRef{}))
+	size := 16
 	if size == 0 {
 		size = 1
 	}
@@ -1210,7 +1216,7 @@ func restoreImageRequestRef(d *dec) ImageRequestRef {
 
 func ImageRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(ImageRequestRef{}))
+	size := 48
 	if size == 0 {
 		size = 1
 	}
@@ -1280,7 +1286,7 @@ func restoreCoverRequestRef(d *dec) CoverRequestRef {
 
 func CoverRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(CoverRequestRef{}))
+	size := 56
 	if size == 0 {
 		size = 1
 	}
@@ -1341,7 +1347,7 @@ func restoreCloudRequestRef(d *dec) CloudRequestRef {
 
 func CloudRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(CloudRequestRef{}))
+	size := 32
 	if size == 0 {
 		size = 1
 	}
@@ -1399,7 +1405,7 @@ func restoreQYWXRequestRef(d *dec) QYWXRequestRef {
 
 func QYWXRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(QYWXRequestRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -1466,7 +1472,7 @@ func restoreFunc014RequestRef(d *dec) Func014RequestRef {
 
 func Func014RequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(Func014RequestRef{}))
+	size := 40
 	if size == 0 {
 		size = 1
 	}
@@ -1530,7 +1536,7 @@ func restoreFunc015RequestRef(d *dec) Func015RequestRef {
 
 func Func015RequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(Func015RequestRef{}))
+	size := 32
 	if size == 0 {
 		size = 1
 	}
@@ -1591,7 +1597,7 @@ func restoreFunc019RequestRef(d *dec) Func019RequestRef {
 
 func Func019RequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(Func019RequestRef{}))
+	size := 32
 	if size == 0 {
 		size = 1
 	}
@@ -1667,7 +1673,7 @@ func restoreFunc157RequestRef(d *dec) Func157RequestRef {
 
 func Func157RequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(Func157RequestRef{}))
+	size := 72
 	if size == 0 {
 		size = 1
 	}
@@ -1803,7 +1809,7 @@ func restoreFunc614RequestRef(d *dec) Func614RequestRef {
 
 func Func614RequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(Func614RequestRef{}))
+	size := 232
 	if size == 0 {
 		size = 1
 	}
@@ -1870,7 +1876,7 @@ func restoreSMSRequestRef(d *dec) SMSRequestRef {
 
 func SMSRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(SMSRequestRef{}))
+	size := 48
 	if size == 0 {
 		size = 1
 	}
@@ -1928,7 +1934,7 @@ func restoreReceiptRequestRef(d *dec) ReceiptRequestRef {
 
 func ReceiptRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(ReceiptRequestRef{}))
+	size := 16
 	if size == 0 {
 		size = 1
 	}
@@ -1989,7 +1995,7 @@ func restoreFunctionRequestRef(d *dec) FunctionRequestRef {
 
 func FunctionRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(FunctionRequestRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -2056,7 +2062,7 @@ func restoreTouchRequestRef(d *dec) TouchRequestRef {
 
 func TouchRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(TouchRequestRef{}))
+	size := 32
 	if size == 0 {
 		size = 1
 	}
@@ -2129,7 +2135,7 @@ func restoreBillRequestRef(d *dec) BillRequestRef {
 
 func BillRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(BillRequestRef{}))
+	size := 64
 	if size == 0 {
 		size = 1
 	}
@@ -2190,7 +2196,7 @@ func restoreCommonResponseRef(d *dec) CommonResponseRef {
 
 func CommonResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(CommonResponseRef{}))
+	size := 17
 	if size == 0 {
 		size = 1
 	}
@@ -2242,7 +2248,7 @@ func restoreHashResponseRef(d *dec) HashResponseRef {
 
 func HashResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(HashResponseRef{}))
+	size := 8
 	if size == 0 {
 		size = 1
 	}
@@ -2300,7 +2306,7 @@ func restoreReceiptResponseRef(d *dec) ReceiptResponseRef {
 
 func ReceiptResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(ReceiptResponseRef{}))
+	size := 16
 	if size == 0 {
 		size = 1
 	}
@@ -2364,7 +2370,7 @@ func restoreAddressResponseRef(d *dec) AddressResponseRef {
 
 func AddressResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(AddressResponseRef{}))
+	size := 40
 	if size == 0 {
 		size = 1
 	}
@@ -2425,7 +2431,7 @@ func restoreAddressLabelRef(d *dec) AddressLabelRef {
 
 func AddressLabelListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(AddressLabelRef{}))
+	size := 28
 	if size == 0 {
 		size = 1
 	}
@@ -2486,7 +2492,7 @@ func restoreLabelResponseRef(d *dec) LabelResponseRef {
 
 func LabelResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(LabelResponseRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -2538,7 +2544,7 @@ func restoreOrderResponseRef(d *dec) OrderResponseRef {
 
 func OrderResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(OrderResponseRef{}))
+	size := 8
 	if size == 0 {
 		size = 1
 	}
@@ -2596,7 +2602,7 @@ func restoreFuncResultRef(d *dec) FuncResultRef {
 
 func FuncResultListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(FuncResultRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -2651,7 +2657,7 @@ func restoreRowResultRef(d *dec) RowResultRef {
 
 func RowResultListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(RowResultRef{}))
+	size := 8
 	if size == 0 {
 		size = 1
 	}
@@ -2712,7 +2718,7 @@ func restoreEOPResponseRef(d *dec) EOPResponseRef {
 
 func EOPResponseListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(EOPResponseRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -2773,7 +2779,7 @@ func restoreFileRequestRef(d *dec) FileRequestRef {
 
 func FileRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(FileRequestRef{}))
+	size := 32
 	if size == 0 {
 		size = 1
 	}
@@ -2834,7 +2840,7 @@ func restoreDeleteFileRequestRef(d *dec) DeleteFileRequestRef {
 
 func DeleteFileRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(DeleteFileRequestRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}
@@ -2889,7 +2895,7 @@ func restoreFileNameAndPathRef(d *dec) FileNameAndPathRef {
 
 func FileNameAndPathListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(FileNameAndPathRef{}))
+	size := 16
 	if size == 0 {
 		size = 1
 	}
@@ -2950,7 +2956,7 @@ func restoreOrderAuditRequestRef(d *dec) OrderAuditRequestRef {
 
 func OrderAuditRequestListRef(d *dec) ListRef {
 	cnt := int(d.u64())
-	size := int(unsafe.Sizeof(OrderAuditRequestRef{}))
+	size := 24
 	if size == 0 {
 		size = 1
 	}

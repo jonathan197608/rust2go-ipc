@@ -105,10 +105,12 @@ func newPrimList[T any](r ListRef) []T {
 	if n <= 0 {
 		return nil
 	}
-	var zero T
-	sz := int(unsafe.Sizeof(zero))
-	src := unsafe.Slice((*byte)(r.ptr), n*sz)
-	return decodePrims[T](src, n)
+	// primList already decoded the little-endian wire bytes into a native,
+	// aligned []T. Decode again would be an identity on little-endian hosts
+	// but would byte-swap values on big-endian targets. Just copy the decoded
+	// elements.
+	src := unsafe.Slice((*T)(r.ptr), n)
+	return append([]T(nil), src...)
 }
 
 func newStringList(r ListRef) []string {
@@ -251,7 +253,11 @@ func primList[T any](d *dec) ListRef {
 }
 func stringList(d *dec) ListRef {
 	n := int(d.u64())
-	if n < 0 || n > (len(d.b)-d.p)/int(unsafe.Sizeof(StringRef{})) {
+	// A wire string is [u64 length][bytes]: minimum width is 8, not the
+	// 16-byte in-memory size of StringRef. Using the latter rejects valid
+	// lists of short strings.
+	const minStringWire = 8
+	if n < 0 || n > (len(d.b)-d.p)/minStringWire {
 		d.err = true
 		panic("rust2go-ipc: string list len out of bounds")
 	}

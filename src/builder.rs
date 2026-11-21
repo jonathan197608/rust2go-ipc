@@ -386,6 +386,7 @@ fn parse_schema(src: &str) -> Schema {
             continue;
         }
         let trait_name = t.ident.to_string();
+        validate_ident(&trait_name, "trait");
         if !schema.traits.contains(&trait_name) {
             schema.traits.push(trait_name.clone());
         }
@@ -435,7 +436,7 @@ fn parse_schema(src: &str) -> Schema {
 
     for st in &schema.structs {
         validate_ident(&st.name, "struct");
-        if st.name == "StringRef" || st.name == "ListRef" {
+        if matches!(st.name.as_str(), "StringRef" | "ListRef" | "enc" | "dec") {
             panic!(
                 "rust2go-ipc: struct name {} conflicts with generated aliases",
                 st.name
@@ -447,6 +448,42 @@ fn parse_schema(src: &str) -> Schema {
             check_supported(&kind, &format!("{}.{}", st.name, f.name), &struct_names);
         }
     }
+    // A list of zero-width structs cannot round-trip: each element occupies no
+    // wire bytes, so a non-empty list is indistinguishable from an empty one
+    // and the count bound rejects every value. Fail at build time with a clear
+    // message instead of a confusing runtime "list length out of bounds".
+    let empty_structs: HashSet<String> = schema
+        .structs
+        .iter()
+        .filter(|s| s.fields.is_empty())
+        .map(|s| s.name.clone())
+        .collect();
+    if !empty_structs.is_empty() {
+        let check = |kind: &FieldKind, ctx: &str| {
+            if let FieldKind::List(elem) = kind {
+                if let FieldKind::Custom(n) = &**elem {
+                    assert!(
+                        !empty_structs.contains(n),
+                        "rust2go-ipc: list of empty struct {n} at {ctx} is not wire-encodable"
+                    );
+                }
+            }
+        };
+        for st in &schema.structs {
+            for f in &st.fields {
+                check(&classify(&f.ty), &format!("{}.{}", st.name, f.name));
+            }
+        }
+        for m in &schema.methods {
+            for p in &m.params {
+                check(&classify(&p.ty), &format!("{}.{}", m.trait_name, p.name));
+            }
+            if let Some(ty) = &m.resp {
+                check(&classify(ty), &format!("{} return", m.trait_name));
+            }
+        }
+    }
+
     for m in &schema.methods {
         for p in &m.params {
             let kind = classify(&p.ty);
@@ -782,7 +819,11 @@ fn restore_expr(ty: &Type, widths: &std::collections::HashMap<String, usize>) ->
             }
             FieldKind::String => quote! {
                 {
-                    let n = dec.list_len_of::<::rust2go::ipc::RawStringRef>();
+                    // A wire string is [u64 length][bytes], so the minimum
+                    // encoded width is 8 (empty string) — not the 16-byte
+                    // in-memory size of RawStringRef. Using the latter would
+                    // reject valid lists of short strings.
+                    let n = dec.list_len_min(8);
                     let mut items = Vec::with_capacity(n);
                     for _ in 0..n {
                         items.push(dec.string());
@@ -879,8 +920,10 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
 
     for m in &schema.methods {
         let stub = format_ident!("C{}_{}", m.trait_name, m.name);
-        let tramp = format_ident!("__r2g_trampoline_{}", m.name);
-        let cleanup = format_ident!("__r2g_cleanup_{}", m.name);
+        // Include the trait in helper names: two #[r2g] traits may define
+        // methods with the same name (method_id is global, symbols are not).
+        let tramp = format_ident!("__r2g_trampoline_{}_{}", m.trait_name, m.name);
+        let cleanup = format_ident!("__r2g_cleanup_{}_{}", m.trait_name, m.name);
         let method_id = m.index;
         let param_decls: Vec<TokenStream> = m
             .params
@@ -1134,7 +1177,7 @@ fn go_restore_expr(
 
 fn go_owned_expr(ty: &Type, var: &str) -> String {
     match classify(ty) {
-        FieldKind::Custom(_) => var.to_string(),
+        FieldKind::Custom(n) => format!("new{}({})", n, var),
         FieldKind::String => format!("newString({var})"),
         FieldKind::List(elem) => match *elem {
             FieldKind::Primitive(_) => {
@@ -1223,10 +1266,12 @@ func newPrimList[T any](r ListRef) []T {
 	if n <= 0 {
 		return nil
 	}
-	var zero T
-	sz := int(unsafe.Sizeof(zero))
-	src := unsafe.Slice((*byte)(r.ptr), n*sz)
-	return decodePrims[T](src, n)
+	// primList already decoded the little-endian wire bytes into a native,
+	// aligned []T. Decode again would be an identity on little-endian hosts
+	// but would byte-swap values on big-endian targets. Just copy the decoded
+	// elements.
+	src := unsafe.Slice((*T)(r.ptr), n)
+	return append([]T(nil), src...)
 }
 
 func newStringList(r ListRef) []string {
@@ -1365,7 +1410,11 @@ func primList[T any](d *dec) ListRef {
 }
 func stringList(d *dec) ListRef {
 	n := int(d.u64())
-	if n < 0 || n > (len(d.b)-d.p)/int(unsafe.Sizeof(StringRef{})) {
+	// A wire string is [u64 length][bytes]: minimum width is 8, not the
+	// 16-byte in-memory size of StringRef. Using the latter rejects valid
+	// lists of short strings.
+	const minStringWire = 8
+	if n < 0 || n > (len(d.b)-d.p)/minStringWire {
 		d.err = true
 		panic("rust2go-ipc: string list len out of bounds")
 	}
@@ -1523,14 +1572,14 @@ func stringList(d *dec) ListRef {
         for (i, p) in m.params.iter().enumerate() {
             let var = format!("_a{i}");
             let ref_var = format!("_r{i}");
-            let ref_ty = go_ref_type(&p.ty);
-            let restore = if matches!(classify(&p.ty), FieldKind::Custom(_)) {
-                format!("restore{}Ref(d)", ref_ty.trim_end_matches("Ref"))
+            let kind = classify(&p.ty);
+            let restore = if let FieldKind::Custom(n) = &kind {
+                format!("restore{n}Ref(d)")
             } else {
                 format!("restoreTop{}(d)", top_name(&p.ty))
             };
-            let owned = if matches!(classify(&p.ty), FieldKind::Custom(_)) {
-                format!("new{}({ref_var})", ref_ty.trim_end_matches("Ref"))
+            let owned = if let FieldKind::Custom(n) = &kind {
+                format!("new{n}({ref_var})")
             } else {
                 format!("newTop{}({ref_var})", top_name(&p.ty))
             };
@@ -1734,83 +1783,5 @@ func serve(conn net.Conn) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EDGE_SCHEMA: &str = r#"
-#[derive(r2g::R2G, Default)]
-pub struct Empty {}
-
-#[derive(R2G, Default)]
-pub struct Req {
-    pub text: String,
-    pub flags: Vec<bool>,
-    pub scalar: char,
-}
-
-#[derive(R2G, Default)]
-pub struct Resp {
-    pub ok: bool,
-}
-
-#[r2g]
-pub trait First {
-    fn zero() -> Resp;
-    fn multi(a: Req, b: i32) -> Resp;
-    fn scalar(name: String) -> String;
-    #[go_pass_struct]
-    fn byval(req: Req);
-}
-
-#[r2g]
-pub trait Second {
-    fn other(req: Req) -> Vec<u8>;
-    async fn async_one(req: Req) -> Resp;
-}
-"#;
-
-    #[test]
-    fn edge_schema_generates_valid_rust_and_go() {
-        let schema = parse_schema(EDGE_SCHEMA);
-        assert_eq!(schema.methods.len(), 6);
-        assert_eq!(
-            schema.traits,
-            vec!["First".to_string(), "Second".to_string()]
-        );
-        let ids: Vec<u32> = schema.methods.iter().map(|m| m.index).collect();
-        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
-        assert!(!schema.methods.iter().any(|m| m.go_ptr && m.name == "byval"));
-
-        let rust = generate_rust_bindings(&schema, 1234).to_string();
-        syn::parse_file(&rust).expect("generated Rust must parse");
-        assert!(rust.contains("CFirst_zero"));
-        assert!(rust.contains("CSecond_other"));
-        assert!(rust.contains("SlotWriter"));
-
-        let go = generate_go_sources(&schema);
-        assert!(go.contains("var FirstImpl First"));
-        assert!(go.contains("var SecondImpl Second"));
-        assert!(go.contains("primList[bool]"));
-        assert!(go.contains("func dispatch("));
-
-        if let Some(gofmt) = find_gofmt() {
-            let path = std::env::temp_dir().join(format!(
-                "rust2go-ipc-edge-{}-{}.go",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::write(&path, &go).unwrap();
-            let status = Command::new(gofmt).arg("-e").arg(&path).output();
-            let _ = fs::remove_file(&path);
-            let status = status.expect("cannot run gofmt");
-            assert!(
-                status.status.success(),
-                "generated Go failed gofmt parse: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
-        }
-    }
-}
+#[path = "builder_tests.rs"]
+mod tests;
