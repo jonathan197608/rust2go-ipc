@@ -18,7 +18,7 @@ use std::{
     ptr::null,
     slice::from_raw_parts,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         Mutex, Once, OnceLock,
     },
     thread::{self, sleep},
@@ -26,11 +26,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(unix)]
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::id as process_id;
 
@@ -46,7 +42,6 @@ const DEFAULT_SYNC_TIMEOUT: u64 = 30;
 const ENV_SERVER_OVERRIDE: &str = "RUST2GO_IPC_SERVER_OVERRIDE";
 const ENV_SYNC_TIMEOUT: &str = "RUST2GO_IPC_SYNC_TIMEOUT_SECS";
 const ENV_ENDPOINT_OVERRIDE: &str = "RUST2GO_IPC_ENDPOINT_OVERRIDE";
-const ENV_TRANSPORT_OVERRIDE: &str = "RUST2GO_IPC_TRANSPORT_OVERRIDE";
 const ENV_PORT_OVERRIDE: &str = "RUST2GO_IPC_PORT_OVERRIDE";
 
 /// Transport is chosen from the compile target, not from runtime probing:
@@ -99,32 +94,34 @@ fn sync_timeout_secs() -> u64 {
 }
 
 /// Resolve the endpoint shared by the Rust client and the Go server.
-/// Overrides: full endpoint (plus optional transport), or just the port.
+/// Overrides: full endpoint, or just the port.
+///
+/// Transport is fixed by the compile target and cannot be overridden: on Unix
+/// it is always UDS. A TCP loopback listener accepts any local process with no
+/// peer authentication, whereas a UDS node can be chmod-restricted to the
+/// owning uid (the generated Go server does exactly that). Allowing an override
+/// back to TCP would silently reopen that attack surface, so it is removed.
 fn resolve_endpoint(port: u16) -> Endpoint {
+    let transport = default_transport();
     if let Some(addr) = env_nonempty(ENV_ENDPOINT_OVERRIDE) {
-        let transport = match env_nonempty(ENV_TRANSPORT_OVERRIDE).as_deref() {
-            Some("tcp") => Transport::Tcp,
-            #[cfg(unix)]
-            Some("unix") => Transport::Unix,
-            _ => default_transport(),
-        };
         return Endpoint { transport, addr };
     }
-    match default_transport() {
+    match transport {
         #[cfg(unix)]
         Transport::Unix => {
-            let mut path =
-                env::temp_dir().join(format!("rust2go-ipc-{}-{}.sock", process_id(), port));
+            let path = env::temp_dir().join(format!("rust2go-ipc-{}-{}.sock", process_id(), port));
             // sockaddr_un.sun_path is ~108 bytes on Linux / 104 on macOS.
-            // Long TMPDIR paths (common in CI) would fail to bind. Measure the
-            // real OS bytes, not a lossy UTF-8 replacement (which inflates
-            // non-UTF-8 bytes to 3 and mis-triggers the fallback).
-            if path.as_os_str().as_bytes().len() >= 100 {
-                path = PathBuf::from(format!("/tmp/rust2go-ipc-{}-{}.sock", process_id(), port));
+            // Measure the exact string handed to both sides: Rust connects with
+            // this `String` and Go measures `len(endpoint)`. Checking raw OS
+            // bytes here (before to_string_lossy) would disagree with Go for
+            // non-UTF-8 TMPDIR paths and let an over-long path reach bind().
+            let mut addr = path.to_string_lossy().into_owned();
+            if addr.len() >= 100 {
+                addr = format!("/tmp/rust2go-ipc-{}-{}.sock", process_id(), port);
             }
             Endpoint {
                 transport: Transport::Unix,
-                addr: path.to_string_lossy().into_owned(),
+                addr,
             }
         }
         Transport::Tcp => Endpoint {
@@ -388,12 +385,17 @@ static ATEXIT: Once = Once::new();
 /// Set by the atexit hook before reaping the child. `reconnect` checks it so a
 /// concurrent reactor restart cannot spawn a fresh child that outlives exit.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// The child's pid, recorded at spawn time (before `RUNTIME` is populated) so
+/// the atexit hook can still kill it during the OnceLock initialization window.
+/// 0 means either no child yet or already reaped.
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// Serialises child reap/spawn between the atexit hook and the reactor so a
 /// newly spawned child can never slip in after the hook has already reaped.
 static CHILD_MGMT: Mutex<()> = Mutex::new(());
 
 /// Kill and reap the child, then close the pipe held by the runtime.
 fn reap_child(rt: &Runtime) {
+    CHILD_PID.store(0, Ordering::SeqCst);
     if let Some(mut child) = lock_or_recover(&rt.child).take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -407,13 +409,34 @@ extern "C" fn cleanup_on_exit() {
     let _mgmt = lock_or_recover(&CHILD_MGMT);
     if let Some(rt) = RUNTIME.get() {
         reap_child(rt);
+    } else {
+        // Initialization window: spawn already happened inside the OnceLock
+        // closure but RUNTIME is not published yet, so reap_child has no
+        // handle to work with. On Unix, kill by the pid recorded at spawn time;
+        // the process is exiting anyway, so the kernel reaps the orphan and the
+        // Go side removes any stale socket on its next start. Windows has no
+        // libc kill API and this window is microseconds wide, so the normal
+        // (RUNTIME-published) reap path is the guarantee there.
+        #[cfg(unix)]
+        {
+            let pid = CHILD_PID.swap(0, Ordering::SeqCst);
+            if pid > 0 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            CHILD_PID.store(0, Ordering::SeqCst);
+        }
     }
 }
 
 /// Spawn the Go server once and start the reactor. `server` is the path to the
 /// compiled Go IPC binary; `port` was reserved by the build script.
 fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
-    Command::new(server)
+    let child = Command::new(server)
         .env("RUST2GO_IPC_PORT", port.to_string())
         .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
         .env("RUST2GO_IPC_ENDPOINT", &endpoint.addr)
@@ -424,7 +447,11 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"))
+        .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"));
+    // Record the pid immediately, before the caller stores the Child handle,
+    // so atexit can still kill it during the OnceLock initialization window.
+    CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+    child
 }
 
 /// Recover a Mutex after a panic in a previous holder. A poisoning panic must
@@ -441,6 +468,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
     let server = env_nonempty(ENV_SERVER_OVERRIDE).unwrap_or_else(|| server.to_string());
     let port = env_nonempty(ENV_PORT_OVERRIDE)
         .and_then(|v| v.parse::<u16>().ok())
+        .filter(|v| *v > 0)
         .unwrap_or(port);
     ATEXIT.call_once(|| unsafe {
         let _ = libc::atexit(cleanup_on_exit);

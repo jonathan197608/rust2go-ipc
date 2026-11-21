@@ -52,9 +52,8 @@ Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives 
 | Variable | Purpose |
 |---|---|
 | `RUST2GO_IPC_SERVER_OVERRIDE` | Path to the Go server binary. Use this in stripped runtime images where the build-time `OUT_DIR` path does not exist. |
-| `RUST2GO_IPC_PORT_OVERRIDE` | Loopback port override. Both sides must agree; the value is forwarded to the child process. |
-| `RUST2GO_IPC_TRANSPORT_OVERRIDE` | Force `tcp` or `unix` regardless of compile target. |
-| `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint (port or socket path). Both sides must agree. |
+| `RUST2GO_IPC_PORT_OVERRIDE` | Loopback port override (`0` is rejected). Both sides must agree; forwarded to the child process. Ignored on Unix, where the endpoint is a UDS path. |
+| `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint: socket path on Unix, `host:port` elsewhere. Both sides must agree. |
 | `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. `0` is rejected. |
 | `RUST2GO_IPC_SYNC_TIMEOUT_SECS` | Response deadline for synchronous calls, in seconds. Default `30`, independent of the async pending TTL. `0` is rejected. |
 | `RUST2GO_IPC_MAX_CONCURRENCY` | Max in-flight Go handlers per server. Default `NumCPU*4` (min 16). Lower it to bound downstream load; the read loop applies back-pressure when full. |
@@ -67,9 +66,20 @@ The generated Go dispatcher recovers handler panics and returns an error status.
 
 If the connection drops, the reactor clears pending entries and rebuilds the socket pair. It restarts the Go child **only if the process has actually exited** (`try_wait` under the child-management lock); a healthy child that merely had an idle connection closed is reused, so in-process state (a one-way `Init`, caches, pools) survives reconnects. In-flight futures rely on caller timeouts. Rust atomic slots remain memory-safe when a late callback observes a dropped reader. A failed request write shuts the connection down immediately so the reactor rebuilds both ends rather than keeping a frame-desynchronised stream.
 
+## Security model
+
+The IPC endpoint is a **local, intra-host trust boundary**, not an authenticated network service. Treat every local process running as the same user as trusted.
+
+- **Unix (UDS)**: the socket node is `chmod 0600` immediately after `Listen`, so only the owning uid (the process that spawned the server) can connect. A different local user cannot reach it. The endpoint path is under the user's `TMPDIR` (falling back to `/tmp` when too long for `sun_path`).
+- **Other platforms (TCP loopback)**: there is **no peer authentication** — any process that can open a loopback connection to the port can dispatch calls. This is acceptable only when the process boundary is itself a trust boundary (e.g. a container, or a single-user host). Do not expose this transport on a multi-tenant host where untrusted local code can reach `127.0.0.1`.
+- Neither transport encrypts payloads; both carry method arguments and return values in plaintext over the local channel.
+- Endpoint path / port overrides are configuration, not a security boundary: anything that can set the parent's environment already controls the process.
+
+If you need isolation from other local users on a non-Unix platform, run the whole application in a container / dedicated user account rather than relying on the IPC layer.
+
 ## Limitations
 
-- Transport is selected by compile target: UDS on Unix, TCP loopback elsewhere (override from the Rust side with `RUST2GO_IPC_TRANSPORT_OVERRIDE` / `RUST2GO_IPC_ENDPOINT_OVERRIDE`; the unsuffixed `RUST2GO_IPC_TRANSPORT` / `RUST2GO_IPC_ENDPOINT` variables are forwarded to the Go child).
+- Transport is fixed by compile target and cannot be overridden: **UDS on Unix, TCP loopback elsewhere**. On Unix the socket node is created with mode `0600`, and the Go server fails closed if it is ever asked to bind TCP. There is no `RUST2GO_IPC_TRANSPORT_OVERRIDE`; the unsuffixed `RUST2GO_IPC_TRANSPORT` / `RUST2GO_IPC_ENDPOINT` variables are forwarded to the Go child for internal use.
 - Request/response payloads are capped at 64 MiB. Go responses over the cap are converted to error status.
 - `i128`/`u128`, nested lists, and lists of empty structs are intentionally unsupported and fail at build time with an explicit message (an empty struct occupies zero wire bytes, so a non-empty list cannot round-trip).
 - The Rust process kills and reaps the Go child on normal exit via an atexit hook. A `SIGKILL`-style hard kill cannot be covered.

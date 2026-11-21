@@ -74,6 +74,12 @@ func main() {
 	if transport == "" {
 		transport = "tcp"
 	}
+	// Fail closed on Unix: this server must never bind a TCP loopback listener
+	// (no peer authentication). The Rust parent always sends "unix" on Unix
+	// targets; reject any other value rather than silently opening TCP.
+	if runtime.GOOS != "windows" && transport != "unix" {
+		panic("rust2go-ipc: tcp transport is not allowed on Unix; UDS only")
+	}
 
 	var ln net.Listener
 	var err error
@@ -84,6 +90,13 @@ func main() {
 		}
 		_ = os.Remove(endpoint)
 		ln, err = net.Listen("unix", endpoint)
+		if err == nil {
+			// net.Listen creates the socket node with 0777 & ^umask (typically
+			// 0755), letting any local user connect and invoke handlers. Restrict
+			// it to the owner so only the process that spawned this server (same
+			// uid) can reach the IPC endpoint.
+			err = os.Chmod(endpoint, 0600)
+		}
 	case "tcp":
 		ln, err = net.Listen("tcp", endpoint)
 	default:

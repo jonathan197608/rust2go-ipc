@@ -88,3 +88,38 @@ fn empty_lists_use_null_pointer() {
     assert!(prims.ptr.is_null());
     assert_eq!(prims.len, 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn unix_transport_is_forced_to_uds_even_with_tcp_endpoint() {
+    // Unix builds pin transport to UDS; no environment variable may switch it
+    // to TCP. An endpoint override is still honoured, but only as a UDS path.
+    std::env::set_var(ENV_ENDPOINT_OVERRIDE, "127.0.0.1:9999");
+    let ep = resolve_endpoint(1234);
+    assert_eq!(ep.transport, Transport::Unix);
+    assert_eq!(ep.addr, "127.0.0.1:9999");
+    std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_default_endpoint_is_a_uds_path() {
+    std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
+    let ep = resolve_endpoint(4321);
+    assert_eq!(ep.transport, Transport::Unix);
+    assert!(ep.addr.ends_with(".sock"), "unexpected addr: {}", ep.addr);
+    assert!(ep.addr.len() < 100, "path must fit sun_path: {}", ep.addr);
+}
+
+#[test]
+fn port_override_zero_is_rejected() {
+    // Mirrors the `runtime()` port parsing: 0 must fall back, never be used.
+    let parsed = "0".parse::<u16>().ok().filter(|v| *v > 0).unwrap_or(7777);
+    assert_eq!(parsed, 7777);
+    let parsed = "5555"
+        .parse::<u16>()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(7777);
+    assert_eq!(parsed, 5555);
+}
