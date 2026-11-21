@@ -808,24 +808,43 @@ fn drop_all_pending(rt: &Runtime) {
     }
 }
 
-/// Re-establish the server and both stream ends. The child handle is stored in
+/// Re-establish the connection: rebuild the socket pair, and restart the Go
+/// child only if it has actually exited. The child handle is stored in
 /// `rt.child` immediately after spawning so a panic in this function can never
 /// orphan it. Returns false only on recoverable connect failures.
 fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
     // All child reap/spawn happens under CHILD_MGMT so the atexit hook cannot
     // interleave: after it sets SHUTTING_DOWN we refuse to spawn a new child.
+    // A dropped connection does NOT imply a dead child — the Go serve loop may
+    // have closed an idle/half-open connection while the process is healthy.
+    // Reaping it here would discard in-process state such as a one-way Init.
+    // Probe under the same lock as reap so the atexit hook cannot reap between
+    // our probe and a spawn decision.
     {
         let _mgmt = lock_or_recover(&CHILD_MGMT);
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return false;
         }
-        reap_child(rt);
-        let child = spawn_server(&rt.server, rt.port, &rt.endpoint);
-        *lock_or_recover(&rt.child) = Some(child);
+        let alive = lock_or_recover(&rt.child)
+            .as_mut()
+            .map(|c| matches!(c.try_wait(), Ok(None)))
+            .unwrap_or(false);
+        if !alive {
+            reap_child(rt);
+            let child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+            *lock_or_recover(&rt.child) = Some(child);
+        }
     }
 
+    // A live child whose endpoint is temporarily unreachable (not listening
+    // yet, socket removed, backlog full) must not trap us in an endless
+    // reconnect. Bound the attempts for this rebuild; on expiry force a
+    // restart so the caller's retry loop re-enters with a fresh child.
+    // Without the bound, switching from "always respawn" to "reuse a live
+    // child" could hang forever on a child that never comes back to listen.
+    let connect_deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        // If the fresh child died before listening, bail out so the caller's
+        // If the child died before listening, bail out so the caller's
         // retry loop re-enters and spawns again (child management stays in one
         // place, under CHILD_MGMT).
         {
@@ -836,6 +855,17 @@ fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
             if !alive || SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return false;
             }
+        }
+        if Instant::now() >= connect_deadline {
+            eprintln!("rust2go-ipc: child alive but not accepting; forcing restart");
+            let _mgmt = lock_or_recover(&CHILD_MGMT);
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return false;
+            }
+            reap_child(rt);
+            let child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+            *lock_or_recover(&rt.child) = Some(child);
+            return false; // caller's loop re-enters and connects to the fresh child
         }
         if let Some(stream) = connect_with_retry(&rt.endpoint, Duration::from_millis(500)) {
             match stream.try_clone() {

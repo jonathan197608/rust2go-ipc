@@ -1816,7 +1816,6 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -1912,10 +1911,6 @@ func main() {
 
 func serve(conn net.Conn) {
 	var writeMu sync.Mutex
-	// in-flight requests on this connection. A slow handler must not have its
-	// connection closed out from under it by the idle read deadline: with
-	// concurrent dispatch the read loop is idle while handlers still run.
-	var inflight atomic.Int64
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 	var once sync.Once
@@ -1940,18 +1935,16 @@ func serve(conn net.Conn) {
 
 	hdr := make([]byte, 22)
 	for {
-		// Set an idle deadline before every read. Setting it only after the
-		// header leaves an absolute deadline that expires on long-idle
-		// connections and makes the Rust side restart the server.
+		// Idle handling: an idle read deadline is a keep-alive tick, not a
+		// reason to close. Closing an idle connection makes the Rust reactor
+		// see EOF and (before the liveness probe) kill + respawn this still
+		// healthy child, discarding in-process state such as a one-way Init.
+		// n == 0 guards against a partial header (a desynced stream), which
+		// must always be closed.
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := io.ReadFull(conn, hdr)
 		if err != nil {
-			// Only a genuine idle timeout with no handler in flight may close
-			// the connection. If a handler is still running, keep waiting: its
-			// response will be written back on this very connection. n == 0
-			// guards against a partial header (a desynced stream), which must
-			// still be closed even if a handler happens to be in flight.
-			if n == 0 && inflight.Load() > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+			if n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
 			return
@@ -1977,17 +1970,23 @@ func serve(conn net.Conn) {
 
 		// Back-pressure: block the read loop once the concurrency cap is
 		// reached, so a burst cannot spawn unbounded goroutines. Acquiring the
-		// slot is cancellable: if the connection is being torn down (e.g. a
-		// handler hit a write error), exit instead of hanging in the acquire.
+		// slot is cancellable two ways: if the connection is torn down (e.g. a
+		// handler hit a write error) `done` fires; if every slot is wedged by a
+		// hung handler the timeout fires. Without the timeout the Rust caller
+		// times out and closes its side, but this serve goroutine would block
+		// forever on the channel (a read deadline does not cover channel ops),
+		// leaking a goroutine. Both paths are bounded. The wait exceeds the
+		// Rust sync timeout (30 s) so normal queuing is not cut short.
 		select {
 		case sem <- struct{}{}:
 		case <-done:
 			return
+		case <-time.After(60 * time.Second):
+			return
 		}
-		inflight.Add(1)
 		wg.Add(1)
 		go func(id uint64, method uint32, body []byte) {
-			defer func() { inflight.Add(-1); wg.Done(); <-sem }()
+			defer func() { wg.Done(); <-sem }()
 			resp, ok := dispatch(method, body)
 			if id == 0 {
 				return

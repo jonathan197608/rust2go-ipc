@@ -181,24 +181,29 @@ fn go_server_dispatches_concurrently_with_bounded_semaphore() {
         "sync import required for writeMu"
     );
 
-    // P1 regression: with concurrent dispatch the read loop is idle while a
-    // handler runs, so a 5-minute read deadline must not close the connection
-    // mid-handler. It must be renewed only while requests are in flight.
+    // P1 regression (seventh audit): an idle read deadline is a keep-alive
+    // tick, NOT a disconnect. Closing an idle connection makes the Rust
+    // reactor see EOF and kill+respawn a still-healthy child, losing in-process
+    // state (e.g. one-way Init). n == 0 still guards partial-header desync.
     assert!(
-        main.contains("inflight.Load() > 0"),
-        "idle timeout must check in-flight handlers before closing"
+        main.contains("n == 0 && errors.Is(err, os.ErrDeadlineExceeded)"),
+        "idle timeout must renew the deadline rather than closing the connection"
+    );
+    assert!(
+        main.contains("continue\n\t\t\t}"),
+        "idle deadline must continue the read loop"
     );
     assert!(
         main.contains("errors.Is(err, os.ErrDeadlineExceeded)"),
         "idle timeout must use errors.Is(os.ErrDeadlineExceeded), not deprecated net.Error.Timeout"
     );
     assert!(
-        main.contains("n == 0 && inflight.Load() > 0"),
-        "partial header (n > 0) must still close even with handlers in flight"
+        !main.contains("inflight"),
+        "in-flight counter is obsolete once idle deadlines always renew"
     );
     assert!(
-        main.contains("\"sync/atomic\""),
-        "sync/atomic import required for in-flight counter"
+        !main.contains("\"sync/atomic\""),
+        "sync/atomic import must be removed with the in-flight counter"
     );
     // Write failure must close the connection so the Rust reactor reconnects;
     // the lock must be released via defer even if writing panics.
@@ -216,6 +221,12 @@ fn go_server_dispatches_concurrently_with_bounded_semaphore() {
     assert!(
         main.contains("case <-done:"),
         "semaphore acquire must be cancellable via done channel"
+    );
+    // HARDEN: a hung handler holding every slot must not leak the blocked
+    // serve goroutine forever after Rust times out and closes its side.
+    assert!(
+        main.contains("case <-time.After(60 * time.Second):"),
+        "semaphore acquire must have a timeout to avoid goroutine leak"
     );
     assert!(
         main.contains("close(done)") && main.contains("sync.Once"),
