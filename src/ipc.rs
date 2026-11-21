@@ -567,7 +567,11 @@ pub unsafe fn dispatch(
     sweep_pending(rt);
     let req_id = next_req_id(rt);
 
-    lock_or_recover(&rt.pending).insert(
+    // Defensive against u64 wraparound: if a recycled id still has a live
+    // pending entry, release its slot before overwriting it. Unreachable in
+    // practice (~1.8e19 calls), but HashMap::insert would otherwise silently
+    // drop the old Pending without running its cleanup.
+    if let Some(old) = lock_or_recover(&rt.pending).insert(
         req_id,
         Pending {
             slot: slot as usize,
@@ -576,7 +580,9 @@ pub unsafe fn dispatch(
             cleanup: handler.cleanup,
             created: Instant::now(),
         },
-    );
+    ) {
+        cleanup_pending(old);
+    }
 
     if !write_frame(rt, req_id, method_id, payload) {
         // The frame never left: no response can arrive. Drop the pending entry

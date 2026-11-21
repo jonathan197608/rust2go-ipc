@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -104,15 +105,49 @@ func main() {
 }
 
 func serve(conn net.Conn) {
-	defer conn.Close()
 	var writeMu sync.Mutex
+	// in-flight requests on this connection. A slow handler must not have its
+	// connection closed out from under it by the idle read deadline: with
+	// concurrent dispatch the read loop is idle while handlers still run.
+	var inflight atomic.Int64
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			_ = conn.Close()
+		})
+	}
+	defer func() {
+		stop()
+		// Give in-flight handlers a bounded chance to finish and release their
+		// semaphore slot. A hung business handler must not block this exit:
+		// the Rust side has its own pending TTL and caller timeout.
+		drained := make(chan struct{})
+		go func() { wg.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
 	hdr := make([]byte, 22)
 	for {
 		// Set an idle deadline before every read. Setting it only after the
 		// header leaves an absolute deadline that expires on long-idle
 		// connections and makes the Rust side restart the server.
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		if _, err := io.ReadFull(conn, hdr); err != nil {
+		n, err := io.ReadFull(conn, hdr)
+		if err != nil {
+			// Only a genuine idle timeout with no handler in flight may close
+			// the connection. If a handler is still running, keep waiting: its
+			// response will be written back on this very connection. n == 0
+			// guards against a partial header (a desynced stream), which must
+			// still be closed even if a handler happens to be in flight.
+			if n == 0 && inflight.Load() > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
 			return
 		}
 		if string(hdr[0:4]) != magic {
@@ -135,10 +170,18 @@ func serve(conn net.Conn) {
 		}
 
 		// Back-pressure: block the read loop once the concurrency cap is
-		// reached, so a burst cannot spawn unbounded goroutines.
-		sem <- struct{}{}
+		// reached, so a burst cannot spawn unbounded goroutines. Acquiring the
+		// slot is cancellable: if the connection is being torn down (e.g. a
+		// handler hit a write error), exit instead of hanging in the acquire.
+		select {
+		case sem <- struct{}{}:
+		case <-done:
+			return
+		}
+		inflight.Add(1)
+		wg.Add(1)
 		go func(id uint64, method uint32, body []byte) {
-			defer func() { <-sem }()
+			defer func() { inflight.Add(-1); wg.Done(); <-sem }()
 			resp, ok := dispatch(method, body)
 			if id == 0 {
 				return
@@ -155,9 +198,15 @@ func serve(conn net.Conn) {
 			out[14] = status
 			binary.LittleEndian.PutUint32(out[15:19], uint32(len(resp)))
 			copy(out[19:], resp)
-			writeMu.Lock()
-			_, _ = conn.Write(out)
-			writeMu.Unlock()
+			func() {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				if _, err := conn.Write(out); err != nil {
+					// The peer is gone; tear down the read loop so the Rust
+					// side reconnects on EOF instead of waiting for idle time.
+					stop()
+				}
+			}()
 		}(reqID, methodID, payload)
 	}
 }

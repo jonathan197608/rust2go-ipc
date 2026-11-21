@@ -180,6 +180,61 @@ fn go_server_dispatches_concurrently_with_bounded_semaphore() {
         main.contains("\"sync\""),
         "sync import required for writeMu"
     );
+
+    // P1 regression: with concurrent dispatch the read loop is idle while a
+    // handler runs, so a 5-minute read deadline must not close the connection
+    // mid-handler. It must be renewed only while requests are in flight.
+    assert!(
+        main.contains("inflight.Load() > 0"),
+        "idle timeout must check in-flight handlers before closing"
+    );
+    assert!(
+        main.contains("errors.Is(err, os.ErrDeadlineExceeded)"),
+        "idle timeout must use errors.Is(os.ErrDeadlineExceeded), not deprecated net.Error.Timeout"
+    );
+    assert!(
+        main.contains("n == 0 && inflight.Load() > 0"),
+        "partial header (n > 0) must still close even with handlers in flight"
+    );
+    assert!(
+        main.contains("\"sync/atomic\""),
+        "sync/atomic import required for in-flight counter"
+    );
+    // Write failure must close the connection so the Rust reactor reconnects;
+    // the lock must be released via defer even if writing panics.
+    assert!(
+        main.contains("if _, err := conn.Write(out); err != nil"),
+        "write errors must be detected"
+    );
+    assert!(
+        main.contains("writeMu.Lock()\n\t\t\t\tdefer writeMu.Unlock()"),
+        "writeMu must be released via defer"
+    );
+
+    // sem acquire must be cancellable: a torn-down connection must not hang
+    // forever blocking on a full semaphore and leak a serve goroutine.
+    assert!(
+        main.contains("case <-done:"),
+        "semaphore acquire must be cancellable via done channel"
+    );
+    assert!(
+        main.contains("close(done)") && main.contains("sync.Once"),
+        "connection teardown must close done exactly once"
+    );
+    // On exit, in-flight handlers must get a bounded chance to release their
+    // semaphore slot, but a hung business handler must not block the exit.
+    assert!(
+        main.contains("var wg sync.WaitGroup") && main.contains("wg.Wait()"),
+        "serve must wait for in-flight handlers on exit"
+    );
+    assert!(
+        main.contains("time.After(2 * time.Second)"),
+        "in-flight drain must be bounded so a hung handler cannot block exit"
+    );
+    assert!(
+        main.contains("wg.Done()"),
+        "each dispatched handler must mark its WaitGroup slot done"
+    );
 }
 
 #[test]
