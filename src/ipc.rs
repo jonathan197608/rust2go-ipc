@@ -166,7 +166,13 @@ impl Write for IpcStream {
 
 /// Signature of a generated response trampoline:
 /// `(payload_ptr, payload_len, slot, cb)`.
-pub type Trampoline = unsafe extern "C" fn(*const u8, usize, *const (), *const ());
+///
+/// `C-unwind` (not `C`) is deliberate: a malformed response can make the
+/// generated restore code panic. With `extern "C"` that panic cannot unwind and
+/// aborts the whole process, which would defeat the reactor's `catch_unwind`.
+/// `C-unwind` lets the panic cross back into the reactor, where it is logged
+/// and the pending entry dropped.
+pub type Trampoline = unsafe extern "C-unwind" fn(*const u8, usize, *const (), *const ());
 
 mod sealed {
     /// Prevents downstream crates from adding wire primitives. Only the
@@ -284,6 +290,14 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"))
 }
 
+/// Recover a Mutex after a panic in a previous holder. A poisoning panic must
+/// never cascade into the reactor (the only recovery mechanism): returning the
+/// inner guard keeps the service alive. All protected state is kept consistent
+/// by the callers even on the error paths.
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -300,8 +314,11 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         .unwrap_or(port);
     let endpoint = resolve_endpoint(port);
     RUNTIME.get_or_init(move || {
-        let child = spawn_server(&server, port, &endpoint);
+        let mut child = spawn_server(&server, port, &endpoint);
         let stream = connect_with_retry(&endpoint, Duration::from_secs(10)).unwrap_or_else(|| {
+            // Reap the child before panicking so a failed start leaves no zombie.
+            let _ = child.kill();
+            let _ = child.wait();
             panic!(
                 "rust2go-ipc: Go server never listened on {} {}",
                 endpoint.transport.as_str(),
@@ -359,10 +376,7 @@ fn sweep_pending(rt: &Runtime) {
     {
         return;
     }
-    let mut pending = rt
-        .pending
-        .lock()
-        .expect("rust2go-ipc: pending lock poisoned");
+    let mut pending = lock_or_recover(&rt.pending);
     let before = pending.len();
     pending.retain(|_, p| p.created.elapsed() < rt.pending_ttl);
     let removed = before - pending.len();
@@ -416,18 +430,15 @@ pub unsafe fn dispatch(
     sweep_pending(rt);
     let req_id = rt.next_id.fetch_add(1, Ordering::Relaxed);
 
-    rt.pending
-        .lock()
-        .expect("rust2go-ipc: pending lock poisoned")
-        .insert(
-            req_id,
-            Pending {
-                slot: slot as usize,
-                cb: cb as usize,
-                trampoline,
-                created: Instant::now(),
-            },
-        );
+    lock_or_recover(&rt.pending).insert(
+        req_id,
+        Pending {
+            slot: slot as usize,
+            cb: cb as usize,
+            trampoline,
+            created: Instant::now(),
+        },
+    );
 
     write_frame(rt, req_id, method_id, payload);
 }
@@ -512,6 +523,11 @@ pub fn dispatch_oneway(server: &str, port: u16, method_id: u32, payload: &[u8]) 
 }
 
 fn build_frame(req_id: u64, method_id: u32, payload: &[u8]) -> Vec<u8> {
+    assert!(
+        payload.len() <= MAX_PAYLOAD,
+        "rust2go-ipc: request payload too large ({})",
+        payload.len()
+    );
     let mut frame = Vec::with_capacity(22 + payload.len());
     frame.extend_from_slice(&MAGIC);
     frame.extend_from_slice(&VERSION.to_le_bytes());
@@ -522,15 +538,17 @@ fn build_frame(req_id: u64, method_id: u32, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Write a request frame. Write/flush failures are logged rather than panicked:
+/// panicking here would poison the writer mutex and (via the reactor's reconnect
+/// path) kill the only recovery thread. The reactor detects the dead connection
+/// through its read side and respawns the server; in-flight futures time out via
+/// the pending TTL.
 fn write_frame(rt: &Runtime, req_id: u64, method_id: u32, payload: &[u8]) {
     let frame = build_frame(req_id, method_id, payload);
-    let mut writer = rt.writer.lock().expect("rust2go-ipc: writer lock poisoned");
-    writer
-        .write_all(&frame)
-        .expect("rust2go-ipc: cannot write request frame");
-    writer
-        .flush()
-        .expect("rust2go-ipc: cannot flush request frame");
+    let mut writer = lock_or_recover(&rt.writer);
+    if let Err(e) = writer.write_all(&frame).and_then(|_| writer.flush()) {
+        eprintln!("rust2go-ipc: cannot write request frame (req {req_id}): {e}");
+    }
 }
 
 fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
@@ -542,11 +560,8 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
                 // In-flight futures stay pending until their caller timeout;
                 // a late response can never reach a stale slot because the
                 // connection is gone.
-                rt.pending
-                    .lock()
-                    .expect("rust2go-ipc: pending lock poisoned")
-                    .clear();
-                if let Some(mut child) = rt.child.lock().expect("child lock poisoned").take() {
+                lock_or_recover(&rt.pending).clear();
+                if let Some(mut child) = lock_or_recover(&rt.child).take() {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
@@ -565,8 +580,8 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
                             reader = stream
                                 .try_clone()
                                 .expect("rust2go-ipc: cannot clone reconnected stream");
-                            *rt.writer.lock().expect("writer lock poisoned") = stream;
-                            *rt.child.lock().expect("child lock poisoned") = Some(child);
+                            *lock_or_recover(&rt.writer) = stream;
+                            *lock_or_recover(&rt.child) = Some(child);
                             break;
                         }
                         None => {
@@ -579,11 +594,7 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
             }
         };
 
-        let pending = rt
-            .pending
-            .lock()
-            .expect("rust2go-ipc: pending lock poisoned")
-            .remove(&req_id);
+        let pending = lock_or_recover(&rt.pending).remove(&req_id);
 
         match pending {
             Some(p) if status == 0 => {
@@ -720,10 +731,29 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// Consume `n` bytes with checked arithmetic and an explicit bounds check.
+    /// Malformed/corrupt frames panic with a clear message instead of wrapping
+    /// an offset or slicing out of range; the reactor's C-unwind trampoline
+    /// turns that panic into a logged, dropped pending entry.
+    fn take(&mut self, n: usize) -> &'a [u8] {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.buf.len())
+            .unwrap_or_else(|| {
+                panic!(
+                    "rust2go-ipc: decode out of bounds (pos {}, need {n}, have {})",
+                    self.pos,
+                    self.buf.len()
+                )
+            });
+        let bytes = &self.buf[self.pos..end];
+        self.pos = end;
+        bytes
+    }
+
     pub fn prim<T: WirePrim>(&mut self) -> T {
-        let n = size_of::<T>();
-        let bytes = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        let bytes = self.take(size_of::<T>());
         T::read(bytes)
     }
 
@@ -735,8 +765,7 @@ impl<'a> Decoder<'a> {
                 len: 0,
             };
         }
-        let bytes = &self.buf[self.pos..self.pos + len];
-        self.pos += len;
+        let bytes = self.take(len);
         let (ptr, len) = self.arena.bytes(bytes);
         RawStringRef { ptr, len }
     }
@@ -746,6 +775,13 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn list_elements<T: WirePrim>(&mut self, n: usize) -> RawListRef {
+        // Bound the element count against the remaining bytes first: a single
+        // corrupt u64 length must not drive an unbounded allocation loop.
+        let max = self.buf.len().saturating_sub(self.pos) / size_of::<T>().max(1);
+        assert!(
+            n <= max,
+            "rust2go-ipc: list length {n} exceeds {max} remaining elements"
+        );
         let items: Vec<T> = (0..n).map(|_| self.prim::<T>()).collect();
         let ptr = self.arena.elements(&items);
         RawListRef {
@@ -763,12 +799,28 @@ impl<'a> Decoder<'a> {
                 len: 0,
             };
         }
-        let nbytes = n * size_of::<T>();
-        let bytes = &self.buf[self.pos..self.pos + nbytes];
-        self.pos += nbytes;
+        let nbytes = n.checked_mul(size_of::<T>()).unwrap_or_else(|| {
+            panic!(
+                "rust2go-ipc: primitive list size overflow ({n} x {})",
+                size_of::<T>()
+            )
+        });
+        let bytes = self.take(nbytes);
+        // Validate bit patterns (bool) before any consumer reads them.
         T::validate(bytes);
-        let ptr = self.arena.bytes(bytes).0 as *const ();
-        RawListRef { ptr, len: n }
+        // Use arena.elements so the allocation is aligned to T. A Box<[u8]>
+        // (align 1) would be UB when the consumer reads it as *const T for
+        // types with alignment > 1 (i64/f64/...). Parse each element through
+        // WirePrim::read so the byte view becomes a real, aligned T array.
+        let width = size_of::<T>();
+        let items: Vec<T> = (0..n)
+            .map(|i| T::read(&bytes[i * width..(i + 1) * width]))
+            .collect();
+        let ptr = self.arena.elements(&items);
+        RawListRef {
+            ptr: ptr as *const (),
+            len: n,
+        }
     }
 
     /// Allocate a restored Ref-element array in the arena, returning a
@@ -786,5 +838,64 @@ impl<'a> Decoder<'a> {
             ptr: ptr as *const (),
             len: n,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::align_of;
+
+    #[test]
+    #[should_panic(expected = "decode out of bounds")]
+    fn decoder_prim_panics_on_truncation() {
+        let mut dec = Decoder::new(&[0x01, 0x02]);
+        let _ = dec.prim::<u64>();
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid bool byte")]
+    fn decoder_rejects_invalid_bool() {
+        let mut dec = Decoder::new(&[0x02]);
+        let _ = dec.prim::<bool>();
+    }
+
+    #[test]
+    fn decoder_accepts_valid_bool() {
+        let mut dec = Decoder::new(&[0x00, 0x01]);
+        assert!(!dec.prim::<bool>());
+        assert!(dec.prim::<bool>());
+    }
+
+    #[test]
+    #[should_panic(expected = "decode out of bounds")]
+    fn decoder_string_rejects_huge_len() {
+        // u64 len = 0xFFFF_FFFF_FFFF_FFFF, no payload follows.
+        let mut dec = Decoder::new(&[0xff; 8]);
+        let _ = dec.string();
+    }
+
+    #[test]
+    fn decoder_prim_list_is_aligned() {
+        // 2 x i64 = 16 bytes. The restored pointer must be 8-byte aligned.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        buf.extend_from_slice(&1i64.to_le_bytes());
+        buf.extend_from_slice(&2i64.to_le_bytes());
+        let mut dec = Decoder::new(&buf);
+        let list = dec.prim_list::<i64>();
+        assert_eq!(list.len, 2);
+        assert_eq!(list.ptr as usize % align_of::<i64>(), 0);
+        // SAFETY: prim_list restored an aligned, owned i64 array in the arena.
+        let vals = unsafe { from_raw_parts(list.ptr as *const i64, list.len) };
+        assert_eq!(vals, &[1i64, 2i64]);
+    }
+
+    #[test]
+    #[should_panic(expected = "list length")]
+    fn decoder_list_elements_rejects_huge_count() {
+        let mut dec = Decoder::new(&[0xff; 8]);
+        // n = u64::MAX elements, no payload -> must be rejected before allocating
+        let _ = dec.list_elements::<u64>(u64::MAX as usize);
     }
 }

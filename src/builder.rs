@@ -581,7 +581,9 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
             let restore = format_ident!("__r2g_restore_{}", resp);
             let tramp = quote! {
                 #[allow(non_snake_case, clippy::missing_safety_doc)]
-                unsafe extern "C" fn #tramp_name(
+                // C-unwind (not C) so a panic from restore can unwind into the
+                // reactor's catch_unwind instead of aborting the process.
+                unsafe extern "C-unwind" fn #tramp_name(
                     payload: *const u8,
                     len: usize,
                     slot: *const (),
@@ -737,7 +739,11 @@ fn go_prim(p: &str) -> String {
         "u128" => "uint64",
         "f32" => "float32",
         "f64" => "float64",
-        "usize" | "isize" => "uint",
+        // usize/isize are pointer-width in Rust (8 bytes on 64-bit targets).
+        // Keep them 8 bytes on the wire and use fixed-width Go types so the
+        // generated Ref fields match the decoder's return type exactly.
+        "usize" => "uint64",
+        "isize" => "int64",
         _ => "uint64",
     };
     ty.to_string()
@@ -853,10 +859,14 @@ fn generate_go_sources(schema: &Schema) -> String {
     s.push_str("\tcase float32:\n\t\te.put(math.Float32bits(x))\n");
     s.push_str("\tcase float64:\n\t\te.put(math.Float64bits(x))\n");
     s.push_str("\tcase string:\n\t\te.put(uint64(len(x))); e.b = append(e.b, x...)\n");
+    s.push_str("\tdefault:\n\t\tpanic(\"rust2go-ipc: unsupported wire type\")\n");
     s.push_str("\t}\n}\n\n");
 
-    s.push_str("type dec struct{ b []byte; p int }\n");
-    s.push_str("func (d *dec) take(n int) []byte { v := d.b[d.p:d.p+n]; d.p += n; return v }\n");
+    s.push_str("type dec struct{ b []byte; p int; err bool }\n");
+    // Bounds-checked take: a corrupt length panics with a Go slice-bounds error,
+    // which dispatch's recover converts to status=1. Critically, we never build
+    // an unsafe.Pointer past the payload, so no SIGSEGV can escape recover.
+    s.push_str("func (d *dec) take(n int) []byte {\n\tif n < 0 || n > len(d.b)-d.p {\n\t\td.err = true\n\t\tpanic(\"rust2go-ipc: decode out of bounds\")\n\t}\n\tv := d.b[d.p : d.p+n]\n\td.p += n\n\treturn v\n}\n");
     s.push_str("func (d *dec) u64() uint64 { return binary.LittleEndian.Uint64(d.take(8)) }\n");
     s.push_str("func (d *dec) i64() int64 { return int64(d.u64()) }\n");
     s.push_str("func (d *dec) u32() uint32 { return binary.LittleEndian.Uint32(d.take(4)) }\n");
@@ -865,12 +875,15 @@ fn generate_go_sources(schema: &Schema) -> String {
     s.push_str("func (d *dec) i16() int16 { return int16(d.u16()) }\n");
     s.push_str("func (d *dec) u8() uint8 { return d.take(1)[0] }\n");
     s.push_str("func (d *dec) i8() int8 { return int8(d.u8()) }\n");
-    s.push_str("func (d *dec) boolean() bool { return d.take(1)[0] != 0 }\n");
+    // Strict bool: non-0/1 is a corrupt frame, not a lenient true.
+    s.push_str("func (d *dec) boolean() bool {\n\tb := d.take(1)[0]\n\tif b > 1 { d.err = true; panic(\"rust2go-ipc: invalid bool byte\") }\n\treturn b == 1\n}\n");
     s.push_str("func (d *dec) f32() float32 { return math.Float32frombits(d.u32()) }\n");
     s.push_str("func (d *dec) f64() float64 { return math.Float64frombits(d.u64()) }\n");
-    s.push_str("func (d *dec) str() StringRef {\n\tn := int(d.u64()); if n == 0 { return StringRef{} }\n\tp := unsafe.Pointer(&d.b[d.p]); d.p += n\n\treturn StringRef{ptr: p, len: uint64(n)}\n}\n");
-    s.push_str("func primList[T any](d *dec) ListRef {\n\tn := int(d.u64()); if n == 0 { return ListRef{} }\n\tvar zero T\n\tp := unsafe.Pointer(&d.b[d.p]); d.p += n * int(unsafe.Sizeof(zero))\n\treturn ListRef{ptr: p, len: uint64(n)}\n}\n");
-    s.push_str("func stringList(d *dec) ListRef {\n\tn := int(d.u64()); if n == 0 { return ListRef{} }\n\tarr := make([]StringRef, n)\n\tfor i := range arr { arr[i] = d.str() }\n\treturn ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}\n}\n\n");
+    // str/primList take() the exact byte span first, so the pointer always
+    // references validated bytes inside the payload.
+    s.push_str("func (d *dec) str() StringRef {\n\tn := int(d.u64())\n\tif n < 0 || n > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: string len out of bounds\") }\n\tif n == 0 { return StringRef{} }\n\tb := d.take(n)\n\treturn StringRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}\n}\n");
+    s.push_str("func primList[T any](d *dec) ListRef {\n\tn := int(d.u64())\n\tif n < 0 { d.err = true; panic(\"rust2go-ipc: negative list len\") }\n\tif n == 0 { return ListRef{} }\n\tvar zero T\n\tsz := int(unsafe.Sizeof(zero))\n\tnbytes := n * sz\n\tif nbytes < 0 || nbytes > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: list len out of bounds\") }\n\tb := d.take(nbytes)\n\treturn ListRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}\n}\n");
+    s.push_str("func stringList(d *dec) ListRef {\n\tn := int(d.u64())\n\tif n < 0 || n > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: string list len out of bounds\") }\n\tif n == 0 { return ListRef{} }\n\tarr := make([]StringRef, n)\n\tfor i := range arr { arr[i] = d.str() }\n\treturn ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}\n}\n\n");
 
     // flatten_<T> (owned -> bytes) and restore_<T>Ref (bytes -> Ref).
     for st in &schema.structs {
@@ -932,6 +945,7 @@ fn generate_go_sources(schema: &Schema) -> String {
                     FieldKind::Custom(ref n) => {
                         s.push_str(&format!("\t\t{}: func() ListRef {{\n", f.name));
                         s.push_str("\t\t\tcnt := int(d.u64())\n");
+                        s.push_str("\t\t\tif cnt < 0 || cnt > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: struct list len out of bounds\") }\n");
                         s.push_str("\t\t\tif cnt == 0 { return ListRef{} }\n");
                         s.push_str(&format!("\t\t\tarr := make([]{}Ref, cnt)\n", n));
                         s.push_str(&format!(
@@ -952,8 +966,10 @@ fn generate_go_sources(schema: &Schema) -> String {
                         "u8" => "d.u8()",
                         "i16" => "d.i16()",
                         "u16" => "d.u16()",
-                        "i32" | "i128" | "isize" => "d.i32()",
-                        "u32" | "u128" | "usize" => "d.u32()",
+                        "i32" | "i128" => "d.i32()",
+                        "u32" | "u128" => "d.u32()",
+                        "isize" => "d.i64()",
+                        "usize" => "d.u64()",
                         "i64" => "d.i64()",
                         "f32" => "d.f32()",
                         "f64" => "d.f64()",
@@ -1029,6 +1045,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 )
 
 const magic = "R2GI"
@@ -1043,7 +1060,11 @@ func main() {
 		if port == "" {
 			panic("RUST2GO_IPC_ENDPOINT / RUST2GO_IPC_PORT not set")
 		}
-		transport = "tcp"
+		// Do not overwrite an explicitly requested transport; only infer tcp
+		// when the caller did not specify one.
+		if transport == "" {
+			transport = "tcp"
+		}
 		endpoint = "127.0.0.1:" + port
 	}
 	if transport == "" {
@@ -1069,7 +1090,13 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			continue
+			// Temporary errors (e.g. EMFILE) should back off rather than spin.
+			// Permanent listener errors let the process exit so Rust respawns it.
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			panic("rust2go-ipc: accept failed: " + err.Error())
 		}
 		go serve(conn)
 	}
@@ -1090,10 +1117,16 @@ func serve(conn net.Conn) {
 		}
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
 		methodID := binary.LittleEndian.Uint32(hdr[14:18])
-		length := int(binary.LittleEndian.Uint32(hdr[18:22]))
-		if length > 64*1024*1024 {
+		// Compare as uint32 before converting to int: on 32-bit targets a value
+		// > 2^31 would wrap negative and bypass the size check.
+		length32 := binary.LittleEndian.Uint32(hdr[18:22])
+		if length32 > 64*1024*1024 {
 			return
 		}
+		length := int(length32)
+		// Bound a half-open connection so a peer that declares a large frame
+		// and stalls cannot pin a goroutine and its buffer forever.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return

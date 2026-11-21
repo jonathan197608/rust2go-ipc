@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 )
 
 const magic = "R2GI"
@@ -20,7 +21,11 @@ func main() {
 		if port == "" {
 			panic("RUST2GO_IPC_ENDPOINT / RUST2GO_IPC_PORT not set")
 		}
-		transport = "tcp"
+		// Do not overwrite an explicitly requested transport; only infer tcp
+		// when the caller did not specify one.
+		if transport == "" {
+			transport = "tcp"
+		}
 		endpoint = "127.0.0.1:" + port
 	}
 	if transport == "" {
@@ -46,7 +51,13 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			continue
+			// Temporary errors (e.g. EMFILE) should back off rather than spin.
+			// Permanent listener errors let the process exit so Rust respawns it.
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			panic("rust2go-ipc: accept failed: " + err.Error())
 		}
 		go serve(conn)
 	}
@@ -67,10 +78,16 @@ func serve(conn net.Conn) {
 		}
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
 		methodID := binary.LittleEndian.Uint32(hdr[14:18])
-		length := int(binary.LittleEndian.Uint32(hdr[18:22]))
-		if length > 64*1024*1024 {
+		// Compare as uint32 before converting to int: on 32-bit targets a value
+		// > 2^31 would wrap negative and bypass the size check.
+		length32 := binary.LittleEndian.Uint32(hdr[18:22])
+		if length32 > 64*1024*1024 {
 			return
 		}
+		length := int(length32)
+		// Bound a half-open connection so a peer that declares a large frame
+		// and stalls cannot pin a goroutine and its buffer forever.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return

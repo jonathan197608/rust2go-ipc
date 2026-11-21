@@ -273,47 +273,81 @@ func (e *enc) put(v any) {
 	case string:
 		e.put(uint64(len(x)))
 		e.b = append(e.b, x...)
+	default:
+		panic("rust2go-ipc: unsupported wire type")
 	}
 }
 
 type dec struct {
-	b []byte
-	p int
+	b   []byte
+	p   int
+	err bool
 }
 
-func (d *dec) take(n int) []byte { v := d.b[d.p : d.p+n]; d.p += n; return v }
-func (d *dec) u64() uint64       { return binary.LittleEndian.Uint64(d.take(8)) }
-func (d *dec) i64() int64        { return int64(d.u64()) }
-func (d *dec) u32() uint32       { return binary.LittleEndian.Uint32(d.take(4)) }
-func (d *dec) i32() int32        { return int32(d.u32()) }
-func (d *dec) u16() uint16       { return binary.LittleEndian.Uint16(d.take(2)) }
-func (d *dec) i16() int16        { return int16(d.u16()) }
-func (d *dec) u8() uint8         { return d.take(1)[0] }
-func (d *dec) i8() int8          { return int8(d.u8()) }
-func (d *dec) boolean() bool     { return d.take(1)[0] != 0 }
-func (d *dec) f32() float32      { return math.Float32frombits(d.u32()) }
-func (d *dec) f64() float64      { return math.Float64frombits(d.u64()) }
+func (d *dec) take(n int) []byte {
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: decode out of bounds")
+	}
+	v := d.b[d.p : d.p+n]
+	d.p += n
+	return v
+}
+func (d *dec) u64() uint64 { return binary.LittleEndian.Uint64(d.take(8)) }
+func (d *dec) i64() int64  { return int64(d.u64()) }
+func (d *dec) u32() uint32 { return binary.LittleEndian.Uint32(d.take(4)) }
+func (d *dec) i32() int32  { return int32(d.u32()) }
+func (d *dec) u16() uint16 { return binary.LittleEndian.Uint16(d.take(2)) }
+func (d *dec) i16() int16  { return int16(d.u16()) }
+func (d *dec) u8() uint8   { return d.take(1)[0] }
+func (d *dec) i8() int8    { return int8(d.u8()) }
+func (d *dec) boolean() bool {
+	b := d.take(1)[0]
+	if b > 1 {
+		d.err = true
+		panic("rust2go-ipc: invalid bool byte")
+	}
+	return b == 1
+}
+func (d *dec) f32() float32 { return math.Float32frombits(d.u32()) }
+func (d *dec) f64() float64 { return math.Float64frombits(d.u64()) }
 func (d *dec) str() StringRef {
 	n := int(d.u64())
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: string len out of bounds")
+	}
 	if n == 0 {
 		return StringRef{}
 	}
-	p := unsafe.Pointer(&d.b[d.p])
-	d.p += n
-	return StringRef{ptr: p, len: uint64(n)}
+	b := d.take(n)
+	return StringRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}
 }
 func primList[T any](d *dec) ListRef {
 	n := int(d.u64())
+	if n < 0 {
+		d.err = true
+		panic("rust2go-ipc: negative list len")
+	}
 	if n == 0 {
 		return ListRef{}
 	}
 	var zero T
-	p := unsafe.Pointer(&d.b[d.p])
-	d.p += n * int(unsafe.Sizeof(zero))
-	return ListRef{ptr: p, len: uint64(n)}
+	sz := int(unsafe.Sizeof(zero))
+	nbytes := n * sz
+	if nbytes < 0 || nbytes > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: list len out of bounds")
+	}
+	b := d.take(nbytes)
+	return ListRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}
 }
 func stringList(d *dec) ListRef {
 	n := int(d.u64())
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: string list len out of bounds")
+	}
 	if n == 0 {
 		return ListRef{}
 	}
@@ -386,6 +420,10 @@ func restoreListRequestRef(d *dec) ListRequestRef {
 		names: stringList(d),
 		items: func() ListRef {
 			cnt := int(d.u64())
+			if cnt < 0 || cnt > len(d.b)-d.p {
+				d.err = true
+				panic("rust2go-ipc: struct list len out of bounds")
+			}
 			if cnt == 0 {
 				return ListRef{}
 			}
@@ -423,6 +461,10 @@ func restoreListResponseRef(d *dec) ListResponseRef {
 		names: stringList(d),
 		items: func() ListRef {
 			cnt := int(d.u64())
+			if cnt < 0 || cnt > len(d.b)-d.p {
+				d.err = true
+				panic("rust2go-ipc: struct list len out of bounds")
+			}
 			if cnt == 0 {
 				return ListRef{}
 			}
