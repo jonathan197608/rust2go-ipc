@@ -422,13 +422,10 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
                 let _ = child.wait();
                 panic!("rust2go-ipc: Go server never became ready within 30s");
             }
-            if let Some(status) = match child.try_wait() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("rust2go-ipc: try_wait during startup: {e}");
-                    None
-                }
-            } {
+            if let Some(status) = child.try_wait().unwrap_or_else(|e| {
+                eprintln!("rust2go-ipc: try_wait during startup: {e}");
+                None
+            }) {
                 eprintln!("rust2go-ipc: Go server exited during startup ({status}); respawning");
                 let _ = child.kill();
                 let _ = child.wait();
