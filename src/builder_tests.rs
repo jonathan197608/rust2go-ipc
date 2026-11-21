@@ -131,6 +131,15 @@ fn nested_struct_and_short_string_list_generate_correct_go() {
         rust
     );
 
+    // Nested Ref lists in requests must be read unaligned: rust2go packs child
+    // Refs into a byte buffer with 1-byte alignment.
+    assert!(
+        rust.contains("read_unaligned") && rust.contains("base.add(i)")
+            || rust.contains("read_unaligned") && rust.contains("base . add (i)"),
+        "nested Ref list flatten must read each element unaligned:\n{}",
+        rust
+    );
+
     if let Some(gofmt) = find_gofmt() {
         let path = std::env::temp_dir().join(format!(
             "rust2go-ipc-nested-{}-{}.go",
@@ -150,4 +159,54 @@ fn nested_struct_and_short_string_list_generate_correct_go() {
             String::from_utf8_lossy(&status.stderr)
         );
     }
+}
+
+#[test]
+fn go_server_dispatches_concurrently_with_bounded_semaphore() {
+    let main = generate_go_main();
+    // Each accepted connection's serve loop must dispatch in a goroutine so a
+    // slow handler cannot serialise later requests on the same connection.
+    assert!(main.contains("go func(id uint64, method uint32, body []byte)"));
+    assert!(main.contains("dispatch(method, body)"));
+    // Concurrency is bounded and configurable; writes are serialised to keep
+    // response frames intact.
+    assert!(main.contains("sem <- struct{}{}"), "missing back-pressure");
+    assert!(main.contains("RUST2GO_IPC_MAX_CONCURRENCY"));
+    assert!(
+        main.contains("writeMu.Lock()"),
+        "response writes must be serialised"
+    );
+    assert!(
+        main.contains("\"sync\""),
+        "sync import required for writeMu"
+    );
+}
+
+#[test]
+#[should_panic(expected = "collides with")]
+fn struct_name_colliding_with_go_helper_is_rejected() {
+    // `String` is a fixed Go helper (newString) and a predeclared identifier.
+    let schema = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct String { pub v: i32 }
+        #[r2g]
+        pub trait GolangCall { fn f(x: String) -> String; }
+        "#,
+    );
+    let _ = generate_go_sources(&schema);
+}
+
+#[test]
+#[should_panic(expected = "collides with")]
+fn trait_name_colliding_with_go_helper_is_rejected() {
+    let schema = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct Req { pub v: i32 }
+        #[r2g]
+        pub trait dispatch { fn f(x: Req) -> Req; }
+        "#,
+    );
+    let _ = generate_go_sources(&schema);
 }

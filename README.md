@@ -39,8 +39,9 @@ The rust2go macro expands each Go call into one external symbol, `binding::CGola
 
 1. The stub flattens the Ref pointer graph into a self-contained byte buffer.
 2. `dispatch` assigns a request id, stores `(slot, cb, trampoline)` in a pending table, writes one frame, and returns immediately. Tokio workers are never blocked.
-3. A reactor thread reads response frames, restores the response Ref graph into an arena, and invokes the generated trampoline.
-4. The `C-unwind` trampoline performs the callback effect directly (sync: write the stack `Option`; async: `SlotWriter::write`), so no panic can cross an `extern "C"` boundary and abort the process. Pending slots are explicitly released on timeout, disconnect, error status, or trampoline panic.
+3. The Go server dispatches each request in its own goroutine, so a slow handler never serialises later requests on the shared connection. Responses are written back out of order; the Rust reactor matches them by request id. Concurrency is bounded by a semaphore with back-pressure, and response writes are serialised to keep frames intact.
+4. A reactor thread reads response frames, restores the response Ref graph into an arena, and invokes the generated trampoline.
+5. The `C-unwind` trampoline performs the callback effect directly (sync: write the stack `Option`; async: `SlotWriter::write`), so no panic can cross an `extern "C"` boundary and abort the process. Pending slots are explicitly released on timeout, disconnect, error status, or trampoline panic.
 
 Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives are little-endian. The client and server must be built from the same crate version.
 
@@ -55,6 +56,7 @@ Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives 
 | `RUST2GO_IPC_TRANSPORT_OVERRIDE` | Force `tcp` or `unix` regardless of compile target. |
 | `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint (port or socket path). Both sides must agree. |
 | `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. |
+| `RUST2GO_IPC_MAX_CONCURRENCY` | Max in-flight Go handlers per server. Default `NumCPU*4` (min 16). Lower it to bound downstream load; the read loop applies back-pressure when full. |
 
 ## Failure semantics
 
@@ -68,6 +70,7 @@ If the connection drops, the reactor clears pending entries, restarts the Go ser
 - Request/response payloads are capped at 64 MiB. Go responses over the cap are converted to error status.
 - `i128`/`u128`, nested lists, and lists of empty structs are intentionally unsupported and fail at build time with an explicit message (an empty struct occupies zero wire bytes, so a non-empty list cannot round-trip).
 - The Rust process kills and reaps the Go child on normal exit via an atexit hook. A `SIGKILL`-style hard kill cannot be covered.
+- Go handlers run concurrently on the shared connection and responses may arrive out of order; they are matched by request id. Do not rely on handler execution order — make shared Go state concurrency-safe, as with the original cgo path.
 - The Go server may still use cgo for unrelated business dependencies. This crate only removes cgo from the rust2go call path.
 
 ## License

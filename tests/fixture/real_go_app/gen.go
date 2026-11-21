@@ -247,6 +247,13 @@ func primList[T any](d *dec) ListRef {
 	}
 	var zero T
 	sz := int(unsafe.Sizeof(zero))
+	// Check the byte count against the remaining buffer before multiplying:
+	// n * sz can overflow a signed int on a malformed frame. decodePrims also
+	// guards this, but validating here keeps the error at the frame boundary.
+	if n > (len(d.b)-d.p)/sz {
+		d.err = true
+		panic("rust2go-ipc: primitive list out of bounds")
+	}
 	b := d.take(n * sz)
 	arr := decodePrims[T](b, n)
 	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}

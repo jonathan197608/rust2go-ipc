@@ -498,6 +498,7 @@ fn parse_schema(src: &str) -> Schema {
             check_supported(&kind, &format!("{} return", m.trait_name), &struct_names);
         }
     }
+    check_go_name_collisions(&schema);
     schema
 }
 
@@ -658,6 +659,143 @@ fn validate_ident(name: &str, what: &str) {
     );
 }
 
+/// Top-level Go identifiers emitted by the generated server (helpers, types,
+/// constants) plus Go predeclared identifiers. A schema name that maps onto any
+/// of these would emit a duplicate declaration and break `go build`; reject it
+/// at build time with a clear message.
+const GO_FIXED_SYMBOLS: &[&str] = &[
+    // gen.go fixed types and helpers
+    "StringRef",
+    "ListRef",
+    "enc",
+    "dec",
+    "newString",
+    "decodePrims",
+    "newPrimList",
+    "newStringList",
+    "primList",
+    "stringList",
+    "dispatch",
+    // ipc_main.go fixed symbols
+    "magic",
+    "version",
+    "maxAcceptErrs",
+    "sem",
+    "acceptBackoff",
+    "main",
+    "serve",
+    "init",
+    // Go predeclared identifiers that a same-named type would shadow
+    "string",
+    "error",
+    "any",
+    "byte",
+    "rune",
+    "bool",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+    "true",
+    "false",
+    "iota",
+    "nil",
+    "append",
+    "cap",
+    "close",
+    "complex",
+    "copy",
+    "delete",
+    "imag",
+    "len",
+    "make",
+    "new",
+    "panic",
+    "print",
+    "println",
+    "real",
+    "recover",
+];
+
+/// Verify that no two generated top-level Go symbols collide. User-supplied
+/// struct/trait names expand into several helpers each (`newX`, `XRef`, ...),
+/// so collisions can arise both with fixed helpers and between two schema
+/// types. It is cheaper to reject at build time than to debug a `go build`
+/// redeclaration error.
+fn check_go_name_collisions(schema: &Schema) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for s in GO_FIXED_SYMBOLS {
+        seen.insert(
+            (*s).to_string(),
+            "a generated helper / Go predeclared name".to_string(),
+        );
+    }
+    let mut claim = |name: String, owner: &str| {
+        if let Some(prev) = seen.get(&name) {
+            panic!(
+                "rust2go-ipc: generated Go symbol `{name}` from {owner} collides with {prev}; rename the schema type"
+            );
+        }
+        seen.insert(name, owner.to_string());
+    };
+    for st in &schema.structs {
+        let n = &st.name;
+        let owner = format!("struct {n}");
+        for sym in [
+            n.clone(),
+            format!("{n}Ref"),
+            format!("new{n}"),
+            format!("new{n}List"),
+            format!("flatten{n}"),
+            format!("restore{n}Ref"),
+            format!("{n}ListRef"),
+        ] {
+            claim(sym, &owner);
+        }
+    }
+    for t in &schema.traits {
+        let owner = format!("trait {t}");
+        claim(t.clone(), &owner);
+        claim(format!("{t}Impl"), &owner);
+    }
+    // Mirror generate_go_sources' top-level helper derivation for non-struct types.
+    let mut tops: Vec<String> = Vec::new();
+    for m in &schema.methods {
+        for p in &m.params {
+            if !matches!(classify(&p.ty), FieldKind::Custom(_)) {
+                let n = top_name(&p.ty);
+                if !tops.contains(&n) {
+                    tops.push(n);
+                }
+            }
+        }
+        if let Some(ty) = &m.resp {
+            if !matches!(classify(ty), FieldKind::Custom(_)) {
+                let n = top_name(ty);
+                if !tops.contains(&n) {
+                    tops.push(n);
+                }
+            }
+        }
+    }
+    for n in tops {
+        claim(format!("restoreTop{n}"), "a top-level helper");
+        claim(format!("newTop{n}"), "a top-level helper");
+    }
+}
+
 fn rust_owned_kind_path(kind: &FieldKind) -> TokenStream {
     match kind {
         FieldKind::String => quote! { ::std::string::String },
@@ -734,12 +872,14 @@ fn flatten_expr(ty: &Type, value: TokenStream) -> TokenStream {
                     let #r = #value;
                     enc.list_header(#r.len);
                     if #r.len > 0 {
-                        let items = ::std::slice::from_raw_parts(
-                            #r.ptr as *const ::rust2go::ipc::RawStringRef,
-                            #r.len,
-                        );
-                        for item in items {
-                            enc.string(*item);
+                        // rust2go packs child Refs into a `Vec<u8>` with 1-byte
+                        // alignment via write_unaligned. Read each element
+                        // unaligned instead of forming an over-aligned slice,
+                        // which would be UB under strict/custom allocators.
+                        let base = #r.ptr as *const ::rust2go::ipc::RawStringRef;
+                        for i in 0..#r.len {
+                            let item = ::std::ptr::read_unaligned(base.add(i));
+                            enc.string(item);
                         }
                     }
                 }
@@ -752,12 +892,10 @@ fn flatten_expr(ty: &Type, value: TokenStream) -> TokenStream {
                         let #r = #value;
                         enc.list_header(#r.len);
                         if #r.len > 0 {
-                            let items = ::std::slice::from_raw_parts(
-                                #r.ptr as *const #rt,
-                                #r.len,
-                            );
-                            for item in items {
-                                #f(enc, item);
+                            let base = #r.ptr as *const #rt;
+                            for i in 0..#r.len {
+                                let item = ::std::ptr::read_unaligned(base.add(i));
+                                #f(enc, &item);
                             }
                         }
                     }
@@ -1061,12 +1199,12 @@ fn go_prim(p: &str) -> &'static str {
         "i16" => "int16",
         "i32" => "int32",
         "i64" => "int64",
-        "i128" => "int64",
+        "i128" => panic!("rust2go-ipc: go_prim called for i128, which check_supported must reject"),
         "u8" => "uint8",
         "u16" => "uint16",
         "u32" => "uint32",
         "u64" => "uint64",
-        "u128" => "uint64",
+        "u128" => panic!("rust2go-ipc: go_prim called for u128, which check_supported must reject"),
         "f32" => "float32",
         "f64" => "float64",
         "usize" => "uint64",
@@ -1404,6 +1542,13 @@ func primList[T any](d *dec) ListRef {
 	}
 	var zero T
 	sz := int(unsafe.Sizeof(zero))
+	// Check the byte count against the remaining buffer before multiplying:
+	// n * sz can overflow a signed int on a malformed frame. decodePrims also
+	// guards this, but validating here keeps the error at the frame boundary.
+	if n > (len(d.b)-d.p)/sz {
+		d.err = true
+		panic("rust2go-ipc: primitive list out of bounds")
+	}
 	b := d.take(n * sz)
 	arr := decodePrims[T](b, n)
 	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
@@ -1656,6 +1801,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -1663,6 +1811,27 @@ const magic = "R2GI"
 const version = uint16(1)
 
 const maxAcceptErrs = 10
+
+// A single long-lived connection can carry many in-flight async requests.
+// Dispatching each in its own goroutine prevents a slow Go handler from
+// serialising every later request on that connection. The Rust reactor matches
+// responses by req_id, so responses may be written back out of order. sem
+// bounds concurrency so a burst cannot spawn an unbounded number of goroutines
+// or overwhelm downstream services. Set RUST2GO_IPC_MAX_CONCURRENCY to tune.
+var sem chan struct{}
+
+func init() {
+	n := runtime.NumCPU() * 4
+	if n < 16 {
+		n = 16
+	}
+	if v := os.Getenv("RUST2GO_IPC_MAX_CONCURRENCY"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	sem = make(chan struct{}, n)
+}
 
 func acceptBackoff(attempt int) time.Duration {
 	d := 5 * time.Millisecond
@@ -1730,6 +1899,7 @@ func main() {
 
 func serve(conn net.Conn) {
 	defer conn.Close()
+	var writeMu sync.Mutex
 	hdr := make([]byte, 22)
 	for {
 		// Set an idle deadline before every read. Setting it only after the
@@ -1751,31 +1921,38 @@ func serve(conn net.Conn) {
 		if length32 > 64*1024*1024 {
 			return
 		}
+		// Own the payload before handing it to a goroutine: the read buffer is
+		// reused on the next loop iteration.
 		payload := make([]byte, int(length32))
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
 
-		if reqID == 0 {
-			_, _ = dispatch(methodID, payload)
-			continue
-		}
-		resp, ok := dispatch(methodID, payload)
-		status := byte(0)
-		if !ok || len(resp) > 64*1024*1024 {
-			status = 1
-			resp = nil
-		}
-		out := make([]byte, 19+len(resp))
-		copy(out[0:4], magic)
-		binary.LittleEndian.PutUint16(out[4:6], version)
-		binary.LittleEndian.PutUint64(out[6:14], reqID)
-		out[14] = status
-		binary.LittleEndian.PutUint32(out[15:19], uint32(len(resp)))
-		copy(out[19:], resp)
-		if _, err := conn.Write(out); err != nil {
-			return
-		}
+		// Back-pressure: block the read loop once the concurrency cap is
+		// reached, so a burst cannot spawn unbounded goroutines.
+		sem <- struct{}{}
+		go func(id uint64, method uint32, body []byte) {
+			defer func() { <-sem }()
+			resp, ok := dispatch(method, body)
+			if id == 0 {
+				return
+			}
+			status := byte(0)
+			if !ok || len(resp) > 64*1024*1024 {
+				status = 1
+				resp = nil
+			}
+			out := make([]byte, 19+len(resp))
+			copy(out[0:4], magic)
+			binary.LittleEndian.PutUint16(out[4:6], version)
+			binary.LittleEndian.PutUint64(out[6:14], id)
+			out[14] = status
+			binary.LittleEndian.PutUint32(out[15:19], uint32(len(resp)))
+			copy(out[19:], resp)
+			writeMu.Lock()
+			_, _ = conn.Write(out)
+			writeMu.Unlock()
+		}(reqID, methodID, payload)
 	}
 }
 "#

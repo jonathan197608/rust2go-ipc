@@ -7,6 +7,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -14,6 +17,27 @@ const magic = "R2GI"
 const version = uint16(1)
 
 const maxAcceptErrs = 10
+
+// A single long-lived connection can carry many in-flight async requests.
+// Dispatching each in its own goroutine prevents a slow Go handler from
+// serialising every later request on that connection. The Rust reactor matches
+// responses by req_id, so responses may be written back out of order. sem
+// bounds concurrency so a burst cannot spawn an unbounded number of goroutines
+// or overwhelm downstream services. Set RUST2GO_IPC_MAX_CONCURRENCY to tune.
+var sem chan struct{}
+
+func init() {
+	n := runtime.NumCPU() * 4
+	if n < 16 {
+		n = 16
+	}
+	if v := os.Getenv("RUST2GO_IPC_MAX_CONCURRENCY"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	sem = make(chan struct{}, n)
+}
 
 func acceptBackoff(attempt int) time.Duration {
 	d := 5 * time.Millisecond
@@ -81,6 +105,7 @@ func main() {
 
 func serve(conn net.Conn) {
 	defer conn.Close()
+	var writeMu sync.Mutex
 	hdr := make([]byte, 22)
 	for {
 		// Set an idle deadline before every read. Setting it only after the
@@ -102,30 +127,37 @@ func serve(conn net.Conn) {
 		if length32 > 64*1024*1024 {
 			return
 		}
+		// Own the payload before handing it to a goroutine: the read buffer is
+		// reused on the next loop iteration.
 		payload := make([]byte, int(length32))
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
 
-		if reqID == 0 {
-			_, _ = dispatch(methodID, payload)
-			continue
-		}
-		resp, ok := dispatch(methodID, payload)
-		status := byte(0)
-		if !ok || len(resp) > 64*1024*1024 {
-			status = 1
-			resp = nil
-		}
-		out := make([]byte, 19+len(resp))
-		copy(out[0:4], magic)
-		binary.LittleEndian.PutUint16(out[4:6], version)
-		binary.LittleEndian.PutUint64(out[6:14], reqID)
-		out[14] = status
-		binary.LittleEndian.PutUint32(out[15:19], uint32(len(resp)))
-		copy(out[19:], resp)
-		if _, err := conn.Write(out); err != nil {
-			return
-		}
+		// Back-pressure: block the read loop once the concurrency cap is
+		// reached, so a burst cannot spawn unbounded goroutines.
+		sem <- struct{}{}
+		go func(id uint64, method uint32, body []byte) {
+			defer func() { <-sem }()
+			resp, ok := dispatch(method, body)
+			if id == 0 {
+				return
+			}
+			status := byte(0)
+			if !ok || len(resp) > 64*1024*1024 {
+				status = 1
+				resp = nil
+			}
+			out := make([]byte, 19+len(resp))
+			copy(out[0:4], magic)
+			binary.LittleEndian.PutUint16(out[4:6], version)
+			binary.LittleEndian.PutUint64(out[6:14], id)
+			out[14] = status
+			binary.LittleEndian.PutUint32(out[15:19], uint32(len(resp)))
+			copy(out[19:], resp)
+			writeMu.Lock()
+			_, _ = conn.Write(out)
+			writeMu.Unlock()
+		}(reqID, methodID, payload)
 	}
 }
