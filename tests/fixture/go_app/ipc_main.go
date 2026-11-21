@@ -12,11 +12,34 @@ const magic = "R2GI"
 const version = uint16(1)
 
 func main() {
-	port := os.Getenv("RUST2GO_IPC_PORT")
-	if port == "" {
-		panic("RUST2GO_IPC_PORT not set")
+	transport := os.Getenv("RUST2GO_IPC_TRANSPORT")
+	endpoint := os.Getenv("RUST2GO_IPC_ENDPOINT")
+	if endpoint == "" {
+		// Backward compat: older Rust clients only set RUST2GO_IPC_PORT.
+		port := os.Getenv("RUST2GO_IPC_PORT")
+		if port == "" {
+			panic("RUST2GO_IPC_ENDPOINT / RUST2GO_IPC_PORT not set")
+		}
+		transport = "tcp"
+		endpoint = "127.0.0.1:" + port
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if transport == "" {
+		transport = "tcp"
+	}
+
+	var ln net.Listener
+	var err error
+	switch transport {
+	case "unix":
+		// A killed server leaves its socket file behind. Unlink before listen
+		// so a respawned process can rebind the same path.
+		_ = os.Remove(endpoint)
+		ln, err = net.Listen("unix", endpoint)
+	case "tcp":
+		ln, err = net.Listen("tcp", endpoint)
+	default:
+		panic("rust2go-ipc: unknown transport " + transport)
+	}
 	if err != nil {
 		panic(err)
 	}

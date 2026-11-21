@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashMap,
+    env,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     process::{Child, Command, Stdio},
@@ -18,11 +19,143 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
 const MAGIC: [u8; 4] = *b"R2GI";
 const VERSION: u16 = 1;
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const DEFAULT_PENDING_TTL: u64 = 600;
 const SWEEP_INTERVAL: u64 = 30;
+
+const ENV_SERVER_OVERRIDE: &str = "RUST2GO_IPC_SERVER_OVERRIDE";
+const ENV_ENDPOINT_OVERRIDE: &str = "RUST2GO_IPC_ENDPOINT_OVERRIDE";
+const ENV_TRANSPORT_OVERRIDE: &str = "RUST2GO_IPC_TRANSPORT_OVERRIDE";
+const ENV_PORT_OVERRIDE: &str = "RUST2GO_IPC_PORT_OVERRIDE";
+
+/// Transport is chosen from the compile target, not from runtime probing:
+/// UDS on Unix, TCP loopback everywhere else (Windows, wasi, ...).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    Tcp,
+    #[cfg(unix)]
+    Unix,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            #[cfg(unix)]
+            Transport::Unix => "unix",
+        }
+    }
+}
+
+fn default_transport() -> Transport {
+    #[cfg(unix)]
+    {
+        Transport::Unix
+    }
+    #[cfg(not(unix))]
+    {
+        Transport::Tcp
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Endpoint {
+    transport: Transport,
+    addr: String,
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Resolve the endpoint shared by the Rust client and the Go server.
+/// Overrides: full endpoint (plus optional transport), or just the port.
+fn resolve_endpoint(port: u16) -> Endpoint {
+    if let Some(addr) = env_nonempty(ENV_ENDPOINT_OVERRIDE) {
+        let transport = match env_nonempty(ENV_TRANSPORT_OVERRIDE).as_deref() {
+            Some("tcp") => Transport::Tcp,
+            #[cfg(unix)]
+            Some("unix") => Transport::Unix,
+            _ => default_transport(),
+        };
+        return Endpoint { transport, addr };
+    }
+    match default_transport() {
+        #[cfg(unix)]
+        Transport::Unix => {
+            let mut path =
+                env::temp_dir().join(format!("rust2go-ipc-{}-{}.sock", std::process::id(), port));
+            // sockaddr_un.sun_path is ~108 bytes on Linux / 104 on macOS.
+            // Long TMPDIR paths (common in CI) would fail to bind.
+            if path.to_string_lossy().len() >= 100 {
+                path = std::path::PathBuf::from(format!(
+                    "/tmp/rust2go-ipc-{}-{}.sock",
+                    std::process::id(),
+                    port
+                ));
+            }
+            Endpoint {
+                transport: Transport::Unix,
+                addr: path.to_string_lossy().into_owned(),
+            }
+        }
+        Transport::Tcp => Endpoint {
+            transport: Transport::Tcp,
+            addr: format!("127.0.0.1:{port}"),
+        },
+    }
+}
+
+/// Unified byte stream over either transport. Both variants implement
+/// `Read + Write + try_clone`, so the reactor needs no transport-specific code.
+enum IpcStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl IpcStream {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            IpcStream::Tcp(s) => s.try_clone().map(IpcStream::Tcp),
+            #[cfg(unix)]
+            IpcStream::Unix(s) => s.try_clone().map(IpcStream::Unix),
+        }
+    }
+}
+
+impl Read for IpcStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            IpcStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            IpcStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for IpcStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            IpcStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            IpcStream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            IpcStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            IpcStream::Unix(s) => s.flush(),
+        }
+    }
+}
 
 /// Signature of a generated response trampoline:
 /// `(payload_ptr, payload_len, slot, cb)`.
@@ -38,8 +171,9 @@ struct Pending {
 struct Runtime {
     server: String,
     port: u16,
+    endpoint: Endpoint,
     child: Mutex<Option<Child>>,
-    writer: Mutex<TcpStream>,
+    writer: Mutex<IpcStream>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     last_sweep: AtomicU64,
@@ -56,9 +190,11 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// Spawn the Go server once and start the reactor. `server` is the path to the
 /// compiled Go IPC binary; `port` was reserved by the build script.
-fn spawn_server(server: &str, port: u16) -> Child {
+fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
     Command::new(server)
         .env("RUST2GO_IPC_PORT", port.to_string())
+        .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
+        .env("RUST2GO_IPC_ENDPOINT", &endpoint.addr)
         .stdin(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"))
@@ -74,18 +210,20 @@ fn now_secs() -> u64 {
 fn runtime(server: &str, port: u16) -> &'static Runtime {
     // Build-time paths live under OUT_DIR and do not exist in a stripped
     // runtime image; let deployment point at the copied binary.
-    let server = std::env::var("RUST2GO_IPC_SERVER_OVERRIDE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| server.to_string());
-    let port = std::env::var("RUST2GO_IPC_PORT_OVERRIDE")
-        .ok()
+    let server = env_nonempty(ENV_SERVER_OVERRIDE).unwrap_or_else(|| server.to_string());
+    let port = env_nonempty(ENV_PORT_OVERRIDE)
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(port);
+    let endpoint = resolve_endpoint(port);
     RUNTIME.get_or_init(move || {
-        let child = spawn_server(&server, port);
-        let stream = connect_with_retry(port, Duration::from_secs(10))
-            .unwrap_or_else(|| panic!("rust2go-ipc: Go server never listened on port {port}"));
+        let child = spawn_server(&server, port, &endpoint);
+        let stream = connect_with_retry(&endpoint, Duration::from_secs(10)).unwrap_or_else(|| {
+            panic!(
+                "rust2go-ipc: Go server never listened on {} {}",
+                endpoint.transport.as_str(),
+                endpoint.addr
+            )
+        });
         let reader = stream
             .try_clone()
             .expect("rust2go-ipc: cannot clone IPC stream");
@@ -97,6 +235,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         let rt = Runtime {
             server,
             port,
+            endpoint,
             child: Mutex::new(Some(child)),
             writer: Mutex::new(stream),
             next_id: AtomicU64::new(1),
@@ -148,11 +287,15 @@ fn sweep_pending(rt: &Runtime) {
     }
 }
 
-fn connect_with_retry(port: u16, timeout: Duration) -> Option<TcpStream> {
-    let addr = format!("127.0.0.1:{port}");
+fn connect_with_retry(endpoint: &Endpoint, timeout: Duration) -> Option<IpcStream> {
     let deadline = Instant::now() + timeout;
     loop {
-        match TcpStream::connect(&addr) {
+        let result = match endpoint.transport {
+            Transport::Tcp => TcpStream::connect(&endpoint.addr).map(IpcStream::Tcp),
+            #[cfg(unix)]
+            Transport::Unix => UnixStream::connect(&endpoint.addr).map(IpcStream::Unix),
+        };
+        match result {
             Ok(s) => return Some(s),
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => return None,
@@ -222,9 +365,9 @@ pub unsafe fn dispatch_sync(
 ) {
     let rt = runtime(_server, port);
     let req_id = rt.next_id.fetch_add(1, Ordering::Relaxed);
-    // Use the runtime port: RUST2GO_IPC_PORT_OVERRIDE may differ from the
-    // build-time constant passed in `port`.
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", rt.port))
+    // Dedicated connection to the resolved endpoint: overrides may differ
+    // from the build-time constant passed in `port`.
+    let mut stream = connect_with_retry(&rt.endpoint, Duration::from_secs(10))
         .expect("rust2go-ipc: cannot connect for synchronous call");
     let frame = build_frame(req_id, method_id, payload);
     stream
@@ -303,7 +446,7 @@ fn write_frame(rt: &Runtime, req_id: u64, method_id: u32, payload: &[u8]) {
         .expect("rust2go-ipc: cannot flush request frame");
 }
 
-fn reactor_loop(mut reader: TcpStream, rt: &'static Runtime) {
+fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
     loop {
         let (req_id, status, payload) = match read_response(&mut reader) {
             Ok(v) => v,
@@ -322,15 +465,15 @@ fn reactor_loop(mut reader: TcpStream, rt: &'static Runtime) {
                 }
                 // Keep one child handle across retries. Spawning on every
                 // failed connect leaks processes and races for the port.
-                let mut child = spawn_server(&rt.server, rt.port);
+                let mut child = spawn_server(&rt.server, rt.port, &rt.endpoint);
                 loop {
                     if let Some(status) = child.try_wait().expect("rust2go-ipc: try_wait failed") {
                         eprintln!(
                             "rust2go-ipc: Go server exited during reconnect ({status}); respawning"
                         );
-                        child = spawn_server(&rt.server, rt.port);
+                        child = spawn_server(&rt.server, rt.port, &rt.endpoint);
                     }
-                    match connect_with_retry(rt.port, Duration::from_secs(2)) {
+                    match connect_with_retry(&rt.endpoint, Duration::from_secs(2)) {
                         Some(stream) => {
                             reader = stream
                                 .try_clone()
