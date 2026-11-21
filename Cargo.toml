@@ -1,0 +1,24 @@
+[package]
+name = "rust2go-ipc"
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+description = "Drop-in rust2go replacement: Rust in main process, Go in child process over IPC"
+documentation = "https://docs.rs/rust2go-ipc"
+readme = "README.md"
+keywords = ["ffi", "ipc", "rust2go", "go", "interop"]
+categories = ["development-tools::ffi"]
+exclude = ["tests/fixture/**", "_*.py"]
+
+[features]
+default = []
+build = ["dep:syn", "dep:quote", "dep:proc-macro2"]
+
+[dependencies]
+rust2go = { version = "0.4", default-features = false }
+syn = { version = "2", features = ["full"], optional = true }
+quote = { version = "1", optional = true }
+proc-macro2 = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

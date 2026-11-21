@@ -1,0 +1,13 @@
+[package]
+name = "r2g-ipc-real-schema-check"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+rust2go = { package = "rust2go-ipc", path = "../../.." }
+
+[build-dependencies]
+rust2go = { package = "rust2go-ipc", path = "../../..", features = ["build"] }
+
+[workspace]

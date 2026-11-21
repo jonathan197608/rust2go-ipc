@@ -1,0 +1,15 @@
+[package]
+name = "r2g-ipc-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rust2go = { package = "rust2go-ipc", path = "../../.." }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+md-5 = "0.10"
+hex = "0.4"
+
+[build-dependencies]
+rust2go = { package = "rust2go-ipc", path = "../../..", features = ["build"] }
+
+[workspace]

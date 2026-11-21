@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Go build artifacts
+*.exe
+*.test
+go-ipc-server
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
