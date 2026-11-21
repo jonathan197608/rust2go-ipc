@@ -7,20 +7,31 @@
 //! wakes the awaiting future.
 
 use std::{
+    any::Any,
     collections::HashMap,
     env,
-    io::{Read, Write},
+    hint::spin_loop,
+    io::{self, Error as IoError, ErrorKind, Read, Write},
+    mem::size_of,
     net::{TcpListener, TcpStream},
+    panic::{catch_unwind, AssertUnwindSafe},
     process::{Child, Command, Stdio},
+    ptr::{null, read_unaligned},
+    slice::from_raw_parts,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
-    time::{Duration, Instant},
+    thread::{self, sleep},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::id as process_id;
 
 const MAGIC: [u8; 4] = *b"R2GI";
 const VERSION: u16 = 1;
@@ -89,15 +100,11 @@ fn resolve_endpoint(port: u16) -> Endpoint {
         #[cfg(unix)]
         Transport::Unix => {
             let mut path =
-                env::temp_dir().join(format!("rust2go-ipc-{}-{}.sock", std::process::id(), port));
+                env::temp_dir().join(format!("rust2go-ipc-{}-{}.sock", process_id(), port));
             // sockaddr_un.sun_path is ~108 bytes on Linux / 104 on macOS.
             // Long TMPDIR paths (common in CI) would fail to bind.
             if path.to_string_lossy().len() >= 100 {
-                path = std::path::PathBuf::from(format!(
-                    "/tmp/rust2go-ipc-{}-{}.sock",
-                    std::process::id(),
-                    port
-                ));
+                path = PathBuf::from(format!("/tmp/rust2go-ipc-{}-{}.sock", process_id(), port));
             }
             Endpoint {
                 transport: Transport::Unix,
@@ -120,7 +127,7 @@ enum IpcStream {
 }
 
 impl IpcStream {
-    fn try_clone(&self) -> std::io::Result<Self> {
+    fn try_clone(&self) -> io::Result<Self> {
         match self {
             IpcStream::Tcp(s) => s.try_clone().map(IpcStream::Tcp),
             #[cfg(unix)]
@@ -130,7 +137,7 @@ impl IpcStream {
 }
 
 impl Read for IpcStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             IpcStream::Tcp(s) => s.read(buf),
             #[cfg(unix)]
@@ -140,7 +147,7 @@ impl Read for IpcStream {
 }
 
 impl Write for IpcStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             IpcStream::Tcp(s) => s.write(buf),
             #[cfg(unix)]
@@ -148,7 +155,7 @@ impl Write for IpcStream {
         }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         match self {
             IpcStream::Tcp(s) => s.flush(),
             #[cfg(unix)]
@@ -201,8 +208,8 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
@@ -227,7 +234,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         let reader = stream
             .try_clone()
             .expect("rust2go-ipc: cannot clone IPC stream");
-        let ttl = std::env::var("RUST2GO_IPC_PENDING_TTL_SECS")
+        let ttl = env::var("RUST2GO_IPC_PENDING_TTL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_PENDING_TTL);
@@ -244,14 +251,14 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
             pending_ttl: Duration::from_secs(ttl),
         };
 
-        std::thread::Builder::new()
+        thread::Builder::new()
             .name("rust2go-ipc-reactor".to_string())
             .spawn(move || {
                 let rt = loop {
                     if let Some(rt) = RUNTIME.get() {
                         break rt;
                     }
-                    std::hint::spin_loop();
+                    spin_loop();
                 };
                 reactor_loop(reader, rt);
             })
@@ -297,7 +304,7 @@ fn connect_with_retry(endpoint: &Endpoint, timeout: Duration) -> Option<IpcStrea
         };
         match result {
             Ok(s) => return Some(s),
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(10)),
             Err(_) => return None,
         }
     }
@@ -381,22 +388,18 @@ pub unsafe fn dispatch_sync(
         read_response(&mut stream).expect("rust2go-ipc: cannot read sync response");
     assert_eq!(resp_id, req_id, "rust2go-ipc: sync response id mismatch");
     assert_eq!(status, 0, "rust2go-ipc: Go returned error for sync call");
-    (trampoline)(resp.as_ptr(), resp.len(), slot, cb);
+    trampoline(resp.as_ptr(), resp.len(), slot, cb);
 }
 
-fn read_response<R: Read>(reader: &mut R) -> std::io::Result<(u64, u8, Vec<u8>)> {
-    use std::io::ErrorKind;
+fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
     let mut header = [0u8; 19];
     reader.read_exact(&mut header)?;
     if header[..4] != MAGIC {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "bad response magic",
-        ));
+        return Err(IoError::new(ErrorKind::InvalidData, "bad response magic"));
     }
     let version = u16::from_le_bytes([header[4], header[5]]);
     if version != VERSION {
-        return Err(std::io::Error::new(
+        return Err(IoError::new(
             ErrorKind::InvalidData,
             format!("unsupported response version {version}"),
         ));
@@ -405,7 +408,7 @@ fn read_response<R: Read>(reader: &mut R) -> std::io::Result<(u64, u8, Vec<u8>)>
     let status = header[14];
     let len = u32::from_le_bytes(header[15..19].try_into().expect("4 bytes")) as usize;
     if len > MAX_PAYLOAD {
-        return Err(std::io::Error::new(
+        return Err(IoError::new(
             ErrorKind::InvalidData,
             format!("response too large ({len})"),
         ));
@@ -484,7 +487,7 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
                         }
                         None => {
                             eprintln!("rust2go-ipc: reconnect failed; retrying in 1s");
-                            std::thread::sleep(Duration::from_secs(1));
+                            sleep(Duration::from_secs(1));
                         }
                     }
                 }
@@ -501,7 +504,7 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
         match pending {
             Some(p) if status == 0 => {
                 // A malformed response must not kill the reactor thread.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                let result = catch_unwind(AssertUnwindSafe(|| unsafe {
                     (p.trampoline)(payload.as_ptr(), payload.len(), p.slot, p.cb);
                 }));
                 if result.is_err() {
@@ -543,9 +546,7 @@ impl Encoder {
     }
 
     pub fn prim<T: Copy>(&mut self, v: T) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(&v as *const T as *const u8, std::mem::size_of::<T>())
-        };
+        let bytes = unsafe { from_raw_parts(&v as *const T as *const u8, size_of::<T>()) };
         self.buf.extend_from_slice(bytes);
     }
 
@@ -555,7 +556,7 @@ impl Encoder {
         if len == 0 {
             return;
         }
-        let bytes = unsafe { std::slice::from_raw_parts(s.ptr, len) };
+        let bytes = unsafe { from_raw_parts(s.ptr, len) };
         self.buf.extend_from_slice(bytes);
     }
 
@@ -569,8 +570,8 @@ impl Encoder {
         if len == 0 {
             return;
         }
-        let nbytes = len * std::mem::size_of::<T>();
-        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, nbytes) };
+        let nbytes = len * size_of::<T>();
+        let bytes = unsafe { from_raw_parts(ptr as *const u8, nbytes) };
         self.buf.extend_from_slice(bytes);
     }
 
@@ -584,7 +585,7 @@ impl Encoder {
 /// Rust values.
 #[derive(Default)]
 pub struct Arena {
-    owned: Vec<Box<dyn std::any::Any>>,
+    owned: Vec<Box<dyn Any>>,
 }
 
 impl Arena {
@@ -597,7 +598,7 @@ impl Arena {
         let boxed: Box<[u8]> = bytes.into();
         let ptr = boxed.as_ptr();
         let len = boxed.len();
-        self.owned.push(Box::new(boxed) as Box<dyn std::any::Any>);
+        self.owned.push(Box::new(boxed) as Box<dyn Any>);
         (ptr, len)
     }
 
@@ -605,7 +606,7 @@ impl Arena {
     pub fn elements<T: Copy + 'static>(&mut self, elems: &[T]) -> *const T {
         let boxed: Box<[T]> = elems.into();
         let ptr = boxed.as_ptr();
-        self.owned.push(Box::new(boxed) as Box<dyn std::any::Any>);
+        self.owned.push(Box::new(boxed) as Box<dyn Any>);
         ptr
     }
 }
@@ -627,17 +628,17 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn prim<T: Copy>(&mut self) -> T {
-        let n = std::mem::size_of::<T>();
+        let n = size_of::<T>();
         let bytes = &self.buf[self.pos..self.pos + n];
         self.pos += n;
-        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) }
+        unsafe { read_unaligned(bytes.as_ptr() as *const T) }
     }
 
     pub fn string(&mut self) -> RawStringRef {
         let len = self.prim::<u64>() as usize;
         if len == 0 {
             return RawStringRef {
-                ptr: std::ptr::null(),
+                ptr: null(),
                 len: 0,
             };
         }
@@ -665,11 +666,11 @@ impl<'a> Decoder<'a> {
         let n = self.list_len();
         if n == 0 {
             return RawListRef {
-                ptr: std::ptr::null(),
+                ptr: null(),
                 len: 0,
             };
         }
-        let nbytes = n * std::mem::size_of::<T>();
+        let nbytes = n * size_of::<T>();
         let bytes = &self.buf[self.pos..self.pos + nbytes];
         self.pos += nbytes;
         let ptr = self.arena.bytes(bytes).0 as *const ();
@@ -682,7 +683,7 @@ impl<'a> Decoder<'a> {
         let n = items.len();
         if n == 0 {
             return RawListRef {
-                ptr: std::ptr::null(),
+                ptr: null(),
                 len: 0,
             };
         }
