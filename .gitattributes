@@ -1,0 +1,4 @@
+# Code templates are embedded verbatim via include_str! and their bytes flow
+# into generated Go sources. Keep them LF-only on every platform so the
+# generated output stays byte-stable regardless of core.autocrlf.
+*.gotpl text eol=lf
