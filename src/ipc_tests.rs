@@ -72,3 +72,19 @@ fn decoder_list_elements_rejects_huge_count() {
     // n = u64::MAX elements, no payload -> must be rejected before allocating
     let _ = dec.list_elements::<u64>(u64::MAX as usize);
 }
+
+#[test]
+fn empty_lists_use_null_pointer() {
+    // Every list-decoding API must agree: an empty list has a null pointer,
+    // never the dangling-but-aligned pointer of an empty Box<[T]>.
+    let mut dec = Decoder::new(&[]);
+    let elements = dec.list_elements::<u64>(0);
+    assert!(elements.ptr.is_null());
+    assert_eq!(elements.len, 0);
+
+    let zero = 0u64.to_le_bytes();
+    let mut dec = Decoder::new(&zero);
+    let prims = dec.prim_list::<u64>();
+    assert!(prims.ptr.is_null());
+    assert_eq!(prims.len, 0);
+}

@@ -12,7 +12,7 @@ use std::{
     env,
     io::{self, Error as IoError, ErrorKind, Read, Write},
     mem::size_of,
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     panic::{catch_unwind, AssertUnwindSafe},
     process::{Child, Command, Stdio},
     ptr::null,
@@ -39,8 +39,12 @@ const VERSION: u16 = 1;
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const DEFAULT_PENDING_TTL: u64 = 600;
 const SWEEP_INTERVAL: u64 = 30;
+/// A hung Go handler must not block a synchronous business thread for the
+/// async-scale TTL; sync calls get a shorter, independent timeout.
+const DEFAULT_SYNC_TIMEOUT: u64 = 30;
 
 const ENV_SERVER_OVERRIDE: &str = "RUST2GO_IPC_SERVER_OVERRIDE";
+const ENV_SYNC_TIMEOUT: &str = "RUST2GO_IPC_SYNC_TIMEOUT_SECS";
 const ENV_ENDPOINT_OVERRIDE: &str = "RUST2GO_IPC_ENDPOINT_OVERRIDE";
 const ENV_TRANSPORT_OVERRIDE: &str = "RUST2GO_IPC_TRANSPORT_OVERRIDE";
 const ENV_PORT_OVERRIDE: &str = "RUST2GO_IPC_PORT_OVERRIDE";
@@ -83,6 +87,15 @@ struct Endpoint {
 
 fn env_nonempty(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Read the synchronous-call timeout, rejecting 0 so a misconfiguration cannot
+/// disable the deadline entirely.
+fn sync_timeout_secs() -> u64 {
+    env_nonempty(ENV_SYNC_TIMEOUT)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SYNC_TIMEOUT)
 }
 
 /// Resolve the endpoint shared by the Rust client and the Go server.
@@ -151,6 +164,22 @@ impl IpcStream {
             IpcStream::Tcp(s) => s.set_write_timeout(Some(timeout)),
             #[cfg(unix)]
             IpcStream::Unix(s) => s.set_write_timeout(Some(timeout)),
+        }
+    }
+
+    /// Shut down both directions so the reactor's cloned reader observes EOF
+    /// immediately and rebuilds the connection. Used after a failed write,
+    /// where a partial frame would otherwise desynchronise the peer's read
+    /// loop while the reactor (seeing only a live child) keeps the connection.
+    fn shutdown_both(&self) {
+        match self {
+            IpcStream::Tcp(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            #[cfg(unix)]
+            IpcStream::Unix(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
         }
     }
 }
@@ -351,7 +380,10 @@ struct Runtime {
 // `usize`, and Trampoline (a fn pointer) is Send + Sync. The remaining fields
 // are Mutex/Atomic/String/Child, all thread-safe.
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+/// `&'static Runtime` (rather than an owned value) lets the reactor thread
+/// receive the runtime directly instead of spin-waiting for `OnceLock` to be
+/// populated after this initialization closure returns.
+static RUNTIME: OnceLock<&'static Runtime> = OnceLock::new();
 static ATEXIT: Once = Once::new();
 /// Set by the atexit hook before reaping the child. `reconnect` checks it so a
 /// concurrent reactor restart cannot spawn a fresh child that outlives exit.
@@ -385,7 +417,12 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
         .env("RUST2GO_IPC_PORT", port.to_string())
         .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
         .env("RUST2GO_IPC_ENDPOINT", &endpoint.addr)
+        // Isolate the child from the parent's stdio. stdin is unused; stdout
+        // has no protocol meaning here. stderr is deliberately inherited so
+        // a Go-side panic remains diagnosable (the Rust side also logs the
+        // child's exit status during startup/respawn).
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"))
 }
@@ -405,11 +442,27 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
     let port = env_nonempty(ENV_PORT_OVERRIDE)
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(port);
-    let endpoint = resolve_endpoint(port);
     ATEXIT.call_once(|| unsafe {
         let _ = libc::atexit(cleanup_on_exit);
     });
     RUNTIME.get_or_init(move || {
+        // Mitigate the build-time port reservation TOCTOU: another process may
+        // have taken the reserved TCP port between build and runtime. If no
+        // full endpoint override is in play and the port is not bindable, pick
+        // a fresh one. Both sides use this port (the Go server gets it via
+        // env), so no build-time constant changes. This runs once, inside the
+        // init closure — doing it on every dispatch would see our own live
+        // server holding the port and falsely reselect each call.
+        let mut port = port;
+        if env_nonempty(ENV_ENDPOINT_OVERRIDE).is_none()
+            && default_transport() == Transport::Tcp
+            && TcpListener::bind(("127.0.0.1", port)).is_err()
+        {
+            let fresh = free_port();
+            eprintln!("rust2go-ipc: reserved port {port} is unavailable; reselecting {fresh}");
+            port = fresh;
+        }
+        let endpoint = resolve_endpoint(port);
         let mut child = spawn_server(&server, port, &endpoint);
         // A Go server that fails to bind exits quickly (e.g. a stale port/socket
         // or a bad binary). Reap and respawn instead of waiting for a timeout.
@@ -445,12 +498,17 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         // reactor probes child liveness instead of treating it as a dead frame:
         // a healthy but quiet server must not be restarted.
         let _ = reader.set_read_timeout(Duration::from_secs(300));
-        let ttl = env::var("RUST2GO_IPC_PENDING_TTL_SECS")
-            .ok()
+        let ttl = env_nonempty("RUST2GO_IPC_PENDING_TTL_SECS")
             .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_PENDING_TTL);
 
-        let rt = Runtime {
+        // Box::leak gives the reactor a `&'static Runtime` up front, removing
+        // the startup spin-wait on OnceLock and letting a spawn failure below
+        // reap the child explicitly before unwinding (a plain `Child` drop
+        // does not kill/wait, which would orphan the Go server holding the
+        // endpoint and make every later init fail at bind).
+        let rt: &'static Runtime = Box::leak(Box::new(Runtime {
             server,
             port,
             endpoint,
@@ -460,20 +518,15 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
             pending: Mutex::new(HashMap::new()),
             last_sweep: Mutex::new(Instant::now()),
             pending_ttl: Duration::from_secs(ttl),
-        };
+        }));
 
-        thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("rust2go-ipc-reactor".to_string())
-            .spawn(move || {
-                let rt = loop {
-                    if let Some(rt) = RUNTIME.get() {
-                        break rt;
-                    }
-                    thread::yield_now();
-                };
-                reactor_loop(reader, rt);
-            })
-            .expect("rust2go-ipc: cannot spawn reactor thread");
+            .spawn(move || reactor_loop(reader, rt))
+        {
+            reap_child(rt);
+            panic!("rust2go-ipc: cannot spawn reactor thread: {e}");
+        }
 
         rt
     })
@@ -623,32 +676,37 @@ pub unsafe fn dispatch_sync(
     let req_id = next_req_id(rt);
     // Dedicated connection to the resolved endpoint: overrides may differ
     // from the build-time constant passed in `port`.
+    // A synchronous rust2go stub always does `slot.take().unwrap()` after this
+    // call. Returning with the slot unset (and sync handlers have no cleanup)
+    // would panic in the macro with a useless "None" message. There is no error
+    // channel in the sync signature, so surface a descriptive panic here with
+    // the method id and cause; the generated stub is a plain Rust `unsafe fn`,
+    // so unwinding reaches the caller safely.
     let Some(mut stream) = connect_with_retry(&rt.endpoint, Duration::from_secs(10)) else {
-        eprintln!("rust2go-ipc: cannot connect for synchronous call");
-        return;
+        panic!("rust2go-ipc: sync call to method {method_id} failed: cannot connect to Go server");
     };
-    let _ = stream.set_read_timeout(Duration::from_secs(300));
+    let _ = stream.set_read_timeout(Duration::from_secs(sync_timeout_secs()));
     let _ = stream.set_write_timeout(Duration::from_secs(30));
     let frame = build_frame(req_id, method_id, payload);
     if let Err(e) = stream.write_all(&frame).and_then(|_| stream.flush()) {
-        eprintln!("rust2go-ipc: cannot write sync request: {e}");
-        return;
+        panic!("rust2go-ipc: sync call to method {method_id} failed: cannot write request: {e}");
     }
 
     let (resp_id, status, resp) = match read_response(&mut stream) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("rust2go-ipc: cannot read sync response: {e}");
-            return;
+            panic!(
+                "rust2go-ipc: sync call to method {method_id} failed: cannot read response: {e}"
+            );
         }
     };
     if resp_id != req_id {
-        eprintln!("rust2go-ipc: sync response id mismatch ({resp_id} != {req_id})");
-        return;
+        panic!(
+            "rust2go-ipc: sync call to method {method_id} failed: response id mismatch ({resp_id} != {req_id})"
+        );
     }
     if status != 0 {
-        eprintln!("rust2go-ipc: Go returned error status for sync req {req_id}");
-        return;
+        panic!("rust2go-ipc: sync call to method {method_id} failed: Go returned error status");
     }
     // SAFETY: `slot`/`cb`/`trampoline` come from the generated stub's safety
     // contract; `resp` is a live owned buffer for the duration of this call.
@@ -718,16 +776,21 @@ fn build_frame(req_id: u64, method_id: u32, payload: &[u8]) -> Vec<u8> {
 
 /// Write a request frame. Write/flush failures are logged rather than panicked:
 /// panicking here would poison the writer mutex and (via the reactor's reconnect
-/// path) kill the only recovery thread. The reactor detects the dead connection
-/// through its read side and respawns the server; in-flight futures time out via
-/// the pending TTL.
+/// path) kill the only recovery thread. On failure the stream is shut down so
+/// the reactor's cloned reader sees EOF and rebuilds both ends; merely returning
+/// false is not enough, because a partial frame would desynchronise the Go read
+/// loop while the reactor (which only probes child liveness on idle) keeps the
+/// broken connection. In-flight futures are released by `drop_all_pending`.
 fn write_frame(rt: &Runtime, req_id: u64, method_id: u32, payload: &[u8]) -> bool {
     let frame = build_frame(req_id, method_id, payload);
     let mut writer = lock_or_recover(&rt.writer);
     match writer.write_all(&frame).and_then(|_| writer.flush()) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("rust2go-ipc: cannot write request frame (req {req_id}): {e}");
+            eprintln!(
+                "rust2go-ipc: cannot write request frame (req {req_id}): {e}; closing connection"
+            );
+            writer.shutdown_both();
             false
         }
     }
@@ -1051,6 +1114,14 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn list_elements<T: WirePrim>(&mut self, n: usize) -> RawListRef {
+        if n == 0 {
+            // Match prim_list/ref_list/string: an empty list has a null pointer,
+            // not the dangling-but-aligned pointer of an empty Box<[T]>.
+            return RawListRef {
+                ptr: null(),
+                len: 0,
+            };
+        }
         // Bound the element count against the remaining bytes first: a single
         // corrupt u64 length must not drive an unbounded allocation loop.
         let max = self.buf.len().saturating_sub(self.pos) / size_of::<T>().max(1);

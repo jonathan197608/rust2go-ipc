@@ -385,14 +385,14 @@ fn parse_schema(src: &str) -> Schema {
         if !has_marker_attr(&t.attrs, "r2g") {
             continue;
         }
-        let trait_name = t.ident.to_string();
+        let trait_name = bare_ident(&t.ident);
         validate_ident(&trait_name, "trait");
         if !schema.traits.contains(&trait_name) {
             schema.traits.push(trait_name.clone());
         }
         for m in &t.items {
             let TraitItem::Fn(f) = m else { continue };
-            let name = f.sig.ident.to_string();
+            let name = bare_ident(&f.sig.ident);
             validate_ident(&name, "method");
             let mut params = Vec::new();
             for arg in &f.sig.inputs {
@@ -400,7 +400,7 @@ fn parse_schema(src: &str) -> Schema {
                     panic!("rust2go-ipc: receiver is not supported in #[r2g] trait methods");
                 };
                 let pname = match &*p.pat {
-                    Pat::Ident(i) => i.ident.to_string(),
+                    Pat::Ident(i) => bare_ident(&i.ident),
                     _ => panic!("rust2go-ipc: only simple parameter patterns are supported"),
                 };
                 validate_ident(&pname, "parameter");
@@ -505,7 +505,7 @@ fn parse_schema(src: &str) -> Schema {
 fn path_last_segment(path: &syn::Path) -> String {
     path.segments
         .last()
-        .map(|s| s.ident.to_string())
+        .map(|s| bare_ident(&s.ident))
         .unwrap_or_default()
 }
 
@@ -534,21 +534,33 @@ fn has_derive(s: &ItemStruct, name: &str) -> bool {
         })
 }
 
+/// Strip a Rust raw-identifier prefix (`r#foo` -> `foo`). Validation already
+/// operates on the bare form; generation must use the same bare form or it
+/// would emit Go/Rust identifiers containing an illegal `#`.
+fn bare_ident(ident: &proc_macro2::Ident) -> String {
+    let s = ident.to_string();
+    s.strip_prefix("r#").unwrap_or(&s).to_string()
+}
+
 fn parse_struct(s: &ItemStruct) -> StructDef {
-    let name = s.ident.to_string();
+    let name = bare_ident(&s.ident);
     let fields = match &s.fields {
         Fields::Named(named) => named
             .named
             .iter()
             .map(|f| {
-                let fname = f.ident.as_ref().expect("named field").to_string();
+                let fname = bare_ident(f.ident.as_ref().expect("named field"));
                 FieldDef {
                     name: fname,
                     ty: strip_reference(&f.ty).0,
                 }
             })
             .collect(),
-        _ => Vec::new(),
+        // Treating tuple/unit structs as zero-field would silently drop their
+        // data. Reject them at build time instead of generating broken code.
+        Fields::Unnamed(_) | Fields::Unit => panic!(
+            "rust2go-ipc: struct `{name}` must have named fields; tuple and unit structs are not supported"
+        ),
     };
     StructDef { name, fields }
 }

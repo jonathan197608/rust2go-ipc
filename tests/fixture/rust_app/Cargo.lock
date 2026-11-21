@@ -139,7 +139,7 @@ checksum = "21ee4d6efac91720550e564892b1fddfe103683f7f0b19196f59dae1621e6e83"
 
 [[package]]
 name = "rust2go-ipc"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
  "proc-macro2",

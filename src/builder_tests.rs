@@ -265,3 +265,60 @@ fn trait_name_colliding_with_go_helper_is_rejected() {
     );
     let _ = generate_go_sources(&schema);
 }
+
+#[test]
+#[should_panic(expected = "must have named fields")]
+fn tuple_struct_is_rejected() {
+    let _ = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct Req(i32);
+        #[r2g]
+        pub trait GolangCall { fn f(x: Req) -> Req; }
+        "#,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must have named fields")]
+fn unit_struct_is_rejected() {
+    let _ = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct Req;
+        #[r2g]
+        pub trait GolangCall { fn f(x: Req) -> Req; }
+        "#,
+    );
+}
+
+#[test]
+fn raw_identifiers_generate_clean_go_names() {
+    // Non-keyword raw identifiers (r#foo) are legal Rust but the `r#` prefix
+    // must be stripped before generating Go/Rust identifiers. Keyword ones
+    // like r#type are rejected by validate_ident as Go keywords.
+    let schema = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct r#Payload { pub r#value: i32 }
+        #[r2g]
+        pub trait GolangCall { fn r#fetch(r#req: r#Payload) -> r#Payload; }
+        "#,
+    );
+    assert_eq!(schema.structs[0].name, "Payload");
+    assert_eq!(schema.structs[0].fields[0].name, "value");
+    assert_eq!(schema.methods[0].name, "fetch");
+    assert_eq!(schema.methods[0].params[0].name, "req");
+
+    let go = generate_go_sources(&schema);
+    assert!(
+        !go.contains("r#"),
+        "generated Go must not contain r# prefix:\n{go}"
+    );
+    let rust = generate_rust_bindings(&schema, 1234).to_string();
+    assert!(
+        !rust.contains("r#"),
+        "generated Rust identifiers must not contain r# prefix:\n{rust}"
+    );
+    syn::parse_file(&rust).expect("generated Rust must parse");
+}

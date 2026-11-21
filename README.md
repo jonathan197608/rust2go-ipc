@@ -55,14 +55,17 @@ Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives 
 | `RUST2GO_IPC_PORT_OVERRIDE` | Loopback port override. Both sides must agree; the value is forwarded to the child process. |
 | `RUST2GO_IPC_TRANSPORT_OVERRIDE` | Force `tcp` or `unix` regardless of compile target. |
 | `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint (port or socket path). Both sides must agree. |
-| `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. |
+| `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. `0` is rejected. |
+| `RUST2GO_IPC_SYNC_TIMEOUT_SECS` | Response deadline for synchronous calls, in seconds. Default `30`, independent of the async pending TTL. `0` is rejected. |
 | `RUST2GO_IPC_MAX_CONCURRENCY` | Max in-flight Go handlers per server. Default `NumCPU*4` (min 16). Lower it to bound downstream load; the read loop applies back-pressure when full. |
 
 ## Failure semantics
 
 The generated Go dispatcher recovers handler panics and returns an error status. The Rust side logs it and drops the pending entry; the awaiting future is resolved by the caller's own timeout, since the rust2go callback signature has no error channel.
 
-If the connection drops, the reactor clears pending entries, restarts the Go server, and reconnects. In-flight futures rely on caller timeouts. Rust atomic slots remain memory-safe when a late callback observes a dropped reader.
+**Synchronous calls have no error channel either**: connect/write/read failures, a bad response id, an error status, or the sync timeout make `dispatch_sync` panic with a descriptive message (method id and cause) instead of returning with the slot unset — otherwise the macro's `slot.take().unwrap()` would panic with a useless "None" message. The generated stub is a plain Rust `unsafe fn`, so this panic unwinds normally to the caller. If you cannot tolerate a panic, wrap the call in `catch_unwind`.
+
+If the connection drops, the reactor clears pending entries, restarts the Go server, and reconnects. In-flight futures rely on caller timeouts. Rust atomic slots remain memory-safe when a late callback observes a dropped reader. A failed request write shuts the connection down immediately so the reactor rebuilds both ends rather than keeping a frame-desynchronised stream.
 
 ## Limitations
 
