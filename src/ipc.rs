@@ -713,11 +713,24 @@ pub unsafe fn dispatch_sync(
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
         (handler.trampoline)(resp.as_ptr(), resp.len(), slot, cb);
     }));
-    if result.is_err() {
-        eprintln!("rust2go-ipc: response trampoline panicked for sync req {req_id}");
+    if let Err(panic) = result {
         if let Some(f) = handler.cleanup {
             unsafe { f(slot) };
         }
+        // Sync has no error channel: returning with the slot unset would make
+        // the macro's `slot.take().unwrap()` panic with a useless "None" message.
+        // Surface a descriptive panic with the method id, keeping the original
+        // decode panic text as detail when it is a string payload.
+        let detail = if let Some(s) = panic.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        panic!(
+            "rust2go-ipc: sync call to method {method_id} (req {req_id}) failed: response decode panicked: {detail}"
+        );
     }
 }
 
@@ -872,8 +885,14 @@ fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
                 Ok(r) => {
                     let _ = stream.set_write_timeout(Duration::from_secs(30));
                     let _ = r.set_read_timeout(Duration::from_secs(300));
+                    // Swap both ends while holding the writer lock. write_frame
+                    // takes the same lock, so a concurrent dispatch cannot slip
+                    // a request onto the old stream in the gap between replacing
+                    // the reactor's reader and the shared writer (which would
+                    // leave that response unread until TTL expiry).
+                    let mut writer = lock_or_recover(&rt.writer);
+                    *writer = stream;
                     *reader = r;
-                    *lock_or_recover(&rt.writer) = stream;
                     return true;
                 }
                 Err(e) => eprintln!("rust2go-ipc: cannot clone reconnected stream: {e}"),
@@ -897,6 +916,12 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
                         .map(|c| matches!(c.try_wait(), Ok(None)))
                         .unwrap_or(false);
                     if alive {
+                        // The idle read timeout is the only periodic tick a
+                        // quiet reactor gets. Reclaim timed-out pending slots
+                        // here so a lost response followed by a long idle
+                        // period cannot leak the SlotWriter and its request
+                        // attachment. sweep_pending is internally throttled.
+                        sweep_pending(rt);
                         continue;
                     }
                 }
@@ -1169,7 +1194,10 @@ impl<'a> Decoder<'a> {
 
     /// Read a primitive list written by [`Encoder::prim_list`].
     pub fn prim_list<T: WirePrim>(&mut self) -> RawListRef {
-        let n = self.list_len();
+        // Guard by the element's wire width, not a blanket 1 byte: a corrupt
+        // count in (remaining/size_of::<T>(), remaining] would otherwise pass
+        // the guard and make take(n * size) panic deep inside the decoder.
+        let n = self.list_len_min(size_of::<T>());
         if n == 0 {
             return RawListRef {
                 ptr: null(),

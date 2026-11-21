@@ -1,6 +1,6 @@
 # rust2go-ipc
 
-Drop-in replacement for [rust2go](https://crates.io/crates/rust2go) that keeps Rust in the main process and moves Go into a child process. Calls cross the boundary over a local TCP socket instead of in-process cgo FFI.
+Drop-in replacement for [rust2go](https://crates.io/crates/rust2go) that keeps Rust in the main process and moves Go into a child process. Calls cross the boundary over a local IPC channel (a Unix domain socket on Unix, a TCP loopback socket elsewhere) instead of in-process cgo FFI.
 
 This removes the Go runtime from the host process, which fixes crashes caused by conflicting signal handlers when the host is a JVM (for example `non-Go code set up signal handler without SA_ONSTACK flag`).
 
@@ -31,7 +31,7 @@ A Go toolchain must be available at build time. The build script runs `go build`
 - `<go_src>/ipc_main.go` — the IPC server entry point
 - `target/<triple>/<profile>/go-ipc-server` — a stable binary path for container image builds
 
-The `build` feature pulls in `syn`, `quote`, and `proc-macro2`. The runtime feature set has no extra dependencies beyond upstream `rust2go`.
+The `build` feature pulls in `syn`, `quote`, and `proc-macro2`. Beyond upstream `rust2go`, the runtime depends only on `libc`.
 
 ## How it works
 
@@ -39,7 +39,7 @@ The rust2go macro expands each Go call into one external symbol, `binding::CGola
 
 1. The stub flattens the Ref pointer graph into a self-contained byte buffer.
 2. `dispatch` assigns a request id, stores `(slot, cb, trampoline)` in a pending table, writes one frame, and returns immediately. Tokio workers are never blocked.
-3. The Go server dispatches each request in its own goroutine, so a slow handler never serialises later requests on the shared connection. Responses are written back out of order; the Rust reactor matches them by request id. Concurrency is bounded by a semaphore with back-pressure (both cancellable on teardown and time-boxed after 30 s so a wedged slot cannot leak a goroutine), and response writes are serialised to keep frames intact. The server's 5-minute read deadline is a keep-alive tick, not a disconnect: idle expiry renews it and keeps waiting, so an idle or long-running handler never causes the connection to close. On teardown, in-flight handlers get a bounded 2-second window to release their slot (a hung handler never blocks exit, and the Rust pending TTL is the backstop).
+3. The Go server dispatches each request in its own goroutine, so a slow handler never serialises later requests on the shared connection. Responses are written back out of order; the Rust reactor matches them by request id. Concurrency is bounded by a semaphore with back-pressure (both cancellable on teardown and time-boxed after 60 s (longer than the 30 s Rust sync timeout) so a wedged slot cannot leak a goroutine), and response writes are serialised to keep frames intact. The server's 5-minute read deadline is a keep-alive tick, not a disconnect: idle expiry renews it and keeps waiting, so an idle or long-running handler never causes the connection to close. On teardown, in-flight handlers get a bounded 2-second window to release their slot (a hung handler never blocks exit, and the Rust pending TTL is the backstop).
 4. A reactor thread reads response frames, restores the response Ref graph into an arena, and invokes the generated trampoline.
 5. The `C-unwind` trampoline performs the callback effect directly (sync: write the stack `Option`; async: `SlotWriter::write`), so no panic can cross an `extern "C"` boundary and abort the process. Pending slots are explicitly released on timeout, disconnect, error status, or trampoline panic.
 

@@ -16,6 +16,14 @@ import (
 const magic = "R2GI"
 const version = uint16(1)
 
+// usize/isize cross the wire as fixed 8-byte values; Rust enforces a 64-bit
+// target. A 32-bit Go server would step 4 bytes per uint/int and desync the
+// primitive-list stream. This fails the build on any non-64-bit target.
+// strconv.IntSize/64 - 1 is 0 on 64-bit (valid [0]struct{}) and -1 on 32-bit
+// (invalid array length), with no runtime cost.
+const _require64bitGoTarget = strconv.IntSize/64 - 1
+var _ [_require64bitGoTarget]struct{}
+
 const maxAcceptErrs = 10
 
 // A single long-lived connection can carry many in-flight async requests.
