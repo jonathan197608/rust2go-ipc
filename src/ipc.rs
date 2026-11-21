@@ -168,9 +168,88 @@ impl Write for IpcStream {
 /// `(payload_ptr, payload_len, slot, cb)`.
 pub type Trampoline = unsafe extern "C" fn(*const u8, usize, *const (), *const ());
 
+mod sealed {
+    /// Prevents downstream crates from adding wire primitives. Only the
+    /// fixed set below is known to be padding-free, which is what makes the
+    /// raw byte reads in Encoder/Decoder sound.
+    pub trait Sealed {}
+}
+
+/// Types that can be bit-copied to/from the IPC wire format.
+///
+/// Sealed on purpose: implementors are all fixed-width primitives with no
+/// padding bytes, so reading `size_of::<T>()` bytes never observes
+/// uninitialised padding. `bool` is special-cased to reject invalid bit
+/// patterns instead of creating an invalid value (which would be UB).
+pub trait WirePrim: Copy + 'static + sealed::Sealed {
+    /// Decode one value from a byte slice of exactly `size_of::<Self>()` bytes.
+    #[allow(clippy::missing_safety_doc)]
+    fn read(bytes: &[u8]) -> Self;
+
+    /// Append this value's wire bytes to `out`.
+    fn write(self, out: &mut Vec<u8>);
+
+    /// Validate a raw byte run holding a list of this type (default: no-op).
+    /// `bool` overrides this to reject bytes other than 0/1.
+    fn validate(_bytes: &[u8]) {}
+}
+
+macro_rules! impl_wire_prim_plain {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl sealed::Sealed for $t {}
+            impl WirePrim for $t {
+                fn read(bytes: &[u8]) -> Self {
+                    debug_assert_eq!(bytes.len(), size_of::<Self>());
+                    // SAFETY: $t is a fixed-width primitive with no padding;
+                    // every bit pattern is valid. `bytes` has exactly
+                    // size_of::<$t>() bytes, sliced by Decoder::prim.
+                    unsafe { read_unaligned(bytes.as_ptr() as *const $t) }
+                }
+                fn write(self, out: &mut Vec<u8>) {
+                    // SAFETY: $t has no padding, so the full byte range of the
+                    // local `self` is initialised and safe to read.
+                    let bytes =
+                        unsafe { from_raw_parts(&self as *const $t as *const u8, size_of::<$t>()) };
+                    out.extend_from_slice(bytes);
+                }
+            }
+        )+
+    };
+}
+
+impl_wire_prim_plain!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+
+impl sealed::Sealed for bool {}
+impl WirePrim for bool {
+    fn read(bytes: &[u8]) -> Self {
+        debug_assert_eq!(bytes.len(), 1);
+        // Never reinterpret arbitrary bytes as bool (non-0/1 is UB). The wire
+        // producer emits 0/1 only; a corrupt frame panics instead of becoming UB.
+        match bytes[0] {
+            0 => false,
+            1 => true,
+            v => panic!("rust2go-ipc: invalid bool byte 0x{v:02x} in response"),
+        }
+    }
+    fn write(self, out: &mut Vec<u8>) {
+        out.push(u8::from(self));
+    }
+    fn validate(bytes: &[u8]) {
+        assert!(
+            bytes.iter().all(|&b| b <= 1),
+            "rust2go-ipc: invalid bool byte in list response"
+        );
+    }
+}
+
 struct Pending {
-    slot: *const (),
-    cb: *const (),
+    // Store the slot/cb addresses as integers rather than raw pointers: `*const ()`
+    // is neither Send nor Sync, which would force `unsafe impl` on Runtime. The
+    // round-trip `ptr as usize as *const ()` is lossless and keeps the unsafe
+    // scope confined to the point where the trampoline is actually invoked.
+    slot: usize,
+    cb: usize,
     trampoline: Trampoline,
     created: Instant,
 }
@@ -187,11 +266,9 @@ struct Runtime {
     pending_ttl: Duration,
 }
 
-// SAFETY: slot pointers are owned by atomic slots whose writer is kept alive
-// until the callback runs; cb and trampoline are `#[no_mangle]` functions in
-// the Rust binary. Each pending entry is removed and consumed exactly once.
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
+// Runtime is Send + Sync without manual impls: slot/cb addresses are stored as
+// `usize`, and Trampoline (a fn pointer) is Send + Sync. The remaining fields
+// are Mutex/Atomic/String/Child, all thread-safe.
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -324,6 +401,8 @@ pub fn free_port() -> u16 {
 /// # Safety
 /// `slot` must be a live atomic-slot writer pointer, `cb` a valid generated
 /// callback, and `trampoline` a generated response decoder for `method_id`.
+/// All three are captured and invoked later on the reactor thread, so they
+/// must stay valid until the response arrives or the pending entry expires.
 pub unsafe fn dispatch(
     server: &str,
     port: u16,
@@ -343,8 +422,8 @@ pub unsafe fn dispatch(
         .insert(
             req_id,
             Pending {
-                slot,
-                cb,
+                slot: slot as usize,
+                cb: cb as usize,
                 trampoline,
                 created: Instant::now(),
             },
@@ -388,7 +467,11 @@ pub unsafe fn dispatch_sync(
         read_response(&mut stream).expect("rust2go-ipc: cannot read sync response");
     assert_eq!(resp_id, req_id, "rust2go-ipc: sync response id mismatch");
     assert_eq!(status, 0, "rust2go-ipc: Go returned error for sync call");
-    trampoline(resp.as_ptr(), resp.len(), slot, cb);
+    // SAFETY: `slot`/`cb`/`trampoline` come from the generated stub's safety
+    // contract; `resp` is a live owned buffer for the duration of this call.
+    unsafe {
+        trampoline(resp.as_ptr(), resp.len(), slot, cb);
+    }
 }
 
 fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
@@ -420,9 +503,10 @@ fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
 
 /// Fire-and-forget call: no pending entry, no response expected.
 ///
-/// # Safety
-/// The Go server must be running; no Rust pointers are retained by this call.
-pub unsafe fn dispatch_oneway(server: &str, port: u16, method_id: u32, payload: &[u8]) {
+/// Safe: nothing captures caller pointers and no response is decoded. The Go
+/// server must be running for the frame to be delivered, but that is a
+/// liveness concern, not a memory-safety one.
+pub fn dispatch_oneway(server: &str, port: u16, method_id: u32, payload: &[u8]) {
     let rt = runtime(server, port);
     write_frame(rt, 0, method_id, payload);
 }
@@ -504,8 +588,16 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
         match pending {
             Some(p) if status == 0 => {
                 // A malformed response must not kill the reactor thread.
+                // SAFETY: p.slot/p.cb are the usize round-trips of the pointers
+                // captured in dispatch(); their validity is that call's safety
+                // contract. trampoline is a generated fn in this binary.
                 let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                    (p.trampoline)(payload.as_ptr(), payload.len(), p.slot, p.cb);
+                    (p.trampoline)(
+                        payload.as_ptr(),
+                        payload.len(),
+                        p.slot as *const (),
+                        p.cb as *const (),
+                    );
                 }));
                 if result.is_err() {
                     eprintln!("rust2go-ipc: response trampoline panicked for req {req_id}");
@@ -545,9 +637,8 @@ impl Encoder {
         Self::default()
     }
 
-    pub fn prim<T: Copy>(&mut self, v: T) {
-        let bytes = unsafe { from_raw_parts(&v as *const T as *const u8, size_of::<T>()) };
-        self.buf.extend_from_slice(bytes);
+    pub fn prim<T: WirePrim>(&mut self, v: T) {
+        v.write(&mut self.buf);
     }
 
     pub fn string(&mut self, s: RawStringRef) {
@@ -565,13 +656,15 @@ impl Encoder {
     }
 
     /// Write a primitive list as `[u64 len][len * size_of::<T>() raw bytes]`.
-    pub fn prim_list<T: Copy>(&mut self, ptr: *const (), len: usize) {
+    pub fn prim_list<T: WirePrim>(&mut self, ptr: *const (), len: usize) {
         self.prim(len as u64);
         if len == 0 {
             return;
         }
-        let nbytes = len * size_of::<T>();
-        let bytes = unsafe { from_raw_parts(ptr as *const u8, nbytes) };
+        // SAFETY: the list pointer/length come from a rust2go `ListRef` whose
+        // elements are T; WirePrim guarantees T is padding-free so the byte
+        // range is fully initialised. Validity/lifetime is the stub's contract.
+        let bytes = unsafe { from_raw_parts(ptr as *const u8, len * size_of::<T>()) };
         self.buf.extend_from_slice(bytes);
     }
 
@@ -627,11 +720,11 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    pub fn prim<T: Copy>(&mut self) -> T {
+    pub fn prim<T: WirePrim>(&mut self) -> T {
         let n = size_of::<T>();
         let bytes = &self.buf[self.pos..self.pos + n];
         self.pos += n;
-        unsafe { read_unaligned(bytes.as_ptr() as *const T) }
+        T::read(bytes)
     }
 
     pub fn string(&mut self) -> RawStringRef {
@@ -652,7 +745,7 @@ impl<'a> Decoder<'a> {
         self.prim::<u64>() as usize
     }
 
-    pub fn list_elements<T: Copy + 'static>(&mut self, n: usize) -> RawListRef {
+    pub fn list_elements<T: WirePrim>(&mut self, n: usize) -> RawListRef {
         let items: Vec<T> = (0..n).map(|_| self.prim::<T>()).collect();
         let ptr = self.arena.elements(&items);
         RawListRef {
@@ -662,7 +755,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// Read a primitive list written by [`Encoder::prim_list`].
-    pub fn prim_list<T: Copy + 'static>(&mut self) -> RawListRef {
+    pub fn prim_list<T: WirePrim>(&mut self) -> RawListRef {
         let n = self.list_len();
         if n == 0 {
             return RawListRef {
@@ -673,6 +766,7 @@ impl<'a> Decoder<'a> {
         let nbytes = n * size_of::<T>();
         let bytes = &self.buf[self.pos..self.pos + nbytes];
         self.pos += nbytes;
+        T::validate(bytes);
         let ptr = self.arena.bytes(bytes).0 as *const ();
         RawListRef { ptr, len: n }
     }
