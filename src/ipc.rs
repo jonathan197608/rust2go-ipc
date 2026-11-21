@@ -10,17 +10,16 @@ use std::{
     any::Any,
     collections::HashMap,
     env,
-    hint::spin_loop,
     io::{self, Error as IoError, ErrorKind, Read, Write},
     mem::size_of,
     net::{TcpListener, TcpStream},
     panic::{catch_unwind, AssertUnwindSafe},
     process::{Child, Command, Stdio},
-    ptr::{null, read_unaligned},
+    ptr::null,
     slice::from_raw_parts,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        Mutex, Once, OnceLock,
     },
     thread::{self, sleep},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -134,6 +133,22 @@ impl IpcStream {
             IpcStream::Unix(s) => s.try_clone().map(IpcStream::Unix),
         }
     }
+
+    fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        match self {
+            IpcStream::Tcp(s) => s.set_read_timeout(Some(timeout)),
+            #[cfg(unix)]
+            IpcStream::Unix(s) => s.set_read_timeout(Some(timeout)),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Duration) -> io::Result<()> {
+        match self {
+            IpcStream::Tcp(s) => s.set_write_timeout(Some(timeout)),
+            #[cfg(unix)]
+            IpcStream::Unix(s) => s.set_write_timeout(Some(timeout)),
+        }
+    }
 }
 
 impl Read for IpcStream {
@@ -174,6 +189,29 @@ impl Write for IpcStream {
 /// and the pending entry dropped.
 pub type Trampoline = unsafe extern "C-unwind" fn(*const u8, usize, *const (), *const ());
 
+/// Type-erased destructor for an async slot that will never receive a
+/// callback. Generated per method because the concrete `SlotWriter<T, A>`
+/// type is needed to release the slot and its attachment.
+pub type SlotCleanup = unsafe fn(*const ());
+
+/// Everything the runtime needs to decode a response and, if no response
+/// arrives, release the caller's slot. Kept in one value to avoid an 8-argument
+/// public API.
+#[derive(Clone, Copy)]
+pub struct ResponseHandler {
+    pub trampoline: Trampoline,
+    pub cleanup: Option<SlotCleanup>,
+}
+
+impl ResponseHandler {
+    pub const fn new(trampoline: Trampoline, cleanup: Option<SlotCleanup>) -> Self {
+        Self {
+            trampoline,
+            cleanup,
+        }
+    }
+}
+
 mod sealed {
     /// Prevents downstream crates from adding wire primitives. Only the
     /// fixed set below is known to be padding-free, which is what makes the
@@ -200,36 +238,53 @@ pub trait WirePrim: Copy + 'static + sealed::Sealed {
     fn validate(_bytes: &[u8]) {}
 }
 
-macro_rules! impl_wire_prim_plain {
+/// All multi-byte primitives are encoded explicitly little-endian. The Go
+/// producer uses `binary.LittleEndian`, so relying on native byte order would
+/// silently corrupt data on big-endian Rust targets.
+macro_rules! impl_wire_prim_le {
     ($($t:ty),+ $(,)?) => {
         $(
             impl sealed::Sealed for $t {}
             impl WirePrim for $t {
                 fn read(bytes: &[u8]) -> Self {
-                    debug_assert_eq!(bytes.len(), size_of::<Self>());
-                    // SAFETY: $t is a fixed-width primitive with no padding;
-                    // every bit pattern is valid. `bytes` has exactly
-                    // size_of::<$t>() bytes, sliced by Decoder::prim.
-                    unsafe { read_unaligned(bytes.as_ptr() as *const $t) }
+                    let expected = size_of::<Self>();
+                    assert_eq!(
+                        bytes.len(), expected,
+                        "rust2go-ipc: primitive wire length mismatch"
+                    );
+                    let mut arr = [0u8; size_of::<Self>()];
+                    arr.copy_from_slice(bytes);
+                    Self::from_le_bytes(arr)
                 }
                 fn write(self, out: &mut Vec<u8>) {
-                    // SAFETY: $t has no padding, so the full byte range of the
-                    // local `self` is initialised and safe to read.
-                    let bytes =
-                        unsafe { from_raw_parts(&self as *const $t as *const u8, size_of::<$t>()) };
-                    out.extend_from_slice(bytes);
+                    out.extend_from_slice(&self.to_le_bytes());
                 }
             }
         )+
     };
 }
 
-impl_wire_prim_plain!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+impl_wire_prim_le!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+
+impl sealed::Sealed for char {}
+impl WirePrim for char {
+    fn read(bytes: &[u8]) -> Self {
+        assert_eq!(bytes.len(), 4, "rust2go-ipc: char wire length mismatch");
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(bytes);
+        let scalar = u32::from_le_bytes(arr);
+        char::from_u32(scalar)
+            .unwrap_or_else(|| panic!("rust2go-ipc: invalid char scalar 0x{scalar:08x}"))
+    }
+    fn write(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self as u32).to_le_bytes());
+    }
+}
 
 impl sealed::Sealed for bool {}
 impl WirePrim for bool {
     fn read(bytes: &[u8]) -> Self {
-        debug_assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes.len(), 1, "rust2go-ipc: bool wire length mismatch");
         // Never reinterpret arbitrary bytes as bool (non-0/1 is UB). The wire
         // producer emits 0/1 only; a corrupt frame panics instead of becoming UB.
         match bytes[0] {
@@ -257,7 +312,21 @@ struct Pending {
     slot: usize,
     cb: usize,
     trampoline: Trampoline,
+    cleanup: Option<SlotCleanup>,
     created: Instant,
+}
+
+impl Pending {
+    /// Release the slot when no callback will ever consume it. Must be called
+    /// after removing the pending entry from the map: waking the future can
+    /// re-enter the runtime.
+    fn cleanup(self) {
+        if let Some(f) = self.cleanup {
+            // SAFETY: the slot pointer came from the generated stub's
+            // `SlotWriter::into_ptr()` and is only released once.
+            unsafe { f(self.slot as *const ()) };
+        }
+    }
 }
 
 struct Runtime {
@@ -277,6 +346,23 @@ struct Runtime {
 // are Mutex/Atomic/String/Child, all thread-safe.
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static ATEXIT: Once = Once::new();
+
+/// Kill and reap the child, then close the pipe held by the runtime.
+fn reap_child(rt: &Runtime) {
+    if let Some(mut child) = lock_or_recover(&rt.child).take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Rust does not drop `static` values at process exit. Without this hook the
+/// Go server survives as an orphan, keeping the port/socket occupied.
+extern "C" fn cleanup_on_exit() {
+    if let Some(rt) = RUNTIME.get() {
+        reap_child(rt);
+    }
+}
 
 /// Spawn the Go server once and start the reactor. `server` is the path to the
 /// compiled Go IPC binary; `port` was reserved by the build script.
@@ -313,21 +399,36 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(port);
     let endpoint = resolve_endpoint(port);
+    ATEXIT.call_once(|| unsafe {
+        let _ = libc::atexit(cleanup_on_exit);
+    });
     RUNTIME.get_or_init(move || {
         let mut child = spawn_server(&server, port, &endpoint);
-        let stream = connect_with_retry(&endpoint, Duration::from_secs(10)).unwrap_or_else(|| {
-            // Reap the child before panicking so a failed start leaves no zombie.
+        // A Go server that fails to bind exits quickly (e.g. a stale port/socket
+        // or a bad binary). Reap and respawn instead of waiting for a timeout.
+        let stream = loop {
+            if let Some(status) = match child.try_wait() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("rust2go-ipc: try_wait during startup: {e}");
+                    None
+                }
+            } {
+                eprintln!("rust2go-ipc: Go server exited during startup ({status}); respawning");
+                let _ = child.kill();
+                let _ = child.wait();
+                child = spawn_server(&server, port, &endpoint);
+            }
+            if let Some(s) = connect_with_retry(&endpoint, Duration::from_millis(500)) {
+                break s;
+            }
+        };
+        let reader = stream.try_clone().unwrap_or_else(|e| {
             let _ = child.kill();
             let _ = child.wait();
-            panic!(
-                "rust2go-ipc: Go server never listened on {} {}",
-                endpoint.transport.as_str(),
-                endpoint.addr
-            )
+            panic!("rust2go-ipc: cannot clone IPC stream: {e}")
         });
-        let reader = stream
-            .try_clone()
-            .expect("rust2go-ipc: cannot clone IPC stream");
+        let _ = stream.set_write_timeout(Duration::from_secs(30));
         let ttl = env::var("RUST2GO_IPC_PENDING_TTL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -352,7 +453,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
                     if let Some(rt) = RUNTIME.get() {
                         break rt;
                     }
-                    spin_loop();
+                    thread::yield_now();
                 };
                 reactor_loop(reader, rt);
             })
@@ -362,9 +463,9 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
     })
 }
 
-/// Drop pending entries whose response never arrived. Their slots are still
-/// safe: rust2go's atomic slot releases itself when a late callback observes
-/// a dropped reader. This only bounds the bookkeeping table.
+/// Drop pending entries whose response never arrived and release their slots.
+/// Without an explicit cleanup the async `SlotWriter` (and the request buffer
+/// attached to it) would leak forever: no callback will ever consume it.
 fn sweep_pending(rt: &Runtime) {
     let now = now_secs();
     let last = rt.last_sweep.load(Ordering::Relaxed);
@@ -376,12 +477,27 @@ fn sweep_pending(rt: &Runtime) {
     {
         return;
     }
-    let mut pending = lock_or_recover(&rt.pending);
-    let before = pending.len();
-    pending.retain(|_, p| p.created.elapsed() < rt.pending_ttl);
-    let removed = before - pending.len();
-    if removed > 0 {
-        eprintln!("rust2go-ipc: swept {removed} stale pending entries");
+    let stale_ids: Vec<u64> = {
+        let pending = lock_or_recover(&rt.pending);
+        pending
+            .iter()
+            .filter(|(_, p)| p.created.elapsed() >= rt.pending_ttl)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    if stale_ids.is_empty() {
+        return;
+    }
+    let stale: Vec<Pending> = {
+        let mut pending = lock_or_recover(&rt.pending);
+        stale_ids
+            .iter()
+            .filter_map(|id| pending.remove(id))
+            .collect()
+    };
+    eprintln!("rust2go-ipc: swept {} stale pending entries", stale.len());
+    for p in stale {
+        p.cleanup();
     }
 }
 
@@ -424,23 +540,33 @@ pub unsafe fn dispatch(
     payload: &[u8],
     slot: *const (),
     cb: *const (),
-    trampoline: Trampoline,
+    handler: ResponseHandler,
 ) {
     let rt = runtime(server, port);
     sweep_pending(rt);
-    let req_id = rt.next_id.fetch_add(1, Ordering::Relaxed);
+    let req_id = next_req_id(rt);
 
     lock_or_recover(&rt.pending).insert(
         req_id,
         Pending {
             slot: slot as usize,
             cb: cb as usize,
-            trampoline,
+            trampoline: handler.trampoline,
+            cleanup: handler.cleanup,
             created: Instant::now(),
         },
     );
 
     write_frame(rt, req_id, method_id, payload);
+}
+
+/// `req_id = 0` is reserved for oneway frames. Skip it on u64 wraparound.
+fn next_req_id(rt: &Runtime) -> u64 {
+    let mut id = rt.next_id.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        id = rt.next_id.fetch_add(1, Ordering::Relaxed);
+    }
+    id
 }
 
 /// Synchronous call with a return value. The rust2go macro reads the stack
@@ -458,30 +584,49 @@ pub unsafe fn dispatch_sync(
     payload: &[u8],
     slot: *const (),
     cb: *const (),
-    trampoline: Trampoline,
+    handler: ResponseHandler,
 ) {
     let rt = runtime(_server, port);
-    let req_id = rt.next_id.fetch_add(1, Ordering::Relaxed);
+    let req_id = next_req_id(rt);
     // Dedicated connection to the resolved endpoint: overrides may differ
     // from the build-time constant passed in `port`.
-    let mut stream = connect_with_retry(&rt.endpoint, Duration::from_secs(10))
-        .expect("rust2go-ipc: cannot connect for synchronous call");
+    let Some(mut stream) = connect_with_retry(&rt.endpoint, Duration::from_secs(10)) else {
+        eprintln!("rust2go-ipc: cannot connect for synchronous call");
+        return;
+    };
+    let _ = stream.set_read_timeout(Duration::from_secs(300));
+    let _ = stream.set_write_timeout(Duration::from_secs(30));
     let frame = build_frame(req_id, method_id, payload);
-    stream
-        .write_all(&frame)
-        .expect("rust2go-ipc: cannot write sync request");
-    stream
-        .flush()
-        .expect("rust2go-ipc: cannot flush sync request");
+    if let Err(e) = stream.write_all(&frame).and_then(|_| stream.flush()) {
+        eprintln!("rust2go-ipc: cannot write sync request: {e}");
+        return;
+    }
 
-    let (resp_id, status, resp) =
-        read_response(&mut stream).expect("rust2go-ipc: cannot read sync response");
-    assert_eq!(resp_id, req_id, "rust2go-ipc: sync response id mismatch");
-    assert_eq!(status, 0, "rust2go-ipc: Go returned error for sync call");
+    let (resp_id, status, resp) = match read_response(&mut stream) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rust2go-ipc: cannot read sync response: {e}");
+            return;
+        }
+    };
+    if resp_id != req_id {
+        eprintln!("rust2go-ipc: sync response id mismatch ({resp_id} != {req_id})");
+        return;
+    }
+    if status != 0 {
+        eprintln!("rust2go-ipc: Go returned error status for sync req {req_id}");
+        return;
+    }
     // SAFETY: `slot`/`cb`/`trampoline` come from the generated stub's safety
     // contract; `resp` is a live owned buffer for the duration of this call.
-    unsafe {
-        trampoline(resp.as_ptr(), resp.len(), slot, cb);
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        (handler.trampoline)(resp.as_ptr(), resp.len(), slot, cb);
+    }));
+    if result.is_err() {
+        eprintln!("rust2go-ipc: response trampoline panicked for sync req {req_id}");
+        if let Some(f) = handler.cleanup {
+            unsafe { f(slot) };
+        }
     }
 }
 
@@ -551,44 +696,85 @@ fn write_frame(rt: &Runtime, req_id: u64, method_id: u32, payload: &[u8]) {
     }
 }
 
+/// Remove every pending entry and release its slot. Called when the transport
+/// dies: no late response can arrive on a dead connection.
+fn drop_all_pending(rt: &Runtime) {
+    let stale: Vec<Pending> = lock_or_recover(&rt.pending)
+        .drain()
+        .map(|(_, p)| p)
+        .collect();
+    for p in stale {
+        p.cleanup();
+    }
+}
+
+/// Re-establish the server and both stream ends. The child handle is stored in
+/// `rt.child` immediately after spawning so a panic in this function can never
+/// orphan it. Returns false only on recoverable connect failures.
+fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
+    reap_child(rt);
+    let child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+    *lock_or_recover(&rt.child) = Some(child);
+
+    loop {
+        let mut exited = false;
+        {
+            let mut guard = lock_or_recover(&rt.child);
+            if let Some(child) = guard.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        eprintln!(
+                            "rust2go-ipc: Go server exited during reconnect ({status}); respawning"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        *child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+                        exited = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("rust2go-ipc: try_wait failed: {e}"),
+                }
+            }
+        }
+        if exited {
+            continue;
+        }
+        if let Some(stream) = connect_with_retry(&rt.endpoint, Duration::from_millis(500)) {
+            match stream.try_clone() {
+                Ok(r) => {
+                    let _ = stream.set_write_timeout(Duration::from_secs(30));
+                    *reader = r;
+                    *lock_or_recover(&rt.writer) = stream;
+                    return true;
+                }
+                Err(e) => eprintln!("rust2go-ipc: cannot clone reconnected stream: {e}"),
+            }
+        }
+        sleep(Duration::from_millis(200));
+    }
+}
+
 fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
     loop {
         let (req_id, status, payload) = match read_response(&mut reader) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("rust2go-ipc: connection lost ({e}); restarting Go server");
-                // In-flight futures stay pending until their caller timeout;
-                // a late response can never reach a stale slot because the
-                // connection is gone.
-                lock_or_recover(&rt.pending).clear();
-                if let Some(mut child) = lock_or_recover(&rt.child).take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                if e.kind() == ErrorKind::InvalidData {
+                    // A single malformed frame must not kill the whole server;
+                    // the sender is local and can be fixed without a restart.
+                    eprintln!("rust2go-ipc: invalid response frame: {e}");
+                    continue;
                 }
-                // Keep one child handle across retries. Spawning on every
-                // failed connect leaks processes and races for the port.
-                let mut child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+                eprintln!("rust2go-ipc: connection lost ({e}); restarting Go server");
+                drop_all_pending(rt);
+                // The only recovery thread must survive a panic in reconnect.
                 loop {
-                    if let Some(status) = child.try_wait().expect("rust2go-ipc: try_wait failed") {
-                        eprintln!(
-                            "rust2go-ipc: Go server exited during reconnect ({status}); respawning"
-                        );
-                        child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+                    match catch_unwind(AssertUnwindSafe(|| reconnect(rt, &mut reader))) {
+                        Ok(true) => break,
+                        Ok(false) => eprintln!("rust2go-ipc: reconnect failed; retrying"),
+                        Err(_) => eprintln!("rust2go-ipc: reconnect panicked; retrying"),
                     }
-                    match connect_with_retry(&rt.endpoint, Duration::from_secs(2)) {
-                        Some(stream) => {
-                            reader = stream
-                                .try_clone()
-                                .expect("rust2go-ipc: cannot clone reconnected stream");
-                            *lock_or_recover(&rt.writer) = stream;
-                            *lock_or_recover(&rt.child) = Some(child);
-                            break;
-                        }
-                        None => {
-                            eprintln!("rust2go-ipc: reconnect failed; retrying in 1s");
-                            sleep(Duration::from_secs(1));
-                        }
-                    }
+                    sleep(Duration::from_secs(1));
                 }
                 continue;
             }
@@ -598,23 +784,33 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
 
         match pending {
             Some(p) if status == 0 => {
+                let slot = p.slot;
+                let cb = p.cb;
+                let trampoline = p.trampoline;
+                let cleanup = p.cleanup;
                 // A malformed response must not kill the reactor thread.
-                // SAFETY: p.slot/p.cb are the usize round-trips of the pointers
-                // captured in dispatch(); their validity is that call's safety
-                // contract. trampoline is a generated fn in this binary.
+                // SAFETY: slot/cb are usize round-trips of the pointers
+                // captured in dispatch(); trampoline is a generated fn in
+                // this binary.
                 let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                    (p.trampoline)(
+                    trampoline(
                         payload.as_ptr(),
                         payload.len(),
-                        p.slot as *const (),
-                        p.cb as *const (),
+                        slot as *const (),
+                        cb as *const (),
                     );
                 }));
                 if result.is_err() {
                     eprintln!("rust2go-ipc: response trampoline panicked for req {req_id}");
+                    if let Some(f) = cleanup {
+                        unsafe { f(slot as *const ()) };
+                    }
                 }
             }
-            Some(_) => eprintln!("rust2go-ipc: Go returned error status for req {req_id}"),
+            Some(p) => {
+                eprintln!("rust2go-ipc: Go returned error status for req {req_id}");
+                p.cleanup();
+            }
             None => eprintln!("rust2go-ipc: response for unknown req {req_id}"),
         }
     }
@@ -666,17 +862,28 @@ impl Encoder {
         self.prim(len as u64);
     }
 
-    /// Write a primitive list as `[u64 len][len * size_of::<T>() raw bytes]`.
+    /// Write a primitive list as `[u64 len][len little-endian T values]`.
     pub fn prim_list<T: WirePrim>(&mut self, ptr: *const (), len: usize) {
         self.prim(len as u64);
         if len == 0 {
             return;
         }
-        // SAFETY: the list pointer/length come from a rust2go `ListRef` whose
-        // elements are T; WirePrim guarantees T is padding-free so the byte
-        // range is fully initialised. Validity/lifetime is the stub's contract.
-        let bytes = unsafe { from_raw_parts(ptr as *const u8, len * size_of::<T>()) };
-        self.buf.extend_from_slice(bytes);
+        let nbytes = len.checked_mul(size_of::<T>()).unwrap_or_else(|| {
+            panic!(
+                "rust2go-ipc: primitive list size overflow ({len} x {})",
+                size_of::<T>()
+            )
+        });
+        assert!(
+            nbytes <= isize::MAX as usize,
+            "rust2go-ipc: primitive list too large ({nbytes})"
+        );
+        // SAFETY: ptr comes from an upstream `ListRef` for `Vec<T>`, i.e. a
+        // `Vec<T>::as_ptr()` with T alignment and `len` initialised elements.
+        let items = unsafe { from_raw_parts(ptr as *const T, len) };
+        for &item in items {
+            item.write(&mut self.buf);
+        }
     }
 
     pub fn take(self) -> Vec<u8> {
@@ -770,8 +977,26 @@ impl<'a> Decoder<'a> {
         RawStringRef { ptr, len }
     }
 
+    /// Read a list length and bound it by the minimum wire width of one
+    /// element, so a corrupt count cannot drive an unbounded allocation.
+    pub fn list_len_min(&mut self, min_width: usize) -> usize {
+        let n = self.prim::<u64>() as usize;
+        let max = self.buf.len().saturating_sub(self.pos) / min_width.max(1);
+        assert!(
+            n <= max,
+            "rust2go-ipc: list length {n} exceeds {max} remaining elements"
+        );
+        n
+    }
+
+    /// Bound by the size of the restored Ref element (`RawStringRef` / custom
+    /// struct Ref), which is what `ref_list` allocates.
+    pub fn list_len_of<T: Copy + 'static>(&mut self) -> usize {
+        self.list_len_min(size_of::<T>())
+    }
+
     pub fn list_len(&mut self) -> usize {
-        self.prim::<u64>() as usize
+        self.list_len_min(1)
     }
 
     pub fn list_elements<T: WirePrim>(&mut self, n: usize) -> RawListRef {
@@ -889,6 +1114,25 @@ mod tests {
         // SAFETY: prim_list restored an aligned, owned i64 array in the arena.
         let vals = unsafe { from_raw_parts(list.ptr as *const i64, list.len) };
         assert_eq!(vals, &[1i64, 2i64]);
+    }
+
+    #[test]
+    fn wire_primitives_are_little_endian() {
+        let mut enc = Encoder::new();
+        enc.prim(0x0102_0304u32);
+        enc.prim('A');
+        assert_eq!(enc.take(), vec![4, 3, 2, 1, b'A', 0, 0, 0]);
+        let mut dec = Decoder::new(&[4, 3, 2, 1]);
+        assert_eq!(dec.prim::<u32>(), 0x0102_0304);
+        let mut dec = Decoder::new(&[b'A', 0, 0, 0]);
+        assert_eq!(dec.prim::<char>(), 'A');
+    }
+
+    #[test]
+    #[should_panic(expected = "list length")]
+    fn decoder_list_len_min_rejects_huge_count() {
+        let mut dec = Decoder::new(&[0xff; 8]);
+        let _ = dec.list_len_min(16);
     }
 
     #[test]

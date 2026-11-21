@@ -40,11 +40,11 @@ The rust2go macro expands each Go call into one external symbol, `binding::CGola
 1. The stub flattens the Ref pointer graph into a self-contained byte buffer.
 2. `dispatch` assigns a request id, stores `(slot, cb, trampoline)` in a pending table, writes one frame, and returns immediately. Tokio workers are never blocked.
 3. A reactor thread reads response frames, restores the response Ref graph into an arena, and invokes the generated trampoline.
-4. The trampoline calls the original `*_cb`, which writes into the atomic slot and wakes the future.
+4. The `C-unwind` trampoline performs the callback effect directly (sync: write the stack `Option`; async: `SlotWriter::write`), so no panic can cross an `extern "C"` boundary and abort the process. Pending slots are explicitly released on timeout, disconnect, error status, or trampoline panic.
 
-Wire format version is 1. The magic bytes are `R2GI`. The client and server must be built from the same crate version.
+Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives are little-endian. The client and server must be built from the same crate version.
 
-`i128` and `u128` fields are rejected at build time because their Rust and Go wire widths differ.
+`i128`, `u128` and nested `Vec<Vec<T>>` fields are rejected at build time. `usize`/`isize` require a 64-bit target (checked at compile time). Zero-argument, multi-argument, non-struct parameter/return types, `char`, `&T` parameters, `#[go_pass_struct]` and multiple `#[r2g]` traits are supported.
 
 ## Configuration
 
@@ -52,6 +52,8 @@ Wire format version is 1. The magic bytes are `R2GI`. The client and server must
 |---|---|
 | `RUST2GO_IPC_SERVER_OVERRIDE` | Path to the Go server binary. Use this in stripped runtime images where the build-time `OUT_DIR` path does not exist. |
 | `RUST2GO_IPC_PORT_OVERRIDE` | Loopback port override. Both sides must agree; the value is forwarded to the child process. |
+| `RUST2GO_IPC_TRANSPORT_OVERRIDE` | Force `tcp` or `unix` regardless of compile target. |
+| `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint (port or socket path). Both sides must agree. |
 | `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. |
 
 ## Failure semantics
@@ -62,9 +64,10 @@ If the connection drops, the reactor clears pending entries, restarts the Go ser
 
 ## Limitations
 
-- Transport is TCP loopback. It behaves identically on Windows development machines and Linux containers, but a UDS transport would avoid the loopback stack in production.
-- Request/response payloads are capped at 64 MiB.
-- `usize`/`isize` fields are encoded at native width; this assumes a 64-bit target on both sides.
+- Transport is selected by compile target: UDS on Unix, TCP loopback elsewhere (override with `RUST2GO_IPC_TRANSPORT` / `RUST2GO_IPC_ENDPOINT`).
+- Request/response payloads are capped at 64 MiB. Go responses over the cap are converted to error status.
+- `i128`/`u128` and nested lists are intentionally unsupported and fail at build time with an explicit message.
+- The Rust process kills and reaps the Go child on normal exit via an atexit hook. A `SIGKILL`-style hard kill cannot be covered.
 - The Go server may still use cgo for unrelated business dependencies. This crate only removes cgo from the rust2go call path.
 
 ## License

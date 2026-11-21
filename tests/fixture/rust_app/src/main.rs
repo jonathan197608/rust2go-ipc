@@ -36,6 +36,7 @@ async fn main() {
         ],
         count: 1234,
         flag: true,
+        flags: vec![true, false, true, true, false, false, false, true, true],
     };
     let (resp, _req) = GolangCallImpl::echoList(req).await;
     assert_eq!(resp.raw, vec![0u8, 1, 2, 255]);
@@ -47,6 +48,10 @@ async fn main() {
     assert_eq!(resp.items[1].value, -7);
     assert_eq!(resp.count, 1234);
     assert!(resp.flag);
+    assert_eq!(
+        resp.flags,
+        vec![true, false, true, true, false, false, false, true, true]
+    );
     println!(
         "list roundtrip: raw={:?} names={:?} items={} count={} flag={}",
         resp.raw,

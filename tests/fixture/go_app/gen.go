@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"unsafe"
 )
 
@@ -19,207 +20,106 @@ type ListRef struct {
 	len uint64
 }
 
-type EmptyRequest struct {
-}
-
-type HashRequest struct {
-	message string
-}
-
-type HashResponse struct {
-	hash string
-}
-
-type NestedItem struct {
-	tag   string
-	value int32
-}
-
-type ListRequest struct {
-	raw   []uint8
-	names []string
-	items []NestedItem
-	count int32
-	flag  bool
-}
-
-type ListResponse struct {
-	raw   []uint8
-	names []string
-	items []NestedItem
-	count int32
-	flag  bool
-}
-
-type EmptyRequestRef struct {
-}
-
-type HashRequestRef struct {
-	message StringRef
-}
-
-type HashResponseRef struct {
-	hash StringRef
-}
-
-type NestedItemRef struct {
-	tag   StringRef
-	value int32
-}
-
-type ListRequestRef struct {
-	raw   ListRef
-	names ListRef
-	items ListRef
-	count int32
-	flag  bool
-}
-
-type ListResponseRef struct {
-	raw   ListRef
-	names ListRef
-	items ListRef
-	count int32
-	flag  bool
-}
-
 func newString(r StringRef) string {
 	if r.len == 0 {
 		return ""
 	}
-	return unsafe.String((*byte)(r.ptr), int(r.len))
+	return strings.Clone(unsafe.String((*byte)(r.ptr), int(r.len)))
+}
+
+func decodePrims[T any](b []byte, n int) []T {
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	if n <= 0 {
+		return nil
+	}
+	if n > len(b)/sz {
+		panic("rust2go-ipc: primitive list out of bounds")
+	}
+	out := make([]T, n)
+	switch any(zero).(type) {
+	case bool:
+		for i := 0; i < n; i++ {
+			v := b[i]
+			if v > 1 {
+				panic("rust2go-ipc: invalid bool byte in list")
+			}
+			out[i] = any(v != 0).(T)
+		}
+	case int8:
+		for i := 0; i < n; i++ {
+			out[i] = any(int8(b[i])).(T)
+		}
+	case uint8:
+		for i := 0; i < n; i++ {
+			out[i] = any(b[i]).(T)
+		}
+	case int16:
+		for i := 0; i < n; i++ {
+			out[i] = any(int16(binary.LittleEndian.Uint16(b[i*2:]))).(T)
+		}
+	case uint16:
+		for i := 0; i < n; i++ {
+			out[i] = any(binary.LittleEndian.Uint16(b[i*2:])).(T)
+		}
+	case int32:
+		for i := 0; i < n; i++ {
+			out[i] = any(int32(binary.LittleEndian.Uint32(b[i*4:]))).(T)
+		}
+	case uint32:
+		for i := 0; i < n; i++ {
+			out[i] = any(binary.LittleEndian.Uint32(b[i*4:])).(T)
+		}
+	case int64:
+		for i := 0; i < n; i++ {
+			out[i] = any(int64(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	case uint64:
+		for i := 0; i < n; i++ {
+			out[i] = any(binary.LittleEndian.Uint64(b[i*8:])).(T)
+		}
+	case uint:
+		for i := 0; i < n; i++ {
+			out[i] = any(uint(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	case int:
+		for i := 0; i < n; i++ {
+			out[i] = any(int(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	case float32:
+		for i := 0; i < n; i++ {
+			out[i] = any(math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))).(T)
+		}
+	case float64:
+		for i := 0; i < n; i++ {
+			out[i] = any(math.Float64frombits(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	default:
+		panic("rust2go-ipc: unsupported primitive list element")
+	}
+	return out
 }
 
 func newPrimList[T any](r ListRef) []T {
-	if r.len == 0 {
+	n := int(r.len)
+	if n <= 0 {
 		return nil
 	}
-	return append([]T(nil), unsafe.Slice((*T)(r.ptr), int(r.len))...)
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	src := unsafe.Slice((*byte)(r.ptr), n*sz)
+	return decodePrims[T](src, n)
 }
 
 func newStringList(r ListRef) []string {
-	if r.len == 0 {
+	n := int(r.len)
+	if n <= 0 {
 		return nil
 	}
-	src := unsafe.Slice((*StringRef)(r.ptr), int(r.len))
-	out := make([]string, int(r.len))
+	src := unsafe.Slice((*StringRef)(r.ptr), n)
+	out := make([]string, n)
 	for i := range out {
 		out[i] = newString(src[i])
-	}
-	return out
-}
-
-func newEmptyRequest(r EmptyRequestRef) EmptyRequest {
-	return EmptyRequest{}
-}
-
-func newEmptyRequestList(r ListRef) []EmptyRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*EmptyRequestRef)(r.ptr), int(r.len))
-	out := make([]EmptyRequest, int(r.len))
-	for i := range out {
-		out[i] = newEmptyRequest(src[i])
-	}
-	return out
-}
-
-func newHashRequest(r HashRequestRef) HashRequest {
-	return HashRequest{
-		message: newString(r.message),
-	}
-}
-
-func newHashRequestList(r ListRef) []HashRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*HashRequestRef)(r.ptr), int(r.len))
-	out := make([]HashRequest, int(r.len))
-	for i := range out {
-		out[i] = newHashRequest(src[i])
-	}
-	return out
-}
-
-func newHashResponse(r HashResponseRef) HashResponse {
-	return HashResponse{
-		hash: newString(r.hash),
-	}
-}
-
-func newHashResponseList(r ListRef) []HashResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*HashResponseRef)(r.ptr), int(r.len))
-	out := make([]HashResponse, int(r.len))
-	for i := range out {
-		out[i] = newHashResponse(src[i])
-	}
-	return out
-}
-
-func newNestedItem(r NestedItemRef) NestedItem {
-	return NestedItem{
-		tag:   newString(r.tag),
-		value: r.value,
-	}
-}
-
-func newNestedItemList(r ListRef) []NestedItem {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*NestedItemRef)(r.ptr), int(r.len))
-	out := make([]NestedItem, int(r.len))
-	for i := range out {
-		out[i] = newNestedItem(src[i])
-	}
-	return out
-}
-
-func newListRequest(r ListRequestRef) ListRequest {
-	return ListRequest{
-		raw:   newPrimList[uint8](r.raw),
-		names: newStringList(r.names),
-		items: newNestedItemList(r.items),
-		count: r.count,
-		flag:  r.flag,
-	}
-}
-
-func newListRequestList(r ListRef) []ListRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*ListRequestRef)(r.ptr), int(r.len))
-	out := make([]ListRequest, int(r.len))
-	for i := range out {
-		out[i] = newListRequest(src[i])
-	}
-	return out
-}
-
-func newListResponse(r ListResponseRef) ListResponse {
-	return ListResponse{
-		raw:   newPrimList[uint8](r.raw),
-		names: newStringList(r.names),
-		items: newNestedItemList(r.items),
-		count: r.count,
-		flag:  r.flag,
-	}
-}
-
-func newListResponseList(r ListRef) []ListResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*ListResponseRef)(r.ptr), int(r.len))
-	out := make([]ListResponse, int(r.len))
-	for i := range out {
-		out[i] = newListResponse(src[i])
 	}
 	return out
 }
@@ -239,39 +139,49 @@ func (e *enc) put(v any) {
 	case uint8:
 		e.b = append(e.b, x)
 	case int16:
-		var t [2]byte
-		binary.LittleEndian.PutUint16(t[:], uint16(x))
-		e.b = append(e.b, t[:]...)
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(x))
+		e.b = append(e.b, b[:]...)
 	case uint16:
-		var t [2]byte
-		binary.LittleEndian.PutUint16(t[:], x)
-		e.b = append(e.b, t[:]...)
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], x)
+		e.b = append(e.b, b[:]...)
 	case int32:
-		var t [4]byte
-		binary.LittleEndian.PutUint32(t[:], uint32(x))
-		e.b = append(e.b, t[:]...)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(x))
+		e.b = append(e.b, b[:]...)
 	case uint32:
-		var t [4]byte
-		binary.LittleEndian.PutUint32(t[:], x)
-		e.b = append(e.b, t[:]...)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], x)
+		e.b = append(e.b, b[:]...)
 	case int64:
-		var t [8]byte
-		binary.LittleEndian.PutUint64(t[:], uint64(x))
-		e.b = append(e.b, t[:]...)
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
 	case uint64:
-		var t [8]byte
-		binary.LittleEndian.PutUint64(t[:], x)
-		e.b = append(e.b, t[:]...)
-	case int:
-		e.put(int64(x))
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], x)
+		e.b = append(e.b, b[:]...)
 	case uint:
-		e.put(uint64(x))
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case int:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
 	case float32:
-		e.put(math.Float32bits(x))
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(x))
+		e.b = append(e.b, b[:]...)
 	case float64:
-		e.put(math.Float64bits(x))
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], math.Float64bits(x))
+		e.b = append(e.b, b[:]...)
 	case string:
-		e.put(uint64(len(x)))
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(len(x)))
+		e.b = append(e.b, b[:]...)
 		e.b = append(e.b, x...)
 	default:
 		panic("rust2go-ipc: unsupported wire type")
@@ -320,8 +230,9 @@ func (d *dec) str() StringRef {
 	if n == 0 {
 		return StringRef{}
 	}
-	b := d.take(n)
-	return StringRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}
+	p := unsafe.Pointer(&d.b[d.p])
+	d.p += n
+	return StringRef{ptr: p, len: uint64(n)}
 }
 func primList[T any](d *dec) ListRef {
 	n := int(d.u64())
@@ -334,17 +245,13 @@ func primList[T any](d *dec) ListRef {
 	}
 	var zero T
 	sz := int(unsafe.Sizeof(zero))
-	nbytes := n * sz
-	if nbytes < 0 || nbytes > len(d.b)-d.p {
-		d.err = true
-		panic("rust2go-ipc: list len out of bounds")
-	}
-	b := d.take(nbytes)
-	return ListRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}
+	b := d.take(n * sz)
+	arr := decodePrims[T](b, n)
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
 }
 func stringList(d *dec) ListRef {
 	n := int(d.u64())
-	if n < 0 || n > len(d.b)-d.p {
+	if n < 0 || n > (len(d.b)-d.p)/int(unsafe.Sizeof(StringRef{})) {
 		d.err = true
 		panic("rust2go-ipc: string list len out of bounds")
 	}
@@ -358,11 +265,140 @@ func stringList(d *dec) ListRef {
 	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
 }
 
+type EmptyRequest struct {
+}
+
+type EmptyRequestRef struct {
+}
+
+type HashRequest struct {
+	message string
+}
+
+type HashRequestRef struct {
+	message StringRef
+}
+
+type HashResponse struct {
+	hash string
+}
+
+type HashResponseRef struct {
+	hash StringRef
+}
+
+type NestedItem struct {
+	tag   string
+	value int32
+}
+
+type NestedItemRef struct {
+	tag   StringRef
+	value int32
+}
+
+type ListRequest struct {
+	raw   []uint8
+	names []string
+	items []NestedItem
+	count int32
+	flag  bool
+	flags []bool
+}
+
+type ListRequestRef struct {
+	raw   ListRef
+	names ListRef
+	items ListRef
+	count int32
+	flag  bool
+	flags ListRef
+}
+
+type ListResponse struct {
+	raw   []uint8
+	names []string
+	items []NestedItem
+	count int32
+	flag  bool
+	flags []bool
+}
+
+type ListResponseRef struct {
+	raw   ListRef
+	names ListRef
+	items ListRef
+	count int32
+	flag  bool
+	flags ListRef
+}
+
+func newEmptyRequest(r EmptyRequestRef) EmptyRequest {
+	var v EmptyRequest
+	return v
+}
+
+func newEmptyRequestList(r ListRef) []EmptyRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*EmptyRequestRef)(r.ptr), n)
+	out := make([]EmptyRequest, n)
+	for i := range out {
+		out[i] = newEmptyRequest(src[i])
+	}
+	return out
+}
+
 func flattenEmptyRequest(v *EmptyRequest, e *enc) {
 }
 
 func restoreEmptyRequestRef(d *dec) EmptyRequestRef {
-	return EmptyRequestRef{}
+	var r EmptyRequestRef
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
+	}
+	return r
+}
+
+func EmptyRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := 0
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]EmptyRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreEmptyRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newHashRequest(r HashRequestRef) HashRequest {
+	var v HashRequest
+	v.message = newString(r.message)
+	return v
+}
+
+func newHashRequestList(r ListRef) []HashRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*HashRequestRef)(r.ptr), n)
+	out := make([]HashRequest, n)
+	for i := range out {
+		out[i] = newHashRequest(src[i])
+	}
+	return out
 }
 
 func flattenHashRequest(v *HashRequest, e *enc) {
@@ -370,9 +406,51 @@ func flattenHashRequest(v *HashRequest, e *enc) {
 }
 
 func restoreHashRequestRef(d *dec) HashRequestRef {
-	return HashRequestRef{
-		message: d.str(),
+	var r HashRequestRef
+	r.message = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func HashRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := 8
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]HashRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreHashRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newHashResponse(r HashResponseRef) HashResponse {
+	var v HashResponse
+	v.hash = newString(r.hash)
+	return v
+}
+
+func newHashResponseList(r ListRef) []HashResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*HashResponseRef)(r.ptr), n)
+	out := make([]HashResponse, n)
+	for i := range out {
+		out[i] = newHashResponse(src[i])
+	}
+	return out
 }
 
 func flattenHashResponse(v *HashResponse, e *enc) {
@@ -380,9 +458,52 @@ func flattenHashResponse(v *HashResponse, e *enc) {
 }
 
 func restoreHashResponseRef(d *dec) HashResponseRef {
-	return HashResponseRef{
-		hash: d.str(),
+	var r HashResponseRef
+	r.hash = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func HashResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := 8
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]HashResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreHashResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newNestedItem(r NestedItemRef) NestedItem {
+	var v NestedItem
+	v.tag = newString(r.tag)
+	v.value = r.value
+	return v
+}
+
+func newNestedItemList(r ListRef) []NestedItem {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*NestedItemRef)(r.ptr), n)
+	out := make([]NestedItem, n)
+	for i := range out {
+		out[i] = newNestedItem(src[i])
+	}
+	return out
 }
 
 func flattenNestedItem(v *NestedItem, e *enc) {
@@ -391,92 +512,191 @@ func flattenNestedItem(v *NestedItem, e *enc) {
 }
 
 func restoreNestedItemRef(d *dec) NestedItemRef {
-	return NestedItemRef{
-		tag:   d.str(),
-		value: d.i32(),
+	var r NestedItemRef
+	r.tag = d.str()
+	r.value = d.i32()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func NestedItemListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := 12
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]NestedItemRef, cnt)
+	for i := range arr {
+		arr[i] = restoreNestedItemRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newListRequest(r ListRequestRef) ListRequest {
+	var v ListRequest
+	v.raw = newPrimList[uint8](r.raw)
+	v.names = newStringList(r.names)
+	v.items = newNestedItemList(r.items)
+	v.count = r.count
+	v.flag = r.flag
+	v.flags = newPrimList[bool](r.flags)
+	return v
+}
+
+func newListRequestList(r ListRef) []ListRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*ListRequestRef)(r.ptr), n)
+	out := make([]ListRequest, n)
+	for i := range out {
+		out[i] = newListRequest(src[i])
+	}
+	return out
 }
 
 func flattenListRequest(v *ListRequest, e *enc) {
 	e.put(uint64(len(v.raw)))
-	for _, item := range v.raw {
-		e.put(item)
+	for _, _item := range v.raw {
+		e.put(_item)
 	}
 	e.put(uint64(len(v.names)))
-	for _, item := range v.names {
-		e.put(item)
+	for _, _item := range v.names {
+		e.put(_item)
 	}
 	e.put(uint64(len(v.items)))
-	for i := range v.items {
-		flattenNestedItem(&v.items[i], e)
+	for _, _item := range v.items {
+		flattenNestedItem(&_item, e)
 	}
 	e.put(v.count)
 	e.put(v.flag)
+	e.put(uint64(len(v.flags)))
+	for _, _item := range v.flags {
+		e.put(_item)
+	}
 }
 
 func restoreListRequestRef(d *dec) ListRequestRef {
-	return ListRequestRef{
-		raw:   primList[uint8](d),
-		names: stringList(d),
-		items: func() ListRef {
-			cnt := int(d.u64())
-			if cnt < 0 || cnt > len(d.b)-d.p {
-				d.err = true
-				panic("rust2go-ipc: struct list len out of bounds")
-			}
-			if cnt == 0 {
-				return ListRef{}
-			}
-			arr := make([]NestedItemRef, cnt)
-			for i := range arr {
-				arr[i] = restoreNestedItemRef(d)
-			}
-			return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
-		}(),
-		count: d.i32(),
-		flag:  d.boolean(),
+	var r ListRequestRef
+	r.raw = primList[uint8](d)
+	r.names = stringList(d)
+	r.items = NestedItemListRef(d)
+	r.count = d.i32()
+	r.flag = d.boolean()
+	r.flags = primList[bool](d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func ListRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := 37
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]ListRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreListRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newListResponse(r ListResponseRef) ListResponse {
+	var v ListResponse
+	v.raw = newPrimList[uint8](r.raw)
+	v.names = newStringList(r.names)
+	v.items = newNestedItemList(r.items)
+	v.count = r.count
+	v.flag = r.flag
+	v.flags = newPrimList[bool](r.flags)
+	return v
+}
+
+func newListResponseList(r ListRef) []ListResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*ListResponseRef)(r.ptr), n)
+	out := make([]ListResponse, n)
+	for i := range out {
+		out[i] = newListResponse(src[i])
+	}
+	return out
 }
 
 func flattenListResponse(v *ListResponse, e *enc) {
 	e.put(uint64(len(v.raw)))
-	for _, item := range v.raw {
-		e.put(item)
+	for _, _item := range v.raw {
+		e.put(_item)
 	}
 	e.put(uint64(len(v.names)))
-	for _, item := range v.names {
-		e.put(item)
+	for _, _item := range v.names {
+		e.put(_item)
 	}
 	e.put(uint64(len(v.items)))
-	for i := range v.items {
-		flattenNestedItem(&v.items[i], e)
+	for _, _item := range v.items {
+		flattenNestedItem(&_item, e)
 	}
 	e.put(v.count)
 	e.put(v.flag)
+	e.put(uint64(len(v.flags)))
+	for _, _item := range v.flags {
+		e.put(_item)
+	}
 }
 
 func restoreListResponseRef(d *dec) ListResponseRef {
-	return ListResponseRef{
-		raw:   primList[uint8](d),
-		names: stringList(d),
-		items: func() ListRef {
-			cnt := int(d.u64())
-			if cnt < 0 || cnt > len(d.b)-d.p {
-				d.err = true
-				panic("rust2go-ipc: struct list len out of bounds")
-			}
-			if cnt == 0 {
-				return ListRef{}
-			}
-			arr := make([]NestedItemRef, cnt)
-			for i := range arr {
-				arr[i] = restoreNestedItemRef(d)
-			}
-			return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
-		}(),
-		count: d.i32(),
-		flag:  d.boolean(),
+	var r ListResponseRef
+	r.raw = primList[uint8](d)
+	r.names = stringList(d)
+	r.items = NestedItemListRef(d)
+	r.count = d.i32()
+	r.flag = d.boolean()
+	r.flags = primList[bool](d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func ListResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := 37
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]ListResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreListResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
 }
 
 var GolangCallImpl GolangCall
@@ -497,20 +717,23 @@ func dispatch(methodID uint32, payload []byte) (out []byte, ok bool) {
 	d := &dec{b: payload}
 	switch methodID {
 	case 0:
-		r := newHashRequest(restoreHashRequestRef(d))
-		resp := GolangCallImpl.md5(&r)
+		_r0 := restoreHashRequestRef(d)
+		_a0 := newHashRequest(_r0)
+		_resp := GolangCallImpl.md5(&_a0)
 		e := &enc{}
-		flattenHashResponse(&resp, e)
+		flattenHashResponse(&_resp, e)
 		return e.b, true
 	case 1:
-		r := newListRequest(restoreListRequestRef(d))
-		resp := GolangCallImpl.echoList(&r)
+		_r0 := restoreListRequestRef(d)
+		_a0 := newListRequest(_r0)
+		_resp := GolangCallImpl.echoList(&_a0)
 		e := &enc{}
-		flattenListResponse(&resp, e)
+		flattenListResponse(&_resp, e)
 		return e.b, true
 	case 2:
-		r := newEmptyRequest(restoreEmptyRequestRef(d))
-		GolangCallImpl.Shutdown(&r)
+		_r0 := restoreEmptyRequestRef(d)
+		_a0 := newEmptyRequest(_r0)
+		GolangCallImpl.Shutdown(&_a0)
 		return nil, true
 	}
 	return nil, false

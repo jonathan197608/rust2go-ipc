@@ -32,6 +32,7 @@ pub struct ListRequest {
     pub items: Vec<NestedItem>,
     pub count: i32,
     pub flag: bool,
+    pub flags: Vec<bool>,
 }
 
 #[derive(R2G, Default)]
@@ -41,6 +42,7 @@ pub struct ListResponse {
     pub items: Vec<NestedItem>,
     pub count: i32,
     pub flag: bool,
+    pub flags: Vec<bool>,
 }
 
 #[r2g]

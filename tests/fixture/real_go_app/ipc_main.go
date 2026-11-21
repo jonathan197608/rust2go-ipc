@@ -30,13 +30,10 @@ func main() {
 	transport := os.Getenv("RUST2GO_IPC_TRANSPORT")
 	endpoint := os.Getenv("RUST2GO_IPC_ENDPOINT")
 	if endpoint == "" {
-		// Backward compat: older Rust clients only set RUST2GO_IPC_PORT.
 		port := os.Getenv("RUST2GO_IPC_PORT")
 		if port == "" {
 			panic("RUST2GO_IPC_ENDPOINT / RUST2GO_IPC_PORT not set")
 		}
-		// Do not overwrite an explicitly requested transport; only infer tcp
-		// when the caller did not specify one.
 		if transport == "" {
 			transport = "tcp"
 		}
@@ -50,8 +47,9 @@ func main() {
 	var err error
 	switch transport {
 	case "unix":
-		// A killed server leaves its socket file behind. Unlink before listen
-		// so a respawned process can rebind the same path.
+		if len(endpoint) >= 100 {
+			panic("rust2go-ipc: unix endpoint path too long")
+		}
 		_ = os.Remove(endpoint)
 		ln, err = net.Listen("unix", endpoint)
 	case "tcp":
@@ -66,10 +64,6 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// net.Error.Temporary is deprecated ("Do not use this method").
-			// Treat every non-closed error as transient: back off exponentially
-			// instead of spinning. A bounded retry count keeps a permanently
-			// broken listener from hiding forever; Rust respawns on panic.
 			if errors.Is(err, net.ErrClosed) {
 				panic("rust2go-ipc: listener closed: " + err.Error())
 			}
@@ -89,6 +83,10 @@ func serve(conn net.Conn) {
 	defer conn.Close()
 	hdr := make([]byte, 22)
 	for {
+		// Set an idle deadline before every read. Setting it only after the
+		// header leaves an absolute deadline that expires on long-idle
+		// connections and makes the Rust side restart the server.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return
 		}
@@ -100,29 +98,24 @@ func serve(conn net.Conn) {
 		}
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
 		methodID := binary.LittleEndian.Uint32(hdr[14:18])
-		// Compare as uint32 before converting to int: on 32-bit targets a value
-		// > 2^31 would wrap negative and bypass the size check.
 		length32 := binary.LittleEndian.Uint32(hdr[18:22])
 		if length32 > 64*1024*1024 {
 			return
 		}
-		length := int(length32)
-		// Bound a half-open connection so a peer that declares a large frame
-		// and stalls cannot pin a goroutine and its buffer forever.
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		payload := make([]byte, length)
+		payload := make([]byte, int(length32))
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
 
 		if reqID == 0 {
 			_, _ = dispatch(methodID, payload)
-			continue // oneway: no response frame
+			continue
 		}
 		resp, ok := dispatch(methodID, payload)
 		status := byte(0)
-		if !ok {
+		if !ok || len(resp) > 64*1024*1024 {
 			status = 1
+			resp = nil
 		}
 		out := make([]byte, 19+len(resp))
 		copy(out[0:4], magic)

@@ -60,6 +60,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -133,8 +139,9 @@ checksum = "21ee4d6efac91720550e564892b1fddfe103683f7f0b19196f59dae1621e6e83"
 
 [[package]]
 name = "rust2go-ipc"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
+ "libc",
  "proc-macro2",
  "quote",
  "rust2go",

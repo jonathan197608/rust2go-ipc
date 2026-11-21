@@ -22,6 +22,7 @@ func (Golang) echoList(req *ListRequest) ListResponse {
 		items: req.items,
 		count: req.count,
 		flag:  req.flag,
+		flags: req.flags,
 	}
 }
 

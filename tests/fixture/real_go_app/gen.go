@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"unsafe"
 )
 
@@ -19,11 +20,263 @@ type ListRef struct {
 	len uint64
 }
 
+func newString(r StringRef) string {
+	if r.len == 0 {
+		return ""
+	}
+	return strings.Clone(unsafe.String((*byte)(r.ptr), int(r.len)))
+}
+
+func decodePrims[T any](b []byte, n int) []T {
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	if n <= 0 {
+		return nil
+	}
+	if n > len(b)/sz {
+		panic("rust2go-ipc: primitive list out of bounds")
+	}
+	out := make([]T, n)
+	switch any(zero).(type) {
+	case bool:
+		for i := 0; i < n; i++ {
+			v := b[i]
+			if v > 1 {
+				panic("rust2go-ipc: invalid bool byte in list")
+			}
+			out[i] = any(v != 0).(T)
+		}
+	case int8:
+		for i := 0; i < n; i++ {
+			out[i] = any(int8(b[i])).(T)
+		}
+	case uint8:
+		for i := 0; i < n; i++ {
+			out[i] = any(b[i]).(T)
+		}
+	case int16:
+		for i := 0; i < n; i++ {
+			out[i] = any(int16(binary.LittleEndian.Uint16(b[i*2:]))).(T)
+		}
+	case uint16:
+		for i := 0; i < n; i++ {
+			out[i] = any(binary.LittleEndian.Uint16(b[i*2:])).(T)
+		}
+	case int32:
+		for i := 0; i < n; i++ {
+			out[i] = any(int32(binary.LittleEndian.Uint32(b[i*4:]))).(T)
+		}
+	case uint32:
+		for i := 0; i < n; i++ {
+			out[i] = any(binary.LittleEndian.Uint32(b[i*4:])).(T)
+		}
+	case int64:
+		for i := 0; i < n; i++ {
+			out[i] = any(int64(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	case uint64:
+		for i := 0; i < n; i++ {
+			out[i] = any(binary.LittleEndian.Uint64(b[i*8:])).(T)
+		}
+	case uint:
+		for i := 0; i < n; i++ {
+			out[i] = any(uint(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	case int:
+		for i := 0; i < n; i++ {
+			out[i] = any(int(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	case float32:
+		for i := 0; i < n; i++ {
+			out[i] = any(math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))).(T)
+		}
+	case float64:
+		for i := 0; i < n; i++ {
+			out[i] = any(math.Float64frombits(binary.LittleEndian.Uint64(b[i*8:]))).(T)
+		}
+	default:
+		panic("rust2go-ipc: unsupported primitive list element")
+	}
+	return out
+}
+
+func newPrimList[T any](r ListRef) []T {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	src := unsafe.Slice((*byte)(r.ptr), n*sz)
+	return decodePrims[T](src, n)
+}
+
+func newStringList(r ListRef) []string {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*StringRef)(r.ptr), n)
+	out := make([]string, n)
+	for i := range out {
+		out[i] = newString(src[i])
+	}
+	return out
+}
+
+type enc struct{ b []byte }
+
+func (e *enc) put(v any) {
+	switch x := v.(type) {
+	case bool:
+		if x {
+			e.b = append(e.b, 1)
+		} else {
+			e.b = append(e.b, 0)
+		}
+	case int8:
+		e.b = append(e.b, byte(x))
+	case uint8:
+		e.b = append(e.b, x)
+	case int16:
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(x))
+		e.b = append(e.b, b[:]...)
+	case uint16:
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], x)
+		e.b = append(e.b, b[:]...)
+	case int32:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(x))
+		e.b = append(e.b, b[:]...)
+	case uint32:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], x)
+		e.b = append(e.b, b[:]...)
+	case int64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case uint64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], x)
+		e.b = append(e.b, b[:]...)
+	case uint:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case int:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case float32:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(x))
+		e.b = append(e.b, b[:]...)
+	case float64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], math.Float64bits(x))
+		e.b = append(e.b, b[:]...)
+	case string:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(len(x)))
+		e.b = append(e.b, b[:]...)
+		e.b = append(e.b, x...)
+	default:
+		panic("rust2go-ipc: unsupported wire type")
+	}
+}
+
+type dec struct {
+	b   []byte
+	p   int
+	err bool
+}
+
+func (d *dec) take(n int) []byte {
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: decode out of bounds")
+	}
+	v := d.b[d.p : d.p+n]
+	d.p += n
+	return v
+}
+func (d *dec) u64() uint64 { return binary.LittleEndian.Uint64(d.take(8)) }
+func (d *dec) i64() int64  { return int64(d.u64()) }
+func (d *dec) u32() uint32 { return binary.LittleEndian.Uint32(d.take(4)) }
+func (d *dec) i32() int32  { return int32(d.u32()) }
+func (d *dec) u16() uint16 { return binary.LittleEndian.Uint16(d.take(2)) }
+func (d *dec) i16() int16  { return int16(d.u16()) }
+func (d *dec) u8() uint8   { return d.take(1)[0] }
+func (d *dec) i8() int8    { return int8(d.u8()) }
+func (d *dec) boolean() bool {
+	b := d.take(1)[0]
+	if b > 1 {
+		d.err = true
+		panic("rust2go-ipc: invalid bool byte")
+	}
+	return b == 1
+}
+func (d *dec) f32() float32 { return math.Float32frombits(d.u32()) }
+func (d *dec) f64() float64 { return math.Float64frombits(d.u64()) }
+func (d *dec) str() StringRef {
+	n := int(d.u64())
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: string len out of bounds")
+	}
+	if n == 0 {
+		return StringRef{}
+	}
+	p := unsafe.Pointer(&d.b[d.p])
+	d.p += n
+	return StringRef{ptr: p, len: uint64(n)}
+}
+func primList[T any](d *dec) ListRef {
+	n := int(d.u64())
+	if n < 0 {
+		d.err = true
+		panic("rust2go-ipc: negative list len")
+	}
+	if n == 0 {
+		return ListRef{}
+	}
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	b := d.take(n * sz)
+	arr := decodePrims[T](b, n)
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
+}
+func stringList(d *dec) ListRef {
+	n := int(d.u64())
+	if n < 0 || n > (len(d.b)-d.p)/int(unsafe.Sizeof(StringRef{})) {
+		d.err = true
+		panic("rust2go-ipc: string list len out of bounds")
+	}
+	if n == 0 {
+		return ListRef{}
+	}
+	arr := make([]StringRef, n)
+	for i := range arr {
+		arr[i] = d.str()
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
+}
+
 type EmptyRequest struct {
+}
+
+type EmptyRequestRef struct {
 }
 
 type HashRequest struct {
 	message string
+}
+
+type HashRequestRef struct {
+	message StringRef
 }
 
 type EsRequest struct {
@@ -32,9 +285,20 @@ type EsRequest struct {
 	dsl      string
 }
 
+type EsRequestRef struct {
+	trace_id StringRef
+	order_id StringRef
+	dsl      StringRef
+}
+
 type UIMRequest struct {
 	trace_id string
 	iccid    string
+}
+
+type UIMRequestRef struct {
+	trace_id StringRef
+	iccid    StringRef
 }
 
 type TextRequest struct {
@@ -45,14 +309,32 @@ type TextRequest struct {
 	location   string
 }
 
+type TextRequestRef struct {
+	trace_id   StringRef
+	rule_id    StringRef
+	biz_token  StringRef
+	order_code StringRef
+	location   StringRef
+}
+
 type AddressRequest struct {
 	trace_id string
 	location string
 }
 
+type AddressRequestRef struct {
+	trace_id StringRef
+	location StringRef
+}
+
 type LabelRequest struct {
 	trace_id   string
 	address_id string
+}
+
+type LabelRequestRef struct {
+	trace_id   StringRef
+	address_id StringRef
 }
 
 type ImageRequest struct {
@@ -62,6 +344,15 @@ type ImageRequest struct {
 	id_card    string
 	started_at string
 	order_code string
+}
+
+type ImageRequestRef struct {
+	trace_id   StringRef
+	rule_id    StringRef
+	biz_token  StringRef
+	id_card    StringRef
+	started_at StringRef
+	order_code StringRef
 }
 
 type CoverRequest struct {
@@ -74,6 +365,16 @@ type CoverRequest struct {
 	save_object string
 }
 
+type CoverRequestRef struct {
+	trace_id    StringRef
+	img1_bucket StringRef
+	img1_object StringRef
+	img2_bucket StringRef
+	img2_object StringRef
+	save_bucket StringRef
+	save_object StringRef
+}
+
 type CloudRequest struct {
 	trace_id    string
 	bucket      string
@@ -81,10 +382,23 @@ type CloudRequest struct {
 	destination string
 }
 
+type CloudRequestRef struct {
+	trace_id    StringRef
+	bucket      StringRef
+	filename    StringRef
+	destination StringRef
+}
+
 type QYWXRequest struct {
 	trace_id string
 	phone    string
 	message  string
+}
+
+type QYWXRequestRef struct {
+	trace_id StringRef
+	phone    StringRef
+	message  StringRef
 }
 
 type Func014Request struct {
@@ -95,6 +409,14 @@ type Func014Request struct {
 	in1014011 []string
 }
 
+type Func014RequestRef struct {
+	trace_id  StringRef
+	in1014001 StringRef
+	in1014002 StringRef
+	in1014003 StringRef
+	in1014011 ListRef
+}
+
 type Func015Request struct {
 	trace_id  string
 	in1015001 string
@@ -102,11 +424,25 @@ type Func015Request struct {
 	in1015011 []string
 }
 
+type Func015RequestRef struct {
+	trace_id  StringRef
+	in1015001 StringRef
+	in1015002 StringRef
+	in1015011 ListRef
+}
+
 type Func019Request struct {
 	trace_id  string
 	in1019001 string
 	in1019002 string
 	in1019003 string
+}
+
+type Func019RequestRef struct {
+	trace_id  StringRef
+	in1019001 StringRef
+	in1019002 StringRef
+	in1019003 StringRef
 }
 
 type Func157Request struct {
@@ -119,6 +455,18 @@ type Func157Request struct {
 	in1157015  string
 	in1157016  string
 	in1157017  string
+}
+
+type Func157RequestRef struct {
+	trace_id   StringRef
+	query_type StringRef
+	in1157011  StringRef
+	in1157012  StringRef
+	in1157013  StringRef
+	in1157014  StringRef
+	in1157015  StringRef
+	in1157016  StringRef
+	in1157017  StringRef
 }
 
 type Func614Request struct {
@@ -153,228 +501,6 @@ type Func614Request struct {
 	In1614102 string
 }
 
-type SMSRequest struct {
-	trace_id    string
-	mobile      string
-	message     string
-	fixed_isp   string
-	sms_range   string
-	template_id string
-}
-
-type ReceiptRequest struct {
-	trace_id string
-	codes    []string
-}
-
-type FunctionRequest struct {
-	trace_id string
-	name     string
-	req      []uint8
-}
-
-type TouchRequest struct {
-	trace_id string
-	code     string
-	scene    int32
-	status   int32
-	count    int32
-	duration int32
-}
-
-type BillRequest struct {
-	trace_id           string
-	order_type         string
-	order_id           int64
-	order_product_name string
-	interface_account  string
-	interface_method   string
-	influence_scope    string
-	err_message        string
-}
-
-type CommonResponse struct {
-	err_msg string
-	result  []uint8
-	ok      bool
-}
-
-type HashResponse struct {
-	hash string
-}
-
-type ReceiptResponse struct {
-	err_msg string
-	files   []string
-}
-
-type AddressResponse struct {
-	province string
-	city     string
-	district string
-	street   string
-	detail   string
-}
-
-type AddressLabel struct {
-	desc  string
-	name  string
-	code  string
-	value int32
-}
-
-type LabelResponse struct {
-	code    string
-	message string
-	labels  []AddressLabel
-}
-
-type OrderResponse struct {
-	code string
-}
-
-type FuncResult struct {
-	id    string
-	name  string
-	value string
-}
-
-type RowResult struct {
-	cols []FuncResult
-}
-
-type EOPResponse struct {
-	result_code string
-	err_msg     string
-	grid        []RowResult
-}
-
-type FileRequest struct {
-	trace_id  string
-	bucket    string
-	objectKey string
-	content   string
-}
-
-type DeleteFileRequest struct {
-	trace_id   string
-	bucket     string
-	objectKeys []string
-}
-
-type FileNameAndPath struct {
-	file_name string
-	file_path string
-}
-
-type OrderAuditRequest struct {
-	trace_id   string
-	image_path []FileNameAndPath
-	audit_info string
-}
-
-type EmptyRequestRef struct {
-}
-
-type HashRequestRef struct {
-	message StringRef
-}
-
-type EsRequestRef struct {
-	trace_id StringRef
-	order_id StringRef
-	dsl      StringRef
-}
-
-type UIMRequestRef struct {
-	trace_id StringRef
-	iccid    StringRef
-}
-
-type TextRequestRef struct {
-	trace_id   StringRef
-	rule_id    StringRef
-	biz_token  StringRef
-	order_code StringRef
-	location   StringRef
-}
-
-type AddressRequestRef struct {
-	trace_id StringRef
-	location StringRef
-}
-
-type LabelRequestRef struct {
-	trace_id   StringRef
-	address_id StringRef
-}
-
-type ImageRequestRef struct {
-	trace_id   StringRef
-	rule_id    StringRef
-	biz_token  StringRef
-	id_card    StringRef
-	started_at StringRef
-	order_code StringRef
-}
-
-type CoverRequestRef struct {
-	trace_id    StringRef
-	img1_bucket StringRef
-	img1_object StringRef
-	img2_bucket StringRef
-	img2_object StringRef
-	save_bucket StringRef
-	save_object StringRef
-}
-
-type CloudRequestRef struct {
-	trace_id    StringRef
-	bucket      StringRef
-	filename    StringRef
-	destination StringRef
-}
-
-type QYWXRequestRef struct {
-	trace_id StringRef
-	phone    StringRef
-	message  StringRef
-}
-
-type Func014RequestRef struct {
-	trace_id  StringRef
-	in1014001 StringRef
-	in1014002 StringRef
-	in1014003 StringRef
-	in1014011 ListRef
-}
-
-type Func015RequestRef struct {
-	trace_id  StringRef
-	in1015001 StringRef
-	in1015002 StringRef
-	in1015011 ListRef
-}
-
-type Func019RequestRef struct {
-	trace_id  StringRef
-	in1019001 StringRef
-	in1019002 StringRef
-	in1019003 StringRef
-}
-
-type Func157RequestRef struct {
-	trace_id   StringRef
-	query_type StringRef
-	in1157011  StringRef
-	in1157012  StringRef
-	in1157013  StringRef
-	in1157014  StringRef
-	in1157015  StringRef
-	in1157016  StringRef
-	in1157017  StringRef
-}
-
 type Func614RequestRef struct {
 	trace_id  StringRef
 	In1614001 StringRef
@@ -407,6 +533,15 @@ type Func614RequestRef struct {
 	In1614102 StringRef
 }
 
+type SMSRequest struct {
+	trace_id    string
+	mobile      string
+	message     string
+	fixed_isp   string
+	sms_range   string
+	template_id string
+}
+
 type SMSRequestRef struct {
 	trace_id    StringRef
 	mobile      StringRef
@@ -416,15 +551,35 @@ type SMSRequestRef struct {
 	template_id StringRef
 }
 
+type ReceiptRequest struct {
+	trace_id string
+	codes    []string
+}
+
 type ReceiptRequestRef struct {
 	trace_id StringRef
 	codes    ListRef
+}
+
+type FunctionRequest struct {
+	trace_id string
+	name     string
+	req      []uint8
 }
 
 type FunctionRequestRef struct {
 	trace_id StringRef
 	name     StringRef
 	req      ListRef
+}
+
+type TouchRequest struct {
+	trace_id string
+	code     string
+	scene    int32
+	status   int32
+	count    int32
+	duration int32
 }
 
 type TouchRequestRef struct {
@@ -434,6 +589,17 @@ type TouchRequestRef struct {
 	status   int32
 	count    int32
 	duration int32
+}
+
+type BillRequest struct {
+	trace_id           string
+	order_type         string
+	order_id           int64
+	order_product_name string
+	interface_account  string
+	interface_method   string
+	influence_scope    string
+	err_message        string
 }
 
 type BillRequestRef struct {
@@ -447,19 +613,42 @@ type BillRequestRef struct {
 	err_message        StringRef
 }
 
+type CommonResponse struct {
+	err_msg string
+	result  []uint8
+	ok      bool
+}
+
 type CommonResponseRef struct {
 	err_msg StringRef
 	result  ListRef
 	ok      bool
 }
 
+type HashResponse struct {
+	hash string
+}
+
 type HashResponseRef struct {
 	hash StringRef
+}
+
+type ReceiptResponse struct {
+	err_msg string
+	files   []string
 }
 
 type ReceiptResponseRef struct {
 	err_msg StringRef
 	files   ListRef
+}
+
+type AddressResponse struct {
+	province string
+	city     string
+	district string
+	street   string
+	detail   string
 }
 
 type AddressResponseRef struct {
@@ -470,11 +659,24 @@ type AddressResponseRef struct {
 	detail   StringRef
 }
 
+type AddressLabel struct {
+	desc  string
+	name  string
+	code  string
+	value int32
+}
+
 type AddressLabelRef struct {
 	desc  StringRef
 	name  StringRef
 	code  StringRef
 	value int32
+}
+
+type LabelResponse struct {
+	code    string
+	message string
+	labels  []AddressLabel
 }
 
 type LabelResponseRef struct {
@@ -483,8 +685,18 @@ type LabelResponseRef struct {
 	labels  ListRef
 }
 
+type OrderResponse struct {
+	code string
+}
+
 type OrderResponseRef struct {
 	code StringRef
+}
+
+type FuncResult struct {
+	id    string
+	name  string
+	value string
 }
 
 type FuncResultRef struct {
@@ -493,14 +705,31 @@ type FuncResultRef struct {
 	value StringRef
 }
 
+type RowResult struct {
+	cols []FuncResult
+}
+
 type RowResultRef struct {
 	cols ListRef
+}
+
+type EOPResponse struct {
+	result_code string
+	err_msg     string
+	grid        []RowResult
 }
 
 type EOPResponseRef struct {
 	result_code StringRef
 	err_msg     StringRef
 	grid        ListRef
+}
+
+type FileRequest struct {
+	trace_id  string
+	bucket    string
+	objectKey string
+	content   string
 }
 
 type FileRequestRef struct {
@@ -510,15 +739,32 @@ type FileRequestRef struct {
 	content   StringRef
 }
 
+type DeleteFileRequest struct {
+	trace_id   string
+	bucket     string
+	objectKeys []string
+}
+
 type DeleteFileRequestRef struct {
 	trace_id   StringRef
 	bucket     StringRef
 	objectKeys ListRef
 }
 
+type FileNameAndPath struct {
+	file_name string
+	file_path string
+}
+
 type FileNameAndPathRef struct {
 	file_name StringRef
 	file_path StringRef
+}
+
+type OrderAuditRequest struct {
+	trace_id   string
+	image_path []FileNameAndPath
+	audit_info string
 }
 
 type OrderAuditRequestRef struct {
@@ -527,880 +773,72 @@ type OrderAuditRequestRef struct {
 	audit_info StringRef
 }
 
-func newString(r StringRef) string {
-	if r.len == 0 {
-		return ""
-	}
-	return unsafe.String((*byte)(r.ptr), int(r.len))
-}
-
-func newPrimList[T any](r ListRef) []T {
-	if r.len == 0 {
-		return nil
-	}
-	return append([]T(nil), unsafe.Slice((*T)(r.ptr), int(r.len))...)
-}
-
-func newStringList(r ListRef) []string {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*StringRef)(r.ptr), int(r.len))
-	out := make([]string, int(r.len))
-	for i := range out {
-		out[i] = newString(src[i])
-	}
-	return out
-}
-
 func newEmptyRequest(r EmptyRequestRef) EmptyRequest {
-	return EmptyRequest{}
+	var v EmptyRequest
+	return v
 }
 
 func newEmptyRequestList(r ListRef) []EmptyRequest {
-	if r.len == 0 {
+	n := int(r.len)
+	if n <= 0 {
 		return nil
 	}
-	src := unsafe.Slice((*EmptyRequestRef)(r.ptr), int(r.len))
-	out := make([]EmptyRequest, int(r.len))
+	src := unsafe.Slice((*EmptyRequestRef)(r.ptr), n)
+	out := make([]EmptyRequest, n)
 	for i := range out {
 		out[i] = newEmptyRequest(src[i])
 	}
 	return out
 }
 
-func newHashRequest(r HashRequestRef) HashRequest {
-	return HashRequest{
-		message: newString(r.message),
-	}
-}
-
-func newHashRequestList(r ListRef) []HashRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*HashRequestRef)(r.ptr), int(r.len))
-	out := make([]HashRequest, int(r.len))
-	for i := range out {
-		out[i] = newHashRequest(src[i])
-	}
-	return out
-}
-
-func newEsRequest(r EsRequestRef) EsRequest {
-	return EsRequest{
-		trace_id: newString(r.trace_id),
-		order_id: newString(r.order_id),
-		dsl:      newString(r.dsl),
-	}
-}
-
-func newEsRequestList(r ListRef) []EsRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*EsRequestRef)(r.ptr), int(r.len))
-	out := make([]EsRequest, int(r.len))
-	for i := range out {
-		out[i] = newEsRequest(src[i])
-	}
-	return out
-}
-
-func newUIMRequest(r UIMRequestRef) UIMRequest {
-	return UIMRequest{
-		trace_id: newString(r.trace_id),
-		iccid:    newString(r.iccid),
-	}
-}
-
-func newUIMRequestList(r ListRef) []UIMRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*UIMRequestRef)(r.ptr), int(r.len))
-	out := make([]UIMRequest, int(r.len))
-	for i := range out {
-		out[i] = newUIMRequest(src[i])
-	}
-	return out
-}
-
-func newTextRequest(r TextRequestRef) TextRequest {
-	return TextRequest{
-		trace_id:   newString(r.trace_id),
-		rule_id:    newString(r.rule_id),
-		biz_token:  newString(r.biz_token),
-		order_code: newString(r.order_code),
-		location:   newString(r.location),
-	}
-}
-
-func newTextRequestList(r ListRef) []TextRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*TextRequestRef)(r.ptr), int(r.len))
-	out := make([]TextRequest, int(r.len))
-	for i := range out {
-		out[i] = newTextRequest(src[i])
-	}
-	return out
-}
-
-func newAddressRequest(r AddressRequestRef) AddressRequest {
-	return AddressRequest{
-		trace_id: newString(r.trace_id),
-		location: newString(r.location),
-	}
-}
-
-func newAddressRequestList(r ListRef) []AddressRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*AddressRequestRef)(r.ptr), int(r.len))
-	out := make([]AddressRequest, int(r.len))
-	for i := range out {
-		out[i] = newAddressRequest(src[i])
-	}
-	return out
-}
-
-func newLabelRequest(r LabelRequestRef) LabelRequest {
-	return LabelRequest{
-		trace_id:   newString(r.trace_id),
-		address_id: newString(r.address_id),
-	}
-}
-
-func newLabelRequestList(r ListRef) []LabelRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*LabelRequestRef)(r.ptr), int(r.len))
-	out := make([]LabelRequest, int(r.len))
-	for i := range out {
-		out[i] = newLabelRequest(src[i])
-	}
-	return out
-}
-
-func newImageRequest(r ImageRequestRef) ImageRequest {
-	return ImageRequest{
-		trace_id:   newString(r.trace_id),
-		rule_id:    newString(r.rule_id),
-		biz_token:  newString(r.biz_token),
-		id_card:    newString(r.id_card),
-		started_at: newString(r.started_at),
-		order_code: newString(r.order_code),
-	}
-}
-
-func newImageRequestList(r ListRef) []ImageRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*ImageRequestRef)(r.ptr), int(r.len))
-	out := make([]ImageRequest, int(r.len))
-	for i := range out {
-		out[i] = newImageRequest(src[i])
-	}
-	return out
-}
-
-func newCoverRequest(r CoverRequestRef) CoverRequest {
-	return CoverRequest{
-		trace_id:    newString(r.trace_id),
-		img1_bucket: newString(r.img1_bucket),
-		img1_object: newString(r.img1_object),
-		img2_bucket: newString(r.img2_bucket),
-		img2_object: newString(r.img2_object),
-		save_bucket: newString(r.save_bucket),
-		save_object: newString(r.save_object),
-	}
-}
-
-func newCoverRequestList(r ListRef) []CoverRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*CoverRequestRef)(r.ptr), int(r.len))
-	out := make([]CoverRequest, int(r.len))
-	for i := range out {
-		out[i] = newCoverRequest(src[i])
-	}
-	return out
-}
-
-func newCloudRequest(r CloudRequestRef) CloudRequest {
-	return CloudRequest{
-		trace_id:    newString(r.trace_id),
-		bucket:      newString(r.bucket),
-		filename:    newString(r.filename),
-		destination: newString(r.destination),
-	}
-}
-
-func newCloudRequestList(r ListRef) []CloudRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*CloudRequestRef)(r.ptr), int(r.len))
-	out := make([]CloudRequest, int(r.len))
-	for i := range out {
-		out[i] = newCloudRequest(src[i])
-	}
-	return out
-}
-
-func newQYWXRequest(r QYWXRequestRef) QYWXRequest {
-	return QYWXRequest{
-		trace_id: newString(r.trace_id),
-		phone:    newString(r.phone),
-		message:  newString(r.message),
-	}
-}
-
-func newQYWXRequestList(r ListRef) []QYWXRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*QYWXRequestRef)(r.ptr), int(r.len))
-	out := make([]QYWXRequest, int(r.len))
-	for i := range out {
-		out[i] = newQYWXRequest(src[i])
-	}
-	return out
-}
-
-func newFunc014Request(r Func014RequestRef) Func014Request {
-	return Func014Request{
-		trace_id:  newString(r.trace_id),
-		in1014001: newString(r.in1014001),
-		in1014002: newString(r.in1014002),
-		in1014003: newString(r.in1014003),
-		in1014011: newStringList(r.in1014011),
-	}
-}
-
-func newFunc014RequestList(r ListRef) []Func014Request {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*Func014RequestRef)(r.ptr), int(r.len))
-	out := make([]Func014Request, int(r.len))
-	for i := range out {
-		out[i] = newFunc014Request(src[i])
-	}
-	return out
-}
-
-func newFunc015Request(r Func015RequestRef) Func015Request {
-	return Func015Request{
-		trace_id:  newString(r.trace_id),
-		in1015001: newString(r.in1015001),
-		in1015002: newString(r.in1015002),
-		in1015011: newStringList(r.in1015011),
-	}
-}
-
-func newFunc015RequestList(r ListRef) []Func015Request {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*Func015RequestRef)(r.ptr), int(r.len))
-	out := make([]Func015Request, int(r.len))
-	for i := range out {
-		out[i] = newFunc015Request(src[i])
-	}
-	return out
-}
-
-func newFunc019Request(r Func019RequestRef) Func019Request {
-	return Func019Request{
-		trace_id:  newString(r.trace_id),
-		in1019001: newString(r.in1019001),
-		in1019002: newString(r.in1019002),
-		in1019003: newString(r.in1019003),
-	}
-}
-
-func newFunc019RequestList(r ListRef) []Func019Request {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*Func019RequestRef)(r.ptr), int(r.len))
-	out := make([]Func019Request, int(r.len))
-	for i := range out {
-		out[i] = newFunc019Request(src[i])
-	}
-	return out
-}
-
-func newFunc157Request(r Func157RequestRef) Func157Request {
-	return Func157Request{
-		trace_id:   newString(r.trace_id),
-		query_type: newString(r.query_type),
-		in1157011:  newString(r.in1157011),
-		in1157012:  newString(r.in1157012),
-		in1157013:  newString(r.in1157013),
-		in1157014:  newString(r.in1157014),
-		in1157015:  newString(r.in1157015),
-		in1157016:  newString(r.in1157016),
-		in1157017:  newString(r.in1157017),
-	}
-}
-
-func newFunc157RequestList(r ListRef) []Func157Request {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*Func157RequestRef)(r.ptr), int(r.len))
-	out := make([]Func157Request, int(r.len))
-	for i := range out {
-		out[i] = newFunc157Request(src[i])
-	}
-	return out
-}
-
-func newFunc614Request(r Func614RequestRef) Func614Request {
-	return Func614Request{
-		trace_id:  newString(r.trace_id),
-		In1614001: newString(r.In1614001),
-		In1614002: newString(r.In1614002),
-		In1614003: newString(r.In1614003),
-		In1614004: newString(r.In1614004),
-		In1614005: newString(r.In1614005),
-		In1614006: newString(r.In1614006),
-		In1614007: newString(r.In1614007),
-		In1614008: newString(r.In1614008),
-		In1614009: newString(r.In1614009),
-		In1614010: newString(r.In1614010),
-		In1614011: newString(r.In1614011),
-		In1614041: newString(r.In1614041),
-		In1614042: newString(r.In1614042),
-		In1614043: newString(r.In1614043),
-		In1614044: newString(r.In1614044),
-		In1614045: newString(r.In1614045),
-		In1614046: newString(r.In1614046),
-		In1614047: newString(r.In1614047),
-		In1614048: newString(r.In1614048),
-		In1614050: newString(r.In1614050),
-		In1614061: newString(r.In1614061),
-		In1614091: newString(r.In1614091),
-		In1614092: newString(r.In1614092),
-		In1614093: newString(r.In1614093),
-		In1614094: newString(r.In1614094),
-		In1614095: newString(r.In1614095),
-		In1614101: newString(r.In1614101),
-		In1614102: newString(r.In1614102),
-	}
-}
-
-func newFunc614RequestList(r ListRef) []Func614Request {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*Func614RequestRef)(r.ptr), int(r.len))
-	out := make([]Func614Request, int(r.len))
-	for i := range out {
-		out[i] = newFunc614Request(src[i])
-	}
-	return out
-}
-
-func newSMSRequest(r SMSRequestRef) SMSRequest {
-	return SMSRequest{
-		trace_id:    newString(r.trace_id),
-		mobile:      newString(r.mobile),
-		message:     newString(r.message),
-		fixed_isp:   newString(r.fixed_isp),
-		sms_range:   newString(r.sms_range),
-		template_id: newString(r.template_id),
-	}
-}
-
-func newSMSRequestList(r ListRef) []SMSRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*SMSRequestRef)(r.ptr), int(r.len))
-	out := make([]SMSRequest, int(r.len))
-	for i := range out {
-		out[i] = newSMSRequest(src[i])
-	}
-	return out
-}
-
-func newReceiptRequest(r ReceiptRequestRef) ReceiptRequest {
-	return ReceiptRequest{
-		trace_id: newString(r.trace_id),
-		codes:    newStringList(r.codes),
-	}
-}
-
-func newReceiptRequestList(r ListRef) []ReceiptRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*ReceiptRequestRef)(r.ptr), int(r.len))
-	out := make([]ReceiptRequest, int(r.len))
-	for i := range out {
-		out[i] = newReceiptRequest(src[i])
-	}
-	return out
-}
-
-func newFunctionRequest(r FunctionRequestRef) FunctionRequest {
-	return FunctionRequest{
-		trace_id: newString(r.trace_id),
-		name:     newString(r.name),
-		req:      newPrimList[uint8](r.req),
-	}
-}
-
-func newFunctionRequestList(r ListRef) []FunctionRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*FunctionRequestRef)(r.ptr), int(r.len))
-	out := make([]FunctionRequest, int(r.len))
-	for i := range out {
-		out[i] = newFunctionRequest(src[i])
-	}
-	return out
-}
-
-func newTouchRequest(r TouchRequestRef) TouchRequest {
-	return TouchRequest{
-		trace_id: newString(r.trace_id),
-		code:     newString(r.code),
-		scene:    r.scene,
-		status:   r.status,
-		count:    r.count,
-		duration: r.duration,
-	}
-}
-
-func newTouchRequestList(r ListRef) []TouchRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*TouchRequestRef)(r.ptr), int(r.len))
-	out := make([]TouchRequest, int(r.len))
-	for i := range out {
-		out[i] = newTouchRequest(src[i])
-	}
-	return out
-}
-
-func newBillRequest(r BillRequestRef) BillRequest {
-	return BillRequest{
-		trace_id:           newString(r.trace_id),
-		order_type:         newString(r.order_type),
-		order_id:           r.order_id,
-		order_product_name: newString(r.order_product_name),
-		interface_account:  newString(r.interface_account),
-		interface_method:   newString(r.interface_method),
-		influence_scope:    newString(r.influence_scope),
-		err_message:        newString(r.err_message),
-	}
-}
-
-func newBillRequestList(r ListRef) []BillRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*BillRequestRef)(r.ptr), int(r.len))
-	out := make([]BillRequest, int(r.len))
-	for i := range out {
-		out[i] = newBillRequest(src[i])
-	}
-	return out
-}
-
-func newCommonResponse(r CommonResponseRef) CommonResponse {
-	return CommonResponse{
-		err_msg: newString(r.err_msg),
-		result:  newPrimList[uint8](r.result),
-		ok:      r.ok,
-	}
-}
-
-func newCommonResponseList(r ListRef) []CommonResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*CommonResponseRef)(r.ptr), int(r.len))
-	out := make([]CommonResponse, int(r.len))
-	for i := range out {
-		out[i] = newCommonResponse(src[i])
-	}
-	return out
-}
-
-func newHashResponse(r HashResponseRef) HashResponse {
-	return HashResponse{
-		hash: newString(r.hash),
-	}
-}
-
-func newHashResponseList(r ListRef) []HashResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*HashResponseRef)(r.ptr), int(r.len))
-	out := make([]HashResponse, int(r.len))
-	for i := range out {
-		out[i] = newHashResponse(src[i])
-	}
-	return out
-}
-
-func newReceiptResponse(r ReceiptResponseRef) ReceiptResponse {
-	return ReceiptResponse{
-		err_msg: newString(r.err_msg),
-		files:   newStringList(r.files),
-	}
-}
-
-func newReceiptResponseList(r ListRef) []ReceiptResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*ReceiptResponseRef)(r.ptr), int(r.len))
-	out := make([]ReceiptResponse, int(r.len))
-	for i := range out {
-		out[i] = newReceiptResponse(src[i])
-	}
-	return out
-}
-
-func newAddressResponse(r AddressResponseRef) AddressResponse {
-	return AddressResponse{
-		province: newString(r.province),
-		city:     newString(r.city),
-		district: newString(r.district),
-		street:   newString(r.street),
-		detail:   newString(r.detail),
-	}
-}
-
-func newAddressResponseList(r ListRef) []AddressResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*AddressResponseRef)(r.ptr), int(r.len))
-	out := make([]AddressResponse, int(r.len))
-	for i := range out {
-		out[i] = newAddressResponse(src[i])
-	}
-	return out
-}
-
-func newAddressLabel(r AddressLabelRef) AddressLabel {
-	return AddressLabel{
-		desc:  newString(r.desc),
-		name:  newString(r.name),
-		code:  newString(r.code),
-		value: r.value,
-	}
-}
-
-func newAddressLabelList(r ListRef) []AddressLabel {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*AddressLabelRef)(r.ptr), int(r.len))
-	out := make([]AddressLabel, int(r.len))
-	for i := range out {
-		out[i] = newAddressLabel(src[i])
-	}
-	return out
-}
-
-func newLabelResponse(r LabelResponseRef) LabelResponse {
-	return LabelResponse{
-		code:    newString(r.code),
-		message: newString(r.message),
-		labels:  newAddressLabelList(r.labels),
-	}
-}
-
-func newLabelResponseList(r ListRef) []LabelResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*LabelResponseRef)(r.ptr), int(r.len))
-	out := make([]LabelResponse, int(r.len))
-	for i := range out {
-		out[i] = newLabelResponse(src[i])
-	}
-	return out
-}
-
-func newOrderResponse(r OrderResponseRef) OrderResponse {
-	return OrderResponse{
-		code: newString(r.code),
-	}
-}
-
-func newOrderResponseList(r ListRef) []OrderResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*OrderResponseRef)(r.ptr), int(r.len))
-	out := make([]OrderResponse, int(r.len))
-	for i := range out {
-		out[i] = newOrderResponse(src[i])
-	}
-	return out
-}
-
-func newFuncResult(r FuncResultRef) FuncResult {
-	return FuncResult{
-		id:    newString(r.id),
-		name:  newString(r.name),
-		value: newString(r.value),
-	}
-}
-
-func newFuncResultList(r ListRef) []FuncResult {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*FuncResultRef)(r.ptr), int(r.len))
-	out := make([]FuncResult, int(r.len))
-	for i := range out {
-		out[i] = newFuncResult(src[i])
-	}
-	return out
-}
-
-func newRowResult(r RowResultRef) RowResult {
-	return RowResult{
-		cols: newFuncResultList(r.cols),
-	}
-}
-
-func newRowResultList(r ListRef) []RowResult {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*RowResultRef)(r.ptr), int(r.len))
-	out := make([]RowResult, int(r.len))
-	for i := range out {
-		out[i] = newRowResult(src[i])
-	}
-	return out
-}
-
-func newEOPResponse(r EOPResponseRef) EOPResponse {
-	return EOPResponse{
-		result_code: newString(r.result_code),
-		err_msg:     newString(r.err_msg),
-		grid:        newRowResultList(r.grid),
-	}
-}
-
-func newEOPResponseList(r ListRef) []EOPResponse {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*EOPResponseRef)(r.ptr), int(r.len))
-	out := make([]EOPResponse, int(r.len))
-	for i := range out {
-		out[i] = newEOPResponse(src[i])
-	}
-	return out
-}
-
-func newFileRequest(r FileRequestRef) FileRequest {
-	return FileRequest{
-		trace_id:  newString(r.trace_id),
-		bucket:    newString(r.bucket),
-		objectKey: newString(r.objectKey),
-		content:   newString(r.content),
-	}
-}
-
-func newFileRequestList(r ListRef) []FileRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*FileRequestRef)(r.ptr), int(r.len))
-	out := make([]FileRequest, int(r.len))
-	for i := range out {
-		out[i] = newFileRequest(src[i])
-	}
-	return out
-}
-
-func newDeleteFileRequest(r DeleteFileRequestRef) DeleteFileRequest {
-	return DeleteFileRequest{
-		trace_id:   newString(r.trace_id),
-		bucket:     newString(r.bucket),
-		objectKeys: newStringList(r.objectKeys),
-	}
-}
-
-func newDeleteFileRequestList(r ListRef) []DeleteFileRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*DeleteFileRequestRef)(r.ptr), int(r.len))
-	out := make([]DeleteFileRequest, int(r.len))
-	for i := range out {
-		out[i] = newDeleteFileRequest(src[i])
-	}
-	return out
-}
-
-func newFileNameAndPath(r FileNameAndPathRef) FileNameAndPath {
-	return FileNameAndPath{
-		file_name: newString(r.file_name),
-		file_path: newString(r.file_path),
-	}
-}
-
-func newFileNameAndPathList(r ListRef) []FileNameAndPath {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*FileNameAndPathRef)(r.ptr), int(r.len))
-	out := make([]FileNameAndPath, int(r.len))
-	for i := range out {
-		out[i] = newFileNameAndPath(src[i])
-	}
-	return out
-}
-
-func newOrderAuditRequest(r OrderAuditRequestRef) OrderAuditRequest {
-	return OrderAuditRequest{
-		trace_id:   newString(r.trace_id),
-		image_path: newFileNameAndPathList(r.image_path),
-		audit_info: newString(r.audit_info),
-	}
-}
-
-func newOrderAuditRequestList(r ListRef) []OrderAuditRequest {
-	if r.len == 0 {
-		return nil
-	}
-	src := unsafe.Slice((*OrderAuditRequestRef)(r.ptr), int(r.len))
-	out := make([]OrderAuditRequest, int(r.len))
-	for i := range out {
-		out[i] = newOrderAuditRequest(src[i])
-	}
-	return out
-}
-
-type enc struct{ b []byte }
-
-func (e *enc) put(v any) {
-	switch x := v.(type) {
-	case bool:
-		if x {
-			e.b = append(e.b, 1)
-		} else {
-			e.b = append(e.b, 0)
-		}
-	case int8:
-		e.b = append(e.b, byte(x))
-	case uint8:
-		e.b = append(e.b, x)
-	case int16:
-		var t [2]byte
-		binary.LittleEndian.PutUint16(t[:], uint16(x))
-		e.b = append(e.b, t[:]...)
-	case uint16:
-		var t [2]byte
-		binary.LittleEndian.PutUint16(t[:], x)
-		e.b = append(e.b, t[:]...)
-	case int32:
-		var t [4]byte
-		binary.LittleEndian.PutUint32(t[:], uint32(x))
-		e.b = append(e.b, t[:]...)
-	case uint32:
-		var t [4]byte
-		binary.LittleEndian.PutUint32(t[:], x)
-		e.b = append(e.b, t[:]...)
-	case int64:
-		var t [8]byte
-		binary.LittleEndian.PutUint64(t[:], uint64(x))
-		e.b = append(e.b, t[:]...)
-	case uint64:
-		var t [8]byte
-		binary.LittleEndian.PutUint64(t[:], x)
-		e.b = append(e.b, t[:]...)
-	case int:
-		e.put(int64(x))
-	case uint:
-		e.put(uint64(x))
-	case float32:
-		e.put(math.Float32bits(x))
-	case float64:
-		e.put(math.Float64bits(x))
-	case string:
-		e.put(uint64(len(x)))
-		e.b = append(e.b, x...)
-	}
-}
-
-type dec struct {
-	b []byte
-	p int
-}
-
-func (d *dec) take(n int) []byte { v := d.b[d.p : d.p+n]; d.p += n; return v }
-func (d *dec) u64() uint64       { return binary.LittleEndian.Uint64(d.take(8)) }
-func (d *dec) i64() int64        { return int64(d.u64()) }
-func (d *dec) u32() uint32       { return binary.LittleEndian.Uint32(d.take(4)) }
-func (d *dec) i32() int32        { return int32(d.u32()) }
-func (d *dec) u16() uint16       { return binary.LittleEndian.Uint16(d.take(2)) }
-func (d *dec) i16() int16        { return int16(d.u16()) }
-func (d *dec) u8() uint8         { return d.take(1)[0] }
-func (d *dec) i8() int8          { return int8(d.u8()) }
-func (d *dec) boolean() bool     { return d.take(1)[0] != 0 }
-func (d *dec) f32() float32      { return math.Float32frombits(d.u32()) }
-func (d *dec) f64() float64      { return math.Float64frombits(d.u64()) }
-func (d *dec) str() StringRef {
-	n := int(d.u64())
-	if n == 0 {
-		return StringRef{}
-	}
-	p := unsafe.Pointer(&d.b[d.p])
-	d.p += n
-	return StringRef{ptr: p, len: uint64(n)}
-}
-func primList[T any](d *dec) ListRef {
-	n := int(d.u64())
-	if n == 0 {
-		return ListRef{}
-	}
-	var zero T
-	p := unsafe.Pointer(&d.b[d.p])
-	d.p += n * int(unsafe.Sizeof(zero))
-	return ListRef{ptr: p, len: uint64(n)}
-}
-func stringList(d *dec) ListRef {
-	n := int(d.u64())
-	if n == 0 {
-		return ListRef{}
-	}
-	arr := make([]StringRef, n)
-	for i := range arr {
-		arr[i] = d.str()
-	}
-	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
-}
-
 func flattenEmptyRequest(v *EmptyRequest, e *enc) {
 }
 
 func restoreEmptyRequestRef(d *dec) EmptyRequestRef {
-	return EmptyRequestRef{}
+	var r EmptyRequestRef
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
+	}
+	return r
+}
+
+func EmptyRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(EmptyRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]EmptyRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreEmptyRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newHashRequest(r HashRequestRef) HashRequest {
+	var v HashRequest
+	v.message = newString(r.message)
+	return v
+}
+
+func newHashRequestList(r ListRef) []HashRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*HashRequestRef)(r.ptr), n)
+	out := make([]HashRequest, n)
+	for i := range out {
+		out[i] = newHashRequest(src[i])
+	}
+	return out
 }
 
 func flattenHashRequest(v *HashRequest, e *enc) {
@@ -1408,9 +846,53 @@ func flattenHashRequest(v *HashRequest, e *enc) {
 }
 
 func restoreHashRequestRef(d *dec) HashRequestRef {
-	return HashRequestRef{
-		message: d.str(),
+	var r HashRequestRef
+	r.message = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func HashRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(HashRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]HashRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreHashRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newEsRequest(r EsRequestRef) EsRequest {
+	var v EsRequest
+	v.trace_id = newString(r.trace_id)
+	v.order_id = newString(r.order_id)
+	v.dsl = newString(r.dsl)
+	return v
+}
+
+func newEsRequestList(r ListRef) []EsRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*EsRequestRef)(r.ptr), n)
+	out := make([]EsRequest, n)
+	for i := range out {
+		out[i] = newEsRequest(src[i])
+	}
+	return out
 }
 
 func flattenEsRequest(v *EsRequest, e *enc) {
@@ -1420,11 +902,54 @@ func flattenEsRequest(v *EsRequest, e *enc) {
 }
 
 func restoreEsRequestRef(d *dec) EsRequestRef {
-	return EsRequestRef{
-		trace_id: d.str(),
-		order_id: d.str(),
-		dsl:      d.str(),
+	var r EsRequestRef
+	r.trace_id = d.str()
+	r.order_id = d.str()
+	r.dsl = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func EsRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(EsRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]EsRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreEsRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newUIMRequest(r UIMRequestRef) UIMRequest {
+	var v UIMRequest
+	v.trace_id = newString(r.trace_id)
+	v.iccid = newString(r.iccid)
+	return v
+}
+
+func newUIMRequestList(r ListRef) []UIMRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*UIMRequestRef)(r.ptr), n)
+	out := make([]UIMRequest, n)
+	for i := range out {
+		out[i] = newUIMRequest(src[i])
+	}
+	return out
 }
 
 func flattenUIMRequest(v *UIMRequest, e *enc) {
@@ -1433,10 +958,56 @@ func flattenUIMRequest(v *UIMRequest, e *enc) {
 }
 
 func restoreUIMRequestRef(d *dec) UIMRequestRef {
-	return UIMRequestRef{
-		trace_id: d.str(),
-		iccid:    d.str(),
+	var r UIMRequestRef
+	r.trace_id = d.str()
+	r.iccid = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func UIMRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(UIMRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]UIMRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreUIMRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newTextRequest(r TextRequestRef) TextRequest {
+	var v TextRequest
+	v.trace_id = newString(r.trace_id)
+	v.rule_id = newString(r.rule_id)
+	v.biz_token = newString(r.biz_token)
+	v.order_code = newString(r.order_code)
+	v.location = newString(r.location)
+	return v
+}
+
+func newTextRequestList(r ListRef) []TextRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*TextRequestRef)(r.ptr), n)
+	out := make([]TextRequest, n)
+	for i := range out {
+		out[i] = newTextRequest(src[i])
+	}
+	return out
 }
 
 func flattenTextRequest(v *TextRequest, e *enc) {
@@ -1448,13 +1019,56 @@ func flattenTextRequest(v *TextRequest, e *enc) {
 }
 
 func restoreTextRequestRef(d *dec) TextRequestRef {
-	return TextRequestRef{
-		trace_id:   d.str(),
-		rule_id:    d.str(),
-		biz_token:  d.str(),
-		order_code: d.str(),
-		location:   d.str(),
+	var r TextRequestRef
+	r.trace_id = d.str()
+	r.rule_id = d.str()
+	r.biz_token = d.str()
+	r.order_code = d.str()
+	r.location = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func TextRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(TextRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]TextRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreTextRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newAddressRequest(r AddressRequestRef) AddressRequest {
+	var v AddressRequest
+	v.trace_id = newString(r.trace_id)
+	v.location = newString(r.location)
+	return v
+}
+
+func newAddressRequestList(r ListRef) []AddressRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*AddressRequestRef)(r.ptr), n)
+	out := make([]AddressRequest, n)
+	for i := range out {
+		out[i] = newAddressRequest(src[i])
+	}
+	return out
 }
 
 func flattenAddressRequest(v *AddressRequest, e *enc) {
@@ -1463,10 +1077,53 @@ func flattenAddressRequest(v *AddressRequest, e *enc) {
 }
 
 func restoreAddressRequestRef(d *dec) AddressRequestRef {
-	return AddressRequestRef{
-		trace_id: d.str(),
-		location: d.str(),
+	var r AddressRequestRef
+	r.trace_id = d.str()
+	r.location = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func AddressRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(AddressRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]AddressRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreAddressRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newLabelRequest(r LabelRequestRef) LabelRequest {
+	var v LabelRequest
+	v.trace_id = newString(r.trace_id)
+	v.address_id = newString(r.address_id)
+	return v
+}
+
+func newLabelRequestList(r ListRef) []LabelRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*LabelRequestRef)(r.ptr), n)
+	out := make([]LabelRequest, n)
+	for i := range out {
+		out[i] = newLabelRequest(src[i])
+	}
+	return out
 }
 
 func flattenLabelRequest(v *LabelRequest, e *enc) {
@@ -1475,10 +1132,57 @@ func flattenLabelRequest(v *LabelRequest, e *enc) {
 }
 
 func restoreLabelRequestRef(d *dec) LabelRequestRef {
-	return LabelRequestRef{
-		trace_id:   d.str(),
-		address_id: d.str(),
+	var r LabelRequestRef
+	r.trace_id = d.str()
+	r.address_id = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func LabelRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(LabelRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]LabelRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreLabelRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newImageRequest(r ImageRequestRef) ImageRequest {
+	var v ImageRequest
+	v.trace_id = newString(r.trace_id)
+	v.rule_id = newString(r.rule_id)
+	v.biz_token = newString(r.biz_token)
+	v.id_card = newString(r.id_card)
+	v.started_at = newString(r.started_at)
+	v.order_code = newString(r.order_code)
+	return v
+}
+
+func newImageRequestList(r ListRef) []ImageRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*ImageRequestRef)(r.ptr), n)
+	out := make([]ImageRequest, n)
+	for i := range out {
+		out[i] = newImageRequest(src[i])
+	}
+	return out
 }
 
 func flattenImageRequest(v *ImageRequest, e *enc) {
@@ -1491,14 +1195,62 @@ func flattenImageRequest(v *ImageRequest, e *enc) {
 }
 
 func restoreImageRequestRef(d *dec) ImageRequestRef {
-	return ImageRequestRef{
-		trace_id:   d.str(),
-		rule_id:    d.str(),
-		biz_token:  d.str(),
-		id_card:    d.str(),
-		started_at: d.str(),
-		order_code: d.str(),
+	var r ImageRequestRef
+	r.trace_id = d.str()
+	r.rule_id = d.str()
+	r.biz_token = d.str()
+	r.id_card = d.str()
+	r.started_at = d.str()
+	r.order_code = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func ImageRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(ImageRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]ImageRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreImageRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newCoverRequest(r CoverRequestRef) CoverRequest {
+	var v CoverRequest
+	v.trace_id = newString(r.trace_id)
+	v.img1_bucket = newString(r.img1_bucket)
+	v.img1_object = newString(r.img1_object)
+	v.img2_bucket = newString(r.img2_bucket)
+	v.img2_object = newString(r.img2_object)
+	v.save_bucket = newString(r.save_bucket)
+	v.save_object = newString(r.save_object)
+	return v
+}
+
+func newCoverRequestList(r ListRef) []CoverRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*CoverRequestRef)(r.ptr), n)
+	out := make([]CoverRequest, n)
+	for i := range out {
+		out[i] = newCoverRequest(src[i])
+	}
+	return out
 }
 
 func flattenCoverRequest(v *CoverRequest, e *enc) {
@@ -1512,15 +1264,60 @@ func flattenCoverRequest(v *CoverRequest, e *enc) {
 }
 
 func restoreCoverRequestRef(d *dec) CoverRequestRef {
-	return CoverRequestRef{
-		trace_id:    d.str(),
-		img1_bucket: d.str(),
-		img1_object: d.str(),
-		img2_bucket: d.str(),
-		img2_object: d.str(),
-		save_bucket: d.str(),
-		save_object: d.str(),
+	var r CoverRequestRef
+	r.trace_id = d.str()
+	r.img1_bucket = d.str()
+	r.img1_object = d.str()
+	r.img2_bucket = d.str()
+	r.img2_object = d.str()
+	r.save_bucket = d.str()
+	r.save_object = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func CoverRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(CoverRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]CoverRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreCoverRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newCloudRequest(r CloudRequestRef) CloudRequest {
+	var v CloudRequest
+	v.trace_id = newString(r.trace_id)
+	v.bucket = newString(r.bucket)
+	v.filename = newString(r.filename)
+	v.destination = newString(r.destination)
+	return v
+}
+
+func newCloudRequestList(r ListRef) []CloudRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*CloudRequestRef)(r.ptr), n)
+	out := make([]CloudRequest, n)
+	for i := range out {
+		out[i] = newCloudRequest(src[i])
+	}
+	return out
 }
 
 func flattenCloudRequest(v *CloudRequest, e *enc) {
@@ -1531,12 +1328,56 @@ func flattenCloudRequest(v *CloudRequest, e *enc) {
 }
 
 func restoreCloudRequestRef(d *dec) CloudRequestRef {
-	return CloudRequestRef{
-		trace_id:    d.str(),
-		bucket:      d.str(),
-		filename:    d.str(),
-		destination: d.str(),
+	var r CloudRequestRef
+	r.trace_id = d.str()
+	r.bucket = d.str()
+	r.filename = d.str()
+	r.destination = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func CloudRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(CloudRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]CloudRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreCloudRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newQYWXRequest(r QYWXRequestRef) QYWXRequest {
+	var v QYWXRequest
+	v.trace_id = newString(r.trace_id)
+	v.phone = newString(r.phone)
+	v.message = newString(r.message)
+	return v
+}
+
+func newQYWXRequestList(r ListRef) []QYWXRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*QYWXRequestRef)(r.ptr), n)
+	out := make([]QYWXRequest, n)
+	for i := range out {
+		out[i] = newQYWXRequest(src[i])
+	}
+	return out
 }
 
 func flattenQYWXRequest(v *QYWXRequest, e *enc) {
@@ -1546,11 +1387,57 @@ func flattenQYWXRequest(v *QYWXRequest, e *enc) {
 }
 
 func restoreQYWXRequestRef(d *dec) QYWXRequestRef {
-	return QYWXRequestRef{
-		trace_id: d.str(),
-		phone:    d.str(),
-		message:  d.str(),
+	var r QYWXRequestRef
+	r.trace_id = d.str()
+	r.phone = d.str()
+	r.message = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func QYWXRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(QYWXRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]QYWXRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreQYWXRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFunc014Request(r Func014RequestRef) Func014Request {
+	var v Func014Request
+	v.trace_id = newString(r.trace_id)
+	v.in1014001 = newString(r.in1014001)
+	v.in1014002 = newString(r.in1014002)
+	v.in1014003 = newString(r.in1014003)
+	v.in1014011 = newStringList(r.in1014011)
+	return v
+}
+
+func newFunc014RequestList(r ListRef) []Func014Request {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*Func014RequestRef)(r.ptr), n)
+	out := make([]Func014Request, n)
+	for i := range out {
+		out[i] = newFunc014Request(src[i])
+	}
+	return out
 }
 
 func flattenFunc014Request(v *Func014Request, e *enc) {
@@ -1559,19 +1446,64 @@ func flattenFunc014Request(v *Func014Request, e *enc) {
 	e.put(v.in1014002)
 	e.put(v.in1014003)
 	e.put(uint64(len(v.in1014011)))
-	for _, item := range v.in1014011 {
-		e.put(item)
+	for _, _item := range v.in1014011 {
+		e.put(_item)
 	}
 }
 
 func restoreFunc014RequestRef(d *dec) Func014RequestRef {
-	return Func014RequestRef{
-		trace_id:  d.str(),
-		in1014001: d.str(),
-		in1014002: d.str(),
-		in1014003: d.str(),
-		in1014011: stringList(d),
+	var r Func014RequestRef
+	r.trace_id = d.str()
+	r.in1014001 = d.str()
+	r.in1014002 = d.str()
+	r.in1014003 = d.str()
+	r.in1014011 = stringList(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func Func014RequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(Func014RequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]Func014RequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFunc014RequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFunc015Request(r Func015RequestRef) Func015Request {
+	var v Func015Request
+	v.trace_id = newString(r.trace_id)
+	v.in1015001 = newString(r.in1015001)
+	v.in1015002 = newString(r.in1015002)
+	v.in1015011 = newStringList(r.in1015011)
+	return v
+}
+
+func newFunc015RequestList(r ListRef) []Func015Request {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*Func015RequestRef)(r.ptr), n)
+	out := make([]Func015Request, n)
+	for i := range out {
+		out[i] = newFunc015Request(src[i])
+	}
+	return out
 }
 
 func flattenFunc015Request(v *Func015Request, e *enc) {
@@ -1579,18 +1511,63 @@ func flattenFunc015Request(v *Func015Request, e *enc) {
 	e.put(v.in1015001)
 	e.put(v.in1015002)
 	e.put(uint64(len(v.in1015011)))
-	for _, item := range v.in1015011 {
-		e.put(item)
+	for _, _item := range v.in1015011 {
+		e.put(_item)
 	}
 }
 
 func restoreFunc015RequestRef(d *dec) Func015RequestRef {
-	return Func015RequestRef{
-		trace_id:  d.str(),
-		in1015001: d.str(),
-		in1015002: d.str(),
-		in1015011: stringList(d),
+	var r Func015RequestRef
+	r.trace_id = d.str()
+	r.in1015001 = d.str()
+	r.in1015002 = d.str()
+	r.in1015011 = stringList(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func Func015RequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(Func015RequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]Func015RequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFunc015RequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFunc019Request(r Func019RequestRef) Func019Request {
+	var v Func019Request
+	v.trace_id = newString(r.trace_id)
+	v.in1019001 = newString(r.in1019001)
+	v.in1019002 = newString(r.in1019002)
+	v.in1019003 = newString(r.in1019003)
+	return v
+}
+
+func newFunc019RequestList(r ListRef) []Func019Request {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*Func019RequestRef)(r.ptr), n)
+	out := make([]Func019Request, n)
+	for i := range out {
+		out[i] = newFunc019Request(src[i])
+	}
+	return out
 }
 
 func flattenFunc019Request(v *Func019Request, e *enc) {
@@ -1601,12 +1578,62 @@ func flattenFunc019Request(v *Func019Request, e *enc) {
 }
 
 func restoreFunc019RequestRef(d *dec) Func019RequestRef {
-	return Func019RequestRef{
-		trace_id:  d.str(),
-		in1019001: d.str(),
-		in1019002: d.str(),
-		in1019003: d.str(),
+	var r Func019RequestRef
+	r.trace_id = d.str()
+	r.in1019001 = d.str()
+	r.in1019002 = d.str()
+	r.in1019003 = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func Func019RequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(Func019RequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]Func019RequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFunc019RequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFunc157Request(r Func157RequestRef) Func157Request {
+	var v Func157Request
+	v.trace_id = newString(r.trace_id)
+	v.query_type = newString(r.query_type)
+	v.in1157011 = newString(r.in1157011)
+	v.in1157012 = newString(r.in1157012)
+	v.in1157013 = newString(r.in1157013)
+	v.in1157014 = newString(r.in1157014)
+	v.in1157015 = newString(r.in1157015)
+	v.in1157016 = newString(r.in1157016)
+	v.in1157017 = newString(r.in1157017)
+	return v
+}
+
+func newFunc157RequestList(r ListRef) []Func157Request {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*Func157RequestRef)(r.ptr), n)
+	out := make([]Func157Request, n)
+	for i := range out {
+		out[i] = newFunc157Request(src[i])
+	}
+	return out
 }
 
 func flattenFunc157Request(v *Func157Request, e *enc) {
@@ -1622,17 +1649,87 @@ func flattenFunc157Request(v *Func157Request, e *enc) {
 }
 
 func restoreFunc157RequestRef(d *dec) Func157RequestRef {
-	return Func157RequestRef{
-		trace_id:   d.str(),
-		query_type: d.str(),
-		in1157011:  d.str(),
-		in1157012:  d.str(),
-		in1157013:  d.str(),
-		in1157014:  d.str(),
-		in1157015:  d.str(),
-		in1157016:  d.str(),
-		in1157017:  d.str(),
+	var r Func157RequestRef
+	r.trace_id = d.str()
+	r.query_type = d.str()
+	r.in1157011 = d.str()
+	r.in1157012 = d.str()
+	r.in1157013 = d.str()
+	r.in1157014 = d.str()
+	r.in1157015 = d.str()
+	r.in1157016 = d.str()
+	r.in1157017 = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func Func157RequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(Func157RequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]Func157RequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFunc157RequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFunc614Request(r Func614RequestRef) Func614Request {
+	var v Func614Request
+	v.trace_id = newString(r.trace_id)
+	v.In1614001 = newString(r.In1614001)
+	v.In1614002 = newString(r.In1614002)
+	v.In1614003 = newString(r.In1614003)
+	v.In1614004 = newString(r.In1614004)
+	v.In1614005 = newString(r.In1614005)
+	v.In1614006 = newString(r.In1614006)
+	v.In1614007 = newString(r.In1614007)
+	v.In1614008 = newString(r.In1614008)
+	v.In1614009 = newString(r.In1614009)
+	v.In1614010 = newString(r.In1614010)
+	v.In1614011 = newString(r.In1614011)
+	v.In1614041 = newString(r.In1614041)
+	v.In1614042 = newString(r.In1614042)
+	v.In1614043 = newString(r.In1614043)
+	v.In1614044 = newString(r.In1614044)
+	v.In1614045 = newString(r.In1614045)
+	v.In1614046 = newString(r.In1614046)
+	v.In1614047 = newString(r.In1614047)
+	v.In1614048 = newString(r.In1614048)
+	v.In1614050 = newString(r.In1614050)
+	v.In1614061 = newString(r.In1614061)
+	v.In1614091 = newString(r.In1614091)
+	v.In1614092 = newString(r.In1614092)
+	v.In1614093 = newString(r.In1614093)
+	v.In1614094 = newString(r.In1614094)
+	v.In1614095 = newString(r.In1614095)
+	v.In1614101 = newString(r.In1614101)
+	v.In1614102 = newString(r.In1614102)
+	return v
+}
+
+func newFunc614RequestList(r ListRef) []Func614Request {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*Func614RequestRef)(r.ptr), n)
+	out := make([]Func614Request, n)
+	for i := range out {
+		out[i] = newFunc614Request(src[i])
+	}
+	return out
 }
 
 func flattenFunc614Request(v *Func614Request, e *enc) {
@@ -1668,37 +1765,84 @@ func flattenFunc614Request(v *Func614Request, e *enc) {
 }
 
 func restoreFunc614RequestRef(d *dec) Func614RequestRef {
-	return Func614RequestRef{
-		trace_id:  d.str(),
-		In1614001: d.str(),
-		In1614002: d.str(),
-		In1614003: d.str(),
-		In1614004: d.str(),
-		In1614005: d.str(),
-		In1614006: d.str(),
-		In1614007: d.str(),
-		In1614008: d.str(),
-		In1614009: d.str(),
-		In1614010: d.str(),
-		In1614011: d.str(),
-		In1614041: d.str(),
-		In1614042: d.str(),
-		In1614043: d.str(),
-		In1614044: d.str(),
-		In1614045: d.str(),
-		In1614046: d.str(),
-		In1614047: d.str(),
-		In1614048: d.str(),
-		In1614050: d.str(),
-		In1614061: d.str(),
-		In1614091: d.str(),
-		In1614092: d.str(),
-		In1614093: d.str(),
-		In1614094: d.str(),
-		In1614095: d.str(),
-		In1614101: d.str(),
-		In1614102: d.str(),
+	var r Func614RequestRef
+	r.trace_id = d.str()
+	r.In1614001 = d.str()
+	r.In1614002 = d.str()
+	r.In1614003 = d.str()
+	r.In1614004 = d.str()
+	r.In1614005 = d.str()
+	r.In1614006 = d.str()
+	r.In1614007 = d.str()
+	r.In1614008 = d.str()
+	r.In1614009 = d.str()
+	r.In1614010 = d.str()
+	r.In1614011 = d.str()
+	r.In1614041 = d.str()
+	r.In1614042 = d.str()
+	r.In1614043 = d.str()
+	r.In1614044 = d.str()
+	r.In1614045 = d.str()
+	r.In1614046 = d.str()
+	r.In1614047 = d.str()
+	r.In1614048 = d.str()
+	r.In1614050 = d.str()
+	r.In1614061 = d.str()
+	r.In1614091 = d.str()
+	r.In1614092 = d.str()
+	r.In1614093 = d.str()
+	r.In1614094 = d.str()
+	r.In1614095 = d.str()
+	r.In1614101 = d.str()
+	r.In1614102 = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func Func614RequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(Func614RequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]Func614RequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFunc614RequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newSMSRequest(r SMSRequestRef) SMSRequest {
+	var v SMSRequest
+	v.trace_id = newString(r.trace_id)
+	v.mobile = newString(r.mobile)
+	v.message = newString(r.message)
+	v.fixed_isp = newString(r.fixed_isp)
+	v.sms_range = newString(r.sms_range)
+	v.template_id = newString(r.template_id)
+	return v
+}
+
+func newSMSRequestList(r ListRef) []SMSRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*SMSRequestRef)(r.ptr), n)
+	out := make([]SMSRequest, n)
+	for i := range out {
+		out[i] = newSMSRequest(src[i])
+	}
+	return out
 }
 
 func flattenSMSRequest(v *SMSRequest, e *enc) {
@@ -1711,46 +1855,180 @@ func flattenSMSRequest(v *SMSRequest, e *enc) {
 }
 
 func restoreSMSRequestRef(d *dec) SMSRequestRef {
-	return SMSRequestRef{
-		trace_id:    d.str(),
-		mobile:      d.str(),
-		message:     d.str(),
-		fixed_isp:   d.str(),
-		sms_range:   d.str(),
-		template_id: d.str(),
+	var r SMSRequestRef
+	r.trace_id = d.str()
+	r.mobile = d.str()
+	r.message = d.str()
+	r.fixed_isp = d.str()
+	r.sms_range = d.str()
+	r.template_id = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func SMSRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(SMSRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]SMSRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreSMSRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newReceiptRequest(r ReceiptRequestRef) ReceiptRequest {
+	var v ReceiptRequest
+	v.trace_id = newString(r.trace_id)
+	v.codes = newStringList(r.codes)
+	return v
+}
+
+func newReceiptRequestList(r ListRef) []ReceiptRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*ReceiptRequestRef)(r.ptr), n)
+	out := make([]ReceiptRequest, n)
+	for i := range out {
+		out[i] = newReceiptRequest(src[i])
+	}
+	return out
 }
 
 func flattenReceiptRequest(v *ReceiptRequest, e *enc) {
 	e.put(v.trace_id)
 	e.put(uint64(len(v.codes)))
-	for _, item := range v.codes {
-		e.put(item)
+	for _, _item := range v.codes {
+		e.put(_item)
 	}
 }
 
 func restoreReceiptRequestRef(d *dec) ReceiptRequestRef {
-	return ReceiptRequestRef{
-		trace_id: d.str(),
-		codes:    stringList(d),
+	var r ReceiptRequestRef
+	r.trace_id = d.str()
+	r.codes = stringList(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func ReceiptRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(ReceiptRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]ReceiptRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreReceiptRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFunctionRequest(r FunctionRequestRef) FunctionRequest {
+	var v FunctionRequest
+	v.trace_id = newString(r.trace_id)
+	v.name = newString(r.name)
+	v.req = newPrimList[uint8](r.req)
+	return v
+}
+
+func newFunctionRequestList(r ListRef) []FunctionRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*FunctionRequestRef)(r.ptr), n)
+	out := make([]FunctionRequest, n)
+	for i := range out {
+		out[i] = newFunctionRequest(src[i])
+	}
+	return out
 }
 
 func flattenFunctionRequest(v *FunctionRequest, e *enc) {
 	e.put(v.trace_id)
 	e.put(v.name)
 	e.put(uint64(len(v.req)))
-	for _, item := range v.req {
-		e.put(item)
+	for _, _item := range v.req {
+		e.put(_item)
 	}
 }
 
 func restoreFunctionRequestRef(d *dec) FunctionRequestRef {
-	return FunctionRequestRef{
-		trace_id: d.str(),
-		name:     d.str(),
-		req:      primList[uint8](d),
+	var r FunctionRequestRef
+	r.trace_id = d.str()
+	r.name = d.str()
+	r.req = primList[uint8](d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func FunctionRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(FunctionRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]FunctionRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFunctionRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newTouchRequest(r TouchRequestRef) TouchRequest {
+	var v TouchRequest
+	v.trace_id = newString(r.trace_id)
+	v.code = newString(r.code)
+	v.scene = r.scene
+	v.status = r.status
+	v.count = r.count
+	v.duration = r.duration
+	return v
+}
+
+func newTouchRequestList(r ListRef) []TouchRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*TouchRequestRef)(r.ptr), n)
+	out := make([]TouchRequest, n)
+	for i := range out {
+		out[i] = newTouchRequest(src[i])
+	}
+	return out
 }
 
 func flattenTouchRequest(v *TouchRequest, e *enc) {
@@ -1763,14 +2041,63 @@ func flattenTouchRequest(v *TouchRequest, e *enc) {
 }
 
 func restoreTouchRequestRef(d *dec) TouchRequestRef {
-	return TouchRequestRef{
-		trace_id: d.str(),
-		code:     d.str(),
-		scene:    d.i32(),
-		status:   d.i32(),
-		count:    d.i32(),
-		duration: d.i32(),
+	var r TouchRequestRef
+	r.trace_id = d.str()
+	r.code = d.str()
+	r.scene = d.i32()
+	r.status = d.i32()
+	r.count = d.i32()
+	r.duration = d.i32()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func TouchRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(TouchRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]TouchRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreTouchRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newBillRequest(r BillRequestRef) BillRequest {
+	var v BillRequest
+	v.trace_id = newString(r.trace_id)
+	v.order_type = newString(r.order_type)
+	v.order_id = r.order_id
+	v.order_product_name = newString(r.order_product_name)
+	v.interface_account = newString(r.interface_account)
+	v.interface_method = newString(r.interface_method)
+	v.influence_scope = newString(r.influence_scope)
+	v.err_message = newString(r.err_message)
+	return v
+}
+
+func newBillRequestList(r ListRef) []BillRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*BillRequestRef)(r.ptr), n)
+	out := make([]BillRequest, n)
+	for i := range out {
+		out[i] = newBillRequest(src[i])
+	}
+	return out
 }
 
 func flattenBillRequest(v *BillRequest, e *enc) {
@@ -1785,33 +2112,119 @@ func flattenBillRequest(v *BillRequest, e *enc) {
 }
 
 func restoreBillRequestRef(d *dec) BillRequestRef {
-	return BillRequestRef{
-		trace_id:           d.str(),
-		order_type:         d.str(),
-		order_id:           d.i64(),
-		order_product_name: d.str(),
-		interface_account:  d.str(),
-		interface_method:   d.str(),
-		influence_scope:    d.str(),
-		err_message:        d.str(),
+	var r BillRequestRef
+	r.trace_id = d.str()
+	r.order_type = d.str()
+	r.order_id = d.i64()
+	r.order_product_name = d.str()
+	r.interface_account = d.str()
+	r.interface_method = d.str()
+	r.influence_scope = d.str()
+	r.err_message = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func BillRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(BillRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]BillRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreBillRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newCommonResponse(r CommonResponseRef) CommonResponse {
+	var v CommonResponse
+	v.err_msg = newString(r.err_msg)
+	v.result = newPrimList[uint8](r.result)
+	v.ok = r.ok
+	return v
+}
+
+func newCommonResponseList(r ListRef) []CommonResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*CommonResponseRef)(r.ptr), n)
+	out := make([]CommonResponse, n)
+	for i := range out {
+		out[i] = newCommonResponse(src[i])
+	}
+	return out
 }
 
 func flattenCommonResponse(v *CommonResponse, e *enc) {
 	e.put(v.err_msg)
 	e.put(uint64(len(v.result)))
-	for _, item := range v.result {
-		e.put(item)
+	for _, _item := range v.result {
+		e.put(_item)
 	}
 	e.put(v.ok)
 }
 
 func restoreCommonResponseRef(d *dec) CommonResponseRef {
-	return CommonResponseRef{
-		err_msg: d.str(),
-		result:  primList[uint8](d),
-		ok:      d.boolean(),
+	var r CommonResponseRef
+	r.err_msg = d.str()
+	r.result = primList[uint8](d)
+	r.ok = d.boolean()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func CommonResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(CommonResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]CommonResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreCommonResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newHashResponse(r HashResponseRef) HashResponse {
+	var v HashResponse
+	v.hash = newString(r.hash)
+	return v
+}
+
+func newHashResponseList(r ListRef) []HashResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*HashResponseRef)(r.ptr), n)
+	out := make([]HashResponse, n)
+	for i := range out {
+		out[i] = newHashResponse(src[i])
+	}
+	return out
 }
 
 func flattenHashResponse(v *HashResponse, e *enc) {
@@ -1819,24 +2232,113 @@ func flattenHashResponse(v *HashResponse, e *enc) {
 }
 
 func restoreHashResponseRef(d *dec) HashResponseRef {
-	return HashResponseRef{
-		hash: d.str(),
+	var r HashResponseRef
+	r.hash = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func HashResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(HashResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]HashResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreHashResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newReceiptResponse(r ReceiptResponseRef) ReceiptResponse {
+	var v ReceiptResponse
+	v.err_msg = newString(r.err_msg)
+	v.files = newStringList(r.files)
+	return v
+}
+
+func newReceiptResponseList(r ListRef) []ReceiptResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*ReceiptResponseRef)(r.ptr), n)
+	out := make([]ReceiptResponse, n)
+	for i := range out {
+		out[i] = newReceiptResponse(src[i])
+	}
+	return out
 }
 
 func flattenReceiptResponse(v *ReceiptResponse, e *enc) {
 	e.put(v.err_msg)
 	e.put(uint64(len(v.files)))
-	for _, item := range v.files {
-		e.put(item)
+	for _, _item := range v.files {
+		e.put(_item)
 	}
 }
 
 func restoreReceiptResponseRef(d *dec) ReceiptResponseRef {
-	return ReceiptResponseRef{
-		err_msg: d.str(),
-		files:   stringList(d),
+	var r ReceiptResponseRef
+	r.err_msg = d.str()
+	r.files = stringList(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func ReceiptResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(ReceiptResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]ReceiptResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreReceiptResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newAddressResponse(r AddressResponseRef) AddressResponse {
+	var v AddressResponse
+	v.province = newString(r.province)
+	v.city = newString(r.city)
+	v.district = newString(r.district)
+	v.street = newString(r.street)
+	v.detail = newString(r.detail)
+	return v
+}
+
+func newAddressResponseList(r ListRef) []AddressResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*AddressResponseRef)(r.ptr), n)
+	out := make([]AddressResponse, n)
+	for i := range out {
+		out[i] = newAddressResponse(src[i])
+	}
+	return out
 }
 
 func flattenAddressResponse(v *AddressResponse, e *enc) {
@@ -1848,13 +2350,58 @@ func flattenAddressResponse(v *AddressResponse, e *enc) {
 }
 
 func restoreAddressResponseRef(d *dec) AddressResponseRef {
-	return AddressResponseRef{
-		province: d.str(),
-		city:     d.str(),
-		district: d.str(),
-		street:   d.str(),
-		detail:   d.str(),
+	var r AddressResponseRef
+	r.province = d.str()
+	r.city = d.str()
+	r.district = d.str()
+	r.street = d.str()
+	r.detail = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func AddressResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(AddressResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]AddressResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreAddressResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newAddressLabel(r AddressLabelRef) AddressLabel {
+	var v AddressLabel
+	v.desc = newString(r.desc)
+	v.name = newString(r.name)
+	v.code = newString(r.code)
+	v.value = r.value
+	return v
+}
+
+func newAddressLabelList(r ListRef) []AddressLabel {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*AddressLabelRef)(r.ptr), n)
+	out := make([]AddressLabel, n)
+	for i := range out {
+		out[i] = newAddressLabel(src[i])
+	}
+	return out
 }
 
 func flattenAddressLabel(v *AddressLabel, e *enc) {
@@ -1865,39 +2412,115 @@ func flattenAddressLabel(v *AddressLabel, e *enc) {
 }
 
 func restoreAddressLabelRef(d *dec) AddressLabelRef {
-	return AddressLabelRef{
-		desc:  d.str(),
-		name:  d.str(),
-		code:  d.str(),
-		value: d.i32(),
+	var r AddressLabelRef
+	r.desc = d.str()
+	r.name = d.str()
+	r.code = d.str()
+	r.value = d.i32()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func AddressLabelListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(AddressLabelRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]AddressLabelRef, cnt)
+	for i := range arr {
+		arr[i] = restoreAddressLabelRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newLabelResponse(r LabelResponseRef) LabelResponse {
+	var v LabelResponse
+	v.code = newString(r.code)
+	v.message = newString(r.message)
+	v.labels = newAddressLabelList(r.labels)
+	return v
+}
+
+func newLabelResponseList(r ListRef) []LabelResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*LabelResponseRef)(r.ptr), n)
+	out := make([]LabelResponse, n)
+	for i := range out {
+		out[i] = newLabelResponse(src[i])
+	}
+	return out
 }
 
 func flattenLabelResponse(v *LabelResponse, e *enc) {
 	e.put(v.code)
 	e.put(v.message)
 	e.put(uint64(len(v.labels)))
-	for i := range v.labels {
-		flattenAddressLabel(&v.labels[i], e)
+	for _, _item := range v.labels {
+		flattenAddressLabel(&_item, e)
 	}
 }
 
 func restoreLabelResponseRef(d *dec) LabelResponseRef {
-	return LabelResponseRef{
-		code:    d.str(),
-		message: d.str(),
-		labels: func() ListRef {
-			cnt := int(d.u64())
-			if cnt == 0 {
-				return ListRef{}
-			}
-			arr := make([]AddressLabelRef, cnt)
-			for i := range arr {
-				arr[i] = restoreAddressLabelRef(d)
-			}
-			return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
-		}(),
+	var r LabelResponseRef
+	r.code = d.str()
+	r.message = d.str()
+	r.labels = AddressLabelListRef(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func LabelResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(LabelResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]LabelResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreLabelResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newOrderResponse(r OrderResponseRef) OrderResponse {
+	var v OrderResponse
+	v.code = newString(r.code)
+	return v
+}
+
+func newOrderResponseList(r ListRef) []OrderResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*OrderResponseRef)(r.ptr), n)
+	out := make([]OrderResponse, n)
+	for i := range out {
+		out[i] = newOrderResponse(src[i])
+	}
+	return out
 }
 
 func flattenOrderResponse(v *OrderResponse, e *enc) {
@@ -1905,9 +2528,53 @@ func flattenOrderResponse(v *OrderResponse, e *enc) {
 }
 
 func restoreOrderResponseRef(d *dec) OrderResponseRef {
-	return OrderResponseRef{
-		code: d.str(),
+	var r OrderResponseRef
+	r.code = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func OrderResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(OrderResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]OrderResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreOrderResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFuncResult(r FuncResultRef) FuncResult {
+	var v FuncResult
+	v.id = newString(r.id)
+	v.name = newString(r.name)
+	v.value = newString(r.value)
+	return v
+}
+
+func newFuncResultList(r ListRef) []FuncResult {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*FuncResultRef)(r.ptr), n)
+	out := make([]FuncResult, n)
+	for i := range out {
+		out[i] = newFuncResult(src[i])
+	}
+	return out
 }
 
 func flattenFuncResult(v *FuncResult, e *enc) {
@@ -1917,61 +2584,172 @@ func flattenFuncResult(v *FuncResult, e *enc) {
 }
 
 func restoreFuncResultRef(d *dec) FuncResultRef {
-	return FuncResultRef{
-		id:    d.str(),
-		name:  d.str(),
-		value: d.str(),
+	var r FuncResultRef
+	r.id = d.str()
+	r.name = d.str()
+	r.value = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func FuncResultListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(FuncResultRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]FuncResultRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFuncResultRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newRowResult(r RowResultRef) RowResult {
+	var v RowResult
+	v.cols = newFuncResultList(r.cols)
+	return v
+}
+
+func newRowResultList(r ListRef) []RowResult {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*RowResultRef)(r.ptr), n)
+	out := make([]RowResult, n)
+	for i := range out {
+		out[i] = newRowResult(src[i])
+	}
+	return out
 }
 
 func flattenRowResult(v *RowResult, e *enc) {
 	e.put(uint64(len(v.cols)))
-	for i := range v.cols {
-		flattenFuncResult(&v.cols[i], e)
+	for _, _item := range v.cols {
+		flattenFuncResult(&_item, e)
 	}
 }
 
 func restoreRowResultRef(d *dec) RowResultRef {
-	return RowResultRef{
-		cols: func() ListRef {
-			cnt := int(d.u64())
-			if cnt == 0 {
-				return ListRef{}
-			}
-			arr := make([]FuncResultRef, cnt)
-			for i := range arr {
-				arr[i] = restoreFuncResultRef(d)
-			}
-			return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
-		}(),
+	var r RowResultRef
+	r.cols = FuncResultListRef(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func RowResultListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(RowResultRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]RowResultRef, cnt)
+	for i := range arr {
+		arr[i] = restoreRowResultRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newEOPResponse(r EOPResponseRef) EOPResponse {
+	var v EOPResponse
+	v.result_code = newString(r.result_code)
+	v.err_msg = newString(r.err_msg)
+	v.grid = newRowResultList(r.grid)
+	return v
+}
+
+func newEOPResponseList(r ListRef) []EOPResponse {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*EOPResponseRef)(r.ptr), n)
+	out := make([]EOPResponse, n)
+	for i := range out {
+		out[i] = newEOPResponse(src[i])
+	}
+	return out
 }
 
 func flattenEOPResponse(v *EOPResponse, e *enc) {
 	e.put(v.result_code)
 	e.put(v.err_msg)
 	e.put(uint64(len(v.grid)))
-	for i := range v.grid {
-		flattenRowResult(&v.grid[i], e)
+	for _, _item := range v.grid {
+		flattenRowResult(&_item, e)
 	}
 }
 
 func restoreEOPResponseRef(d *dec) EOPResponseRef {
-	return EOPResponseRef{
-		result_code: d.str(),
-		err_msg:     d.str(),
-		grid: func() ListRef {
-			cnt := int(d.u64())
-			if cnt == 0 {
-				return ListRef{}
-			}
-			arr := make([]RowResultRef, cnt)
-			for i := range arr {
-				arr[i] = restoreRowResultRef(d)
-			}
-			return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
-		}(),
+	var r EOPResponseRef
+	r.result_code = d.str()
+	r.err_msg = d.str()
+	r.grid = RowResultListRef(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func EOPResponseListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(EOPResponseRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]EOPResponseRef, cnt)
+	for i := range arr {
+		arr[i] = restoreEOPResponseRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFileRequest(r FileRequestRef) FileRequest {
+	var v FileRequest
+	v.trace_id = newString(r.trace_id)
+	v.bucket = newString(r.bucket)
+	v.objectKey = newString(r.objectKey)
+	v.content = newString(r.content)
+	return v
+}
+
+func newFileRequestList(r ListRef) []FileRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*FileRequestRef)(r.ptr), n)
+	out := make([]FileRequest, n)
+	for i := range out {
+		out[i] = newFileRequest(src[i])
+	}
+	return out
 }
 
 func flattenFileRequest(v *FileRequest, e *enc) {
@@ -1982,29 +2760,116 @@ func flattenFileRequest(v *FileRequest, e *enc) {
 }
 
 func restoreFileRequestRef(d *dec) FileRequestRef {
-	return FileRequestRef{
-		trace_id:  d.str(),
-		bucket:    d.str(),
-		objectKey: d.str(),
-		content:   d.str(),
+	var r FileRequestRef
+	r.trace_id = d.str()
+	r.bucket = d.str()
+	r.objectKey = d.str()
+	r.content = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func FileRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(FileRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]FileRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFileRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newDeleteFileRequest(r DeleteFileRequestRef) DeleteFileRequest {
+	var v DeleteFileRequest
+	v.trace_id = newString(r.trace_id)
+	v.bucket = newString(r.bucket)
+	v.objectKeys = newStringList(r.objectKeys)
+	return v
+}
+
+func newDeleteFileRequestList(r ListRef) []DeleteFileRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*DeleteFileRequestRef)(r.ptr), n)
+	out := make([]DeleteFileRequest, n)
+	for i := range out {
+		out[i] = newDeleteFileRequest(src[i])
+	}
+	return out
 }
 
 func flattenDeleteFileRequest(v *DeleteFileRequest, e *enc) {
 	e.put(v.trace_id)
 	e.put(v.bucket)
 	e.put(uint64(len(v.objectKeys)))
-	for _, item := range v.objectKeys {
-		e.put(item)
+	for _, _item := range v.objectKeys {
+		e.put(_item)
 	}
 }
 
 func restoreDeleteFileRequestRef(d *dec) DeleteFileRequestRef {
-	return DeleteFileRequestRef{
-		trace_id:   d.str(),
-		bucket:     d.str(),
-		objectKeys: stringList(d),
+	var r DeleteFileRequestRef
+	r.trace_id = d.str()
+	r.bucket = d.str()
+	r.objectKeys = stringList(d)
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func DeleteFileRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(DeleteFileRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]DeleteFileRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreDeleteFileRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newFileNameAndPath(r FileNameAndPathRef) FileNameAndPath {
+	var v FileNameAndPath
+	v.file_name = newString(r.file_name)
+	v.file_path = newString(r.file_path)
+	return v
+}
+
+func newFileNameAndPathList(r ListRef) []FileNameAndPath {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*FileNameAndPathRef)(r.ptr), n)
+	out := make([]FileNameAndPath, n)
+	for i := range out {
+		out[i] = newFileNameAndPath(src[i])
+	}
+	return out
 }
 
 func flattenFileNameAndPath(v *FileNameAndPath, e *enc) {
@@ -2013,37 +2878,94 @@ func flattenFileNameAndPath(v *FileNameAndPath, e *enc) {
 }
 
 func restoreFileNameAndPathRef(d *dec) FileNameAndPathRef {
-	return FileNameAndPathRef{
-		file_name: d.str(),
-		file_path: d.str(),
+	var r FileNameAndPathRef
+	r.file_name = d.str()
+	r.file_path = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func FileNameAndPathListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(FileNameAndPathRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]FileNameAndPathRef, cnt)
+	for i := range arr {
+		arr[i] = restoreFileNameAndPathRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
+}
+
+func newOrderAuditRequest(r OrderAuditRequestRef) OrderAuditRequest {
+	var v OrderAuditRequest
+	v.trace_id = newString(r.trace_id)
+	v.image_path = newFileNameAndPathList(r.image_path)
+	v.audit_info = newString(r.audit_info)
+	return v
+}
+
+func newOrderAuditRequestList(r ListRef) []OrderAuditRequest {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*OrderAuditRequestRef)(r.ptr), n)
+	out := make([]OrderAuditRequest, n)
+	for i := range out {
+		out[i] = newOrderAuditRequest(src[i])
+	}
+	return out
 }
 
 func flattenOrderAuditRequest(v *OrderAuditRequest, e *enc) {
 	e.put(v.trace_id)
 	e.put(uint64(len(v.image_path)))
-	for i := range v.image_path {
-		flattenFileNameAndPath(&v.image_path[i], e)
+	for _, _item := range v.image_path {
+		flattenFileNameAndPath(&_item, e)
 	}
 	e.put(v.audit_info)
 }
 
 func restoreOrderAuditRequestRef(d *dec) OrderAuditRequestRef {
-	return OrderAuditRequestRef{
-		trace_id: d.str(),
-		image_path: func() ListRef {
-			cnt := int(d.u64())
-			if cnt == 0 {
-				return ListRef{}
-			}
-			arr := make([]FileNameAndPathRef, cnt)
-			for i := range arr {
-				arr[i] = restoreFileNameAndPathRef(d)
-			}
-			return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
-		}(),
-		audit_info: d.str(),
+	var r OrderAuditRequestRef
+	r.trace_id = d.str()
+	r.image_path = FileNameAndPathListRef(d)
+	r.audit_info = d.str()
+	if d.err {
+		panic("rust2go-ipc: invalid payload")
 	}
+	return r
+}
+
+func OrderAuditRequestListRef(d *dec) ListRef {
+	cnt := int(d.u64())
+	size := int(unsafe.Sizeof(OrderAuditRequestRef{}))
+	if size == 0 {
+		size = 1
+	}
+	if cnt < 0 || cnt > (len(d.b)-d.p)/size {
+		d.err = true
+		panic("rust2go-ipc: struct list len out of bounds")
+	}
+	if cnt == 0 {
+		return ListRef{}
+	}
+	arr := make([]OrderAuditRequestRef, cnt)
+	for i := range arr {
+		arr[i] = restoreOrderAuditRequestRef(d)
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}
 }
 
 var GolangCallImpl GolangCall
@@ -2091,174 +3013,204 @@ func dispatch(methodID uint32, payload []byte) (out []byte, ok bool) {
 	d := &dec{b: payload}
 	switch methodID {
 	case 0:
-		r := newEmptyRequest(restoreEmptyRequestRef(d))
-		GolangCallImpl.Init(&r)
+		_r0 := restoreEmptyRequestRef(d)
+		_a0 := newEmptyRequest(_r0)
+		GolangCallImpl.Init(&_a0)
 		return nil, true
 	case 1:
-		r := newEmptyRequest(restoreEmptyRequestRef(d))
-		GolangCallImpl.Shutdown(&r)
+		_r0 := restoreEmptyRequestRef(d)
+		_a0 := newEmptyRequest(_r0)
+		GolangCallImpl.Shutdown(&_a0)
 		return nil, true
 	case 2:
-		r := newTouchRequest(restoreTouchRequestRef(d))
-		GolangCallImpl.touchBill(&r)
+		_r0 := restoreTouchRequestRef(d)
+		_a0 := newTouchRequest(_r0)
+		GolangCallImpl.touchBill(&_a0)
 		return nil, true
 	case 3:
-		r := newBillRequest(restoreBillRequestRef(d))
-		GolangCallImpl.newBill(&r)
+		_r0 := restoreBillRequestRef(d)
+		_a0 := newBillRequest(_r0)
+		GolangCallImpl.newBill(&_a0)
 		return nil, true
 	case 4:
-		r := newBillRequest(restoreBillRequestRef(d))
-		GolangCallImpl.newErrorBill(&r)
+		_r0 := restoreBillRequestRef(d)
+		_a0 := newBillRequest(_r0)
+		GolangCallImpl.newErrorBill(&_a0)
 		return nil, true
 	case 5:
-		r := newEmptyRequest(restoreEmptyRequestRef(d))
-		resp := GolangCallImpl.newID(&r)
+		_r0 := restoreEmptyRequestRef(d)
+		_a0 := newEmptyRequest(_r0)
+		_resp := GolangCallImpl.newID(&_a0)
 		e := &enc{}
-		flattenOrderResponse(&resp, e)
+		flattenOrderResponse(&_resp, e)
 		return e.b, true
 	case 6:
-		r := newHashRequest(restoreHashRequestRef(d))
-		resp := GolangCallImpl.md5(&r)
+		_r0 := restoreHashRequestRef(d)
+		_a0 := newHashRequest(_r0)
+		_resp := GolangCallImpl.md5(&_a0)
 		e := &enc{}
-		flattenHashResponse(&resp, e)
+		flattenHashResponse(&_resp, e)
 		return e.b, true
 	case 7:
-		r := newEsRequest(restoreEsRequestRef(d))
-		resp := GolangCallImpl.esGetOrder(&r)
+		_r0 := restoreEsRequestRef(d)
+		_a0 := newEsRequest(_r0)
+		_resp := GolangCallImpl.esGetOrder(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 8:
-		r := newFunc014Request(restoreFunc014RequestRef(d))
-		resp := GolangCallImpl.eop014(&r)
+		_r0 := restoreFunc014RequestRef(d)
+		_a0 := newFunc014Request(_r0)
+		_resp := GolangCallImpl.eop014(&_a0)
 		e := &enc{}
-		flattenEOPResponse(&resp, e)
+		flattenEOPResponse(&_resp, e)
 		return e.b, true
 	case 9:
-		r := newFunc015Request(restoreFunc015RequestRef(d))
-		resp := GolangCallImpl.eop015(&r)
+		_r0 := restoreFunc015RequestRef(d)
+		_a0 := newFunc015Request(_r0)
+		_resp := GolangCallImpl.eop015(&_a0)
 		e := &enc{}
-		flattenEOPResponse(&resp, e)
+		flattenEOPResponse(&_resp, e)
 		return e.b, true
 	case 10:
-		r := newFunc019Request(restoreFunc019RequestRef(d))
-		resp := GolangCallImpl.eop019(&r)
+		_r0 := restoreFunc019RequestRef(d)
+		_a0 := newFunc019Request(_r0)
+		_resp := GolangCallImpl.eop019(&_a0)
 		e := &enc{}
-		flattenEOPResponse(&resp, e)
+		flattenEOPResponse(&_resp, e)
 		return e.b, true
 	case 11:
-		r := newFunc157Request(restoreFunc157RequestRef(d))
-		resp := GolangCallImpl.eop157(&r)
+		_r0 := restoreFunc157RequestRef(d)
+		_a0 := newFunc157Request(_r0)
+		_resp := GolangCallImpl.eop157(&_a0)
 		e := &enc{}
-		flattenEOPResponse(&resp, e)
+		flattenEOPResponse(&_resp, e)
 		return e.b, true
 	case 12:
-		r := newFunc614Request(restoreFunc614RequestRef(d))
-		resp := GolangCallImpl.eop614(&r)
+		_r0 := restoreFunc614RequestRef(d)
+		_a0 := newFunc614Request(_r0)
+		_resp := GolangCallImpl.eop614(&_a0)
 		e := &enc{}
-		flattenEOPResponse(&resp, e)
+		flattenEOPResponse(&_resp, e)
 		return e.b, true
 	case 13:
-		r := newLabelRequest(restoreLabelRequestRef(d))
-		resp := GolangCallImpl.addressLabel(&r)
+		_r0 := restoreLabelRequestRef(d)
+		_a0 := newLabelRequest(_r0)
+		_resp := GolangCallImpl.addressLabel(&_a0)
 		e := &enc{}
-		flattenLabelResponse(&resp, e)
+		flattenLabelResponse(&_resp, e)
 		return e.b, true
 	case 14:
-		r := newAddressRequest(restoreAddressRequestRef(d))
-		resp := GolangCallImpl.fetchAddress(&r)
+		_r0 := restoreAddressRequestRef(d)
+		_a0 := newAddressRequest(_r0)
+		_resp := GolangCallImpl.fetchAddress(&_a0)
 		e := &enc{}
-		flattenAddressResponse(&resp, e)
+		flattenAddressResponse(&_resp, e)
 		return e.b, true
 	case 15:
-		r := newFunctionRequest(restoreFunctionRequestRef(d))
-		resp := GolangCallImpl.function(&r)
+		_r0 := restoreFunctionRequestRef(d)
+		_a0 := newFunctionRequest(_r0)
+		_resp := GolangCallImpl.function(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 16:
-		r := newEsRequest(restoreEsRequestRef(d))
-		resp := GolangCallImpl.esDump(&r)
+		_r0 := restoreEsRequestRef(d)
+		_a0 := newEsRequest(_r0)
+		_resp := GolangCallImpl.esDump(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 17:
-		r := newUIMRequest(restoreUIMRequestRef(d))
-		resp := GolangCallImpl.fetchUIM(&r)
+		_r0 := restoreUIMRequestRef(d)
+		_a0 := newUIMRequest(_r0)
+		_resp := GolangCallImpl.fetchUIM(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 18:
-		r := newTextRequest(restoreTextRequestRef(d))
-		resp := GolangCallImpl.fetchText(&r)
+		_r0 := restoreTextRequestRef(d)
+		_a0 := newTextRequest(_r0)
+		_resp := GolangCallImpl.fetchText(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 19:
-		r := newImageRequest(restoreImageRequestRef(d))
-		resp := GolangCallImpl.fetchImages(&r)
+		_r0 := restoreImageRequestRef(d)
+		_a0 := newImageRequest(_r0)
+		_resp := GolangCallImpl.fetchImages(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 20:
-		r := newCoverRequest(restoreCoverRequestRef(d))
-		resp := GolangCallImpl.newCover(&r)
+		_r0 := restoreCoverRequestRef(d)
+		_a0 := newCoverRequest(_r0)
+		_resp := GolangCallImpl.newCover(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 21:
-		r := newCloudRequest(restoreCloudRequestRef(d))
-		resp := GolangCallImpl.saveCloud(&r)
+		_r0 := restoreCloudRequestRef(d)
+		_a0 := newCloudRequest(_r0)
+		_resp := GolangCallImpl.saveCloud(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 22:
-		r := newSMSRequest(restoreSMSRequestRef(d))
-		resp := GolangCallImpl.sendSMS(&r)
+		_r0 := restoreSMSRequestRef(d)
+		_a0 := newSMSRequest(_r0)
+		_resp := GolangCallImpl.sendSMS(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 23:
-		r := newQYWXRequest(restoreQYWXRequestRef(d))
-		resp := GolangCallImpl.sendQYWX(&r)
+		_r0 := restoreQYWXRequestRef(d)
+		_a0 := newQYWXRequest(_r0)
+		_resp := GolangCallImpl.sendQYWX(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 24:
-		r := newReceiptRequest(restoreReceiptRequestRef(d))
-		resp := GolangCallImpl.fetchReceipts(&r)
+		_r0 := restoreReceiptRequestRef(d)
+		_a0 := newReceiptRequest(_r0)
+		_resp := GolangCallImpl.fetchReceipts(&_a0)
 		e := &enc{}
-		flattenReceiptResponse(&resp, e)
+		flattenReceiptResponse(&_resp, e)
 		return e.b, true
 	case 25:
-		r := newEsRequest(restoreEsRequestRef(d))
-		resp := GolangCallImpl.dailyReportES(&r)
+		_r0 := restoreEsRequestRef(d)
+		_a0 := newEsRequest(_r0)
+		_resp := GolangCallImpl.dailyReportES(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 26:
-		r := newFileRequest(restoreFileRequestRef(d))
-		resp := GolangCallImpl.UploadFile(&r)
+		_r0 := restoreFileRequestRef(d)
+		_a0 := newFileRequest(_r0)
+		_resp := GolangCallImpl.UploadFile(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 27:
-		r := newFileRequest(restoreFileRequestRef(d))
-		resp := GolangCallImpl.DownloadFile(&r)
+		_r0 := restoreFileRequestRef(d)
+		_a0 := newFileRequest(_r0)
+		_resp := GolangCallImpl.DownloadFile(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 28:
-		r := newDeleteFileRequest(restoreDeleteFileRequestRef(d))
-		resp := GolangCallImpl.DeleteFile(&r)
+		_r0 := restoreDeleteFileRequestRef(d)
+		_a0 := newDeleteFileRequest(_r0)
+		_resp := GolangCallImpl.DeleteFile(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	case 29:
-		r := newOrderAuditRequest(restoreOrderAuditRequestRef(d))
-		resp := GolangCallImpl.OrderPreaudit(&r)
+		_r0 := restoreOrderAuditRequestRef(d)
+		_a0 := newOrderAuditRequest(_r0)
+		_resp := GolangCallImpl.OrderPreaudit(&_a0)
 		e := &enc{}
-		flattenCommonResponse(&resp, e)
+		flattenCommonResponse(&_resp, e)
 		return e.b, true
 	}
 	return nil, false

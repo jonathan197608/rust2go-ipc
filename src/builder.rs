@@ -1,11 +1,11 @@
 //! Build-time API mirroring `rust2go::Builder`. Instead of cgo + bindgen, this
 //! parses the Rust schema and emits pure-Go sources plus Rust binding mirrors.
 
-use std::{env, ffi::OsString, fs, path::PathBuf, process::Command};
+use std::{collections::HashSet, env, ffi::OsString, fs, path::PathBuf, process::Command};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Fields, Item, ItemStruct, Type};
+use syn::{Fields, FnArg, Item, ItemStruct, Pat, ReturnType, TraitItem, Type};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkType {
@@ -168,7 +168,7 @@ impl GoCompilerArgs for CustomArgGoCompiler {
 
 impl Builder<PathBuf, CustomArgGoCompiler> {
     /// Generate pure-Go sources and Rust binding mirrors, then compile the
-    /// Go IPC server with CGO disabled.
+    /// Go IPC server.
     pub fn build(self) {
         let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
         let manifest =
@@ -184,9 +184,24 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
         } else {
             PathBuf::from(&self.regen_dst)
         };
+        // `go build .` always runs in `go_dir`; writing gen.go elsewhere would
+        // silently compile a stale file. Fail loudly instead.
+        assert!(
+            regen_dst.parent() == Some(go_dir.as_path()),
+            "rust2go-ipc: regen dst must be inside go_src ({} vs {})",
+            regen_dst.display(),
+            go_dir.display()
+        );
 
         println!("cargo:rerun-if-changed={}", src_rs.display());
-        println!("cargo:rerun-if-changed={}", go_dir.display());
+        if let Ok(entries) = fs::read_dir(&go_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("go") {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                }
+            }
+        }
 
         let schema = parse_schema(&fs::read_to_string(&src_rs).expect("cannot read schema source"));
         let binding_name = self.binding_name.as_deref().unwrap_or("_go_bindings.rs");
@@ -199,10 +214,19 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
         fs::write(&regen_dst, &go_gen).expect("cannot write Go sources");
 
         let ipc_main = go_dir.join("ipc_main.go");
-        fs::write(&ipc_main, generate_go_main()).expect("cannot write Go main");
+        let main_src = generate_go_main();
+        if fs::read_to_string(&ipc_main)
+            .map(|old| old != main_src)
+            .unwrap_or(false)
+        {
+            println!(
+                "cargo:warning=rust2go-ipc: overwriting {} with the generated IPC server",
+                ipc_main.display()
+            );
+        }
+        fs::write(&ipc_main, main_src).expect("cannot write Go main");
 
         // Keep generated Go sources gofmt-clean when the tool is available.
-        // Some CI images put `go` on PATH but not `gofmt`; fall back to GOROOT/bin.
         let gofmt = find_gofmt();
         for path in [&regen_dst, &ipc_main] {
             let result = match &gofmt {
@@ -224,10 +248,8 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
 
         let server_out = out_dir.join("go-ipc-server");
         let mut cmd = Command::new("go");
-        // Do not force CGO_ENABLED=0: real projects may depend on cgo-only
-        // packages (webp, etc.). The Go server is a separate process, so cgo
-        // there does not put the Go runtime into the JVM process. Callers can
-        // still force it off via CustomArgGoCompiler::env.
+        // Real projects may depend on cgo-only packages. The Go server is a
+        // separate process, so cgo here does not affect the Rust host.
         cmd.current_dir(&go_dir)
             .env("GO111MODULE", "on")
             .arg("build")
@@ -243,9 +265,6 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
         let status = cmd.status().expect("go build failed to start");
         assert!(status.success(), "go build failed");
 
-        // Also drop a copy next to the crate artifacts (target/<triple>/<profile>)
-        // so container builds can COPY a stable path instead of the hashed
-        // OUT_DIR used at compile time.
         if let Some(profile_dir) = out_dir
             .parent()
             .and_then(|p| p.parent())
@@ -268,7 +287,6 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
 
 /// Locate gofmt: prefer PATH, then `$GOROOT/bin/gofmt`, then `go env GOROOT`.
 fn find_gofmt() -> Option<PathBuf> {
-    // 1) Plain `gofmt` on PATH.
     if Command::new("gofmt")
         .arg("--help")
         .output()
@@ -277,14 +295,12 @@ fn find_gofmt() -> Option<PathBuf> {
     {
         return Some(PathBuf::from("gofmt"));
     }
-    // 2) GOROOT env var.
     if let Ok(root) = env::var("GOROOT") {
         let p = PathBuf::from(root).join("bin").join("gofmt");
         if p.exists() {
             return Some(p);
         }
     }
-    // 3) Ask `go env GOROOT`.
     if let Ok(out) = Command::new("go").args(["env", "GOROOT"]).output() {
         if out.status.success() {
             let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -299,6 +315,10 @@ fn find_gofmt() -> Option<PathBuf> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Schema model
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 struct FieldDef {
     name: String,
@@ -311,12 +331,20 @@ struct StructDef {
     fields: Vec<FieldDef>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+struct ParamDef {
+    name: String,
+    ty: Type,
+}
+
+#[derive(Clone)]
 struct MethodDef {
     name: String,
-    req: String,
-    resp: Option<String>,
+    trait_name: String,
+    params: Vec<ParamDef>,
+    resp: Option<Type>,
     is_async: bool,
+    go_ptr: bool,
     index: u32,
 }
 
@@ -324,88 +352,7 @@ struct MethodDef {
 struct Schema {
     structs: Vec<StructDef>,
     methods: Vec<MethodDef>,
-}
-
-fn parse_schema(src: &str) -> Schema {
-    let file: syn::File = syn::parse_str(src).expect("cannot parse schema source");
-    let mut schema = Schema::default();
-    for item in &file.items {
-        if let Item::Struct(s) = item {
-            if has_derive(s, "R2G") {
-                schema.structs.push(parse_struct(s));
-            }
-        }
-    }
-    for item in &file.items {
-        if let Item::Trait(t) = item {
-            if t.attrs.iter().any(|a| a.path().is_ident("r2g")) {
-                let mut idx = 0u32;
-                for m in &t.items {
-                    if let syn::TraitItem::Fn(f) = m {
-                        let name = f.sig.ident.to_string();
-                        let is_async = f.sig.asyncness.is_some();
-                        let req = match f.sig.inputs.first() {
-                            Some(syn::FnArg::Typed(p)) => type_ident(&p.ty),
-                            _ => "EmptyRequest".to_string(),
-                        };
-                        let resp = match &f.sig.output {
-                            syn::ReturnType::Type(_, ty) => Some(type_ident(ty)),
-                            _ => None,
-                        };
-                        schema.methods.push(MethodDef {
-                            name,
-                            req,
-                            resp,
-                            is_async,
-                            index: idx,
-                        });
-                        idx += 1;
-                    }
-                }
-            }
-        }
-    }
-    schema
-}
-
-fn has_derive(s: &ItemStruct, name: &str) -> bool {
-    s.attrs.iter().any(|a| {
-        a.path().is_ident("derive")
-            && a.meta
-                .require_list()
-                .map(|l| l.tokens.to_string().split(',').any(|p| p.trim() == name))
-                .unwrap_or(false)
-    })
-}
-
-fn parse_struct(s: &ItemStruct) -> StructDef {
-    let fields = match &s.fields {
-        Fields::Named(n) => n
-            .named
-            .iter()
-            .map(|f| FieldDef {
-                name: f.ident.as_ref().expect("named field").to_string(),
-                ty: f.ty.clone(),
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    StructDef {
-        name: s.ident.to_string(),
-        fields,
-    }
-}
-
-fn type_ident(ty: &Type) -> String {
-    match ty {
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default(),
-        _ => String::new(),
-    }
+    traits: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -416,36 +363,297 @@ enum FieldKind {
     Custom(String),
 }
 
-/// Extract the element type from `Vec<T>` / `Option<T>`.
-fn generic_arg(ty: &Type) -> Option<&Type> {
-    let Type::Path(p) = ty else { return None };
+fn parse_schema(src: &str) -> Schema {
+    let file = syn::parse_file(src).expect("rust2go-ipc: cannot parse schema source");
+    let mut schema = Schema::default();
+
+    for item in &file.items {
+        if let Item::Struct(s) = item {
+            if has_derive(s, "R2G") {
+                schema.structs.push(parse_struct(s));
+            }
+        }
+    }
+    let struct_names: HashSet<String> = schema.structs.iter().map(|s| s.name.clone()).collect();
+
+    // Method IDs are global: multiple #[r2g] traits must not produce duplicate
+    // Go `case` labels.
+    let mut idx = 0u32;
+    let mut stub_names = HashSet::new();
+    for item in &file.items {
+        let Item::Trait(t) = item else { continue };
+        if !has_marker_attr(&t.attrs, "r2g") {
+            continue;
+        }
+        let trait_name = t.ident.to_string();
+        if !schema.traits.contains(&trait_name) {
+            schema.traits.push(trait_name.clone());
+        }
+        for m in &t.items {
+            let TraitItem::Fn(f) = m else { continue };
+            let name = f.sig.ident.to_string();
+            validate_ident(&name, "method");
+            let mut params = Vec::new();
+            for arg in &f.sig.inputs {
+                let FnArg::Typed(p) = arg else {
+                    panic!("rust2go-ipc: receiver is not supported in #[r2g] trait methods");
+                };
+                let pname = match &*p.pat {
+                    Pat::Ident(i) => i.ident.to_string(),
+                    _ => panic!("rust2go-ipc: only simple parameter patterns are supported"),
+                };
+                validate_ident(&pname, "parameter");
+                let (ty, is_reference) = strip_reference(&p.ty);
+                let _ = is_reference;
+                params.push(ParamDef { name: pname, ty });
+            }
+            let resp = match &f.sig.output {
+                ReturnType::Type(_, ty) => Some(strip_reference(ty).0),
+                ReturnType::Default => None,
+            };
+            let go_ptr = !f
+                .attrs
+                .iter()
+                .any(|a| has_last_segment(a.path(), "go_pass_struct"));
+            let stub = format!("C{trait_name}_{name}");
+            assert!(
+                stub_names.insert(stub.clone()),
+                "rust2go-ipc: duplicate stub symbol {stub} (duplicate #[r2g] method)"
+            );
+            schema.methods.push(MethodDef {
+                name,
+                trait_name: trait_name.clone(),
+                params,
+                resp,
+                is_async: f.sig.asyncness.is_some(),
+                go_ptr,
+                index: idx,
+            });
+            idx += 1;
+        }
+    }
+
+    for st in &schema.structs {
+        validate_ident(&st.name, "struct");
+        if st.name == "StringRef" || st.name == "ListRef" {
+            panic!(
+                "rust2go-ipc: struct name {} conflicts with generated aliases",
+                st.name
+            );
+        }
+        for f in &st.fields {
+            validate_ident(&f.name, "field");
+            let kind = classify(&f.ty);
+            check_supported(&kind, &format!("{}.{}", st.name, f.name), &struct_names);
+        }
+    }
+    for m in &schema.methods {
+        for p in &m.params {
+            let kind = classify(&p.ty);
+            check_supported(
+                &kind,
+                &format!("{}.{}", m.trait_name, p.name),
+                &struct_names,
+            );
+        }
+        if let Some(ty) = &m.resp {
+            let kind = classify(ty);
+            check_supported(&kind, &format!("{} return", m.trait_name), &struct_names);
+        }
+    }
+    schema
+}
+
+fn path_last_segment(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
+}
+
+fn has_last_segment(path: &syn::Path, name: &str) -> bool {
+    path_last_segment(path) == name
+}
+
+fn has_marker_attr(attrs: &[syn::Attribute], name: &str) -> bool {
+    attrs.iter().any(|a| has_last_segment(a.path(), name))
+}
+
+fn has_derive(s: &ItemStruct, name: &str) -> bool {
+    s.attrs
+        .iter()
+        .filter(|a| a.path().is_ident("derive"))
+        .any(|a| {
+            if let syn::Meta::List(list) = &a.meta {
+                list.tokens
+                    .to_string()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .any(|s| s.rsplit("::").next() == Some(name))
+            } else {
+                false
+            }
+        })
+}
+
+fn parse_struct(s: &ItemStruct) -> StructDef {
+    let name = s.ident.to_string();
+    let fields = match &s.fields {
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|f| {
+                let fname = f.ident.as_ref().expect("named field").to_string();
+                FieldDef {
+                    name: fname,
+                    ty: strip_reference(&f.ty).0,
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    StructDef { name, fields }
+}
+
+fn strip_reference(ty: &Type) -> (Type, bool) {
+    if let Type::Reference(r) = ty {
+        ((*r.elem).clone(), true)
+    } else {
+        (ty.clone(), false)
+    }
+}
+
+fn type_ident(ty: &Type) -> String {
+    match &strip_reference(ty).0 {
+        Type::Path(p) => path_last_segment(&p.path),
+        _ => String::new(),
+    }
+}
+
+fn generic_arg(ty: &Type) -> Option<Type> {
+    let Type::Path(p) = &strip_reference(ty).0 else {
+        return None;
+    };
     let seg = p.path.segments.last()?;
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         return None;
     };
     args.args.iter().find_map(|a| match a {
-        syn::GenericArgument::Type(t) => Some(t),
+        syn::GenericArgument::Type(t) => Some(t.clone()),
         _ => None,
     })
 }
 
 fn classify(ty: &Type) -> FieldKind {
-    let name = type_ident(ty);
-    match name.as_str() {
+    match type_ident(ty).as_str() {
         "String" => FieldKind::String,
-        "Vec" | "Option" => {
-            let elem = generic_arg(ty)
-                .map(classify)
-                .unwrap_or(FieldKind::Primitive("u8".to_string()));
-            FieldKind::List(Box::new(elem))
-        }
+        "Vec" | "Option" => FieldKind::List(Box::new(
+            generic_arg(ty)
+                .map(|t| classify(&t))
+                .unwrap_or(FieldKind::Primitive("u8".to_string())),
+        )),
         "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
-        | "f32" | "f64" | "usize" | "isize" => FieldKind::Primitive(name),
-        _ => FieldKind::Custom(name),
+        | "f32" | "f64" | "usize" | "isize" | "char" => FieldKind::Primitive(type_ident(ty)),
+        other => FieldKind::Custom(other.to_string()),
     }
 }
 
-fn ref_ty(ty: &Type) -> TokenStream {
+fn check_supported(kind: &FieldKind, ctx: &str, structs: &HashSet<String>) {
+    match kind {
+        FieldKind::Primitive(p) if p == "i128" || p == "u128" => {
+            panic!("rust2go-ipc: {p} field at {ctx} is not wire-compatible")
+        }
+        FieldKind::List(elem) => {
+            if matches!(**elem, FieldKind::List(_)) {
+                panic!("rust2go-ipc: nested list field at {ctx} is not supported");
+            }
+            check_supported(elem, ctx, structs);
+        }
+        FieldKind::Custom(name) => {
+            assert!(
+                structs.contains(name),
+                "rust2go-ipc: unknown struct type {name} at {ctx} (missing #[derive(R2G)]?)"
+            );
+        }
+        _ => {}
+    }
+}
+
+fn validate_ident(name: &str, what: &str) {
+    const RUST: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+    ];
+    const GO: &[&str] = &[
+        "break",
+        "default",
+        "func",
+        "interface",
+        "select",
+        "case",
+        "defer",
+        "go",
+        "map",
+        "struct",
+        "chan",
+        "else",
+        "goto",
+        "package",
+        "switch",
+        "const",
+        "fallthrough",
+        "if",
+        "range",
+        "type",
+        "continue",
+        "for",
+        "import",
+        "return",
+        "var",
+    ];
+    let bare = name.strip_prefix("r#").unwrap_or(name);
+    assert!(
+        !RUST.contains(&bare) && !GO.contains(&bare) && !bare.is_empty(),
+        "rust2go-ipc: {what} name `{name}` is a reserved identifier"
+    );
+}
+
+fn rust_owned_kind_path(kind: &FieldKind) -> TokenStream {
+    match kind {
+        FieldKind::String => quote! { ::std::string::String },
+        FieldKind::List(elem) => {
+            let inner = rust_owned_kind_path(elem);
+            quote! { ::std::vec::Vec<#inner> }
+        }
+        FieldKind::Custom(n) => {
+            let id = format_ident!("{}", n);
+            quote! { super::#id }
+        }
+        FieldKind::Primitive(p) => {
+            let id = format_ident!("{}", p);
+            quote! { #id }
+        }
+    }
+}
+
+/// Owned type as seen from the generated `binding` module. Schema structs live
+/// in the parent module, hence the `super::` prefix (the generated file is
+/// included from a sibling `binding` module).
+fn rust_owned_path(ty: &Type) -> TokenStream {
+    match classify(ty) {
+        FieldKind::List(_) if type_ident(ty) == "Option" => {
+            let elem = generic_arg(ty).expect("Option<T>");
+            let inner = rust_owned_path(&elem);
+            quote! { ::std::option::Option<#inner> }
+        }
+        other => rust_owned_kind_path(&other),
+    }
+}
+
+fn rust_ref_type(ty: &Type) -> TokenStream {
     match classify(ty) {
         FieldKind::String => quote! { ::rust2go::ipc::RawStringRef },
         FieldKind::List(_) => quote! { ::rust2go::ipc::RawListRef },
@@ -460,110 +668,331 @@ fn ref_ty(ty: &Type) -> TokenStream {
     }
 }
 
-fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
-    fn check_supported(kind: &FieldKind) {
-        match kind {
-            FieldKind::Primitive(p) if p == "i128" || p == "u128" => {
-                panic!("rust2go-ipc: i128/u128 fields are not wire-compatible")
-            }
-            FieldKind::List(elem) => check_supported(elem),
-            _ => {}
+// ---------------------------------------------------------------------------
+// Rust binding generation
+// ---------------------------------------------------------------------------
+
+fn flatten_expr(ty: &Type, value: TokenStream) -> TokenStream {
+    let r = format_ident!("__r2g_r");
+    match classify(ty) {
+        FieldKind::String => quote! { enc.string(#value); },
+        FieldKind::Primitive(p) if p == "bool" => quote! { enc.prim(#value); },
+        FieldKind::Primitive(_) => quote! { enc.prim(#value); },
+        FieldKind::Custom(n) => {
+            let f = format_ident!("__r2g_flatten_{}", n);
+            quote! { #f(enc, &#value); }
         }
-    }
-    for st in &schema.structs {
-        for f in &st.fields {
-            check_supported(&classify(&f.ty));
-        }
-    }
-
-    let mut out = TokenStream::new();
-
-    let structs: Vec<TokenStream> = schema
-        .structs
-        .iter()
-        .map(|s| {
-            let name = format_ident!("{}Ref", s.name);
-            let fields = s.fields.iter().map(|f| {
-                let id = format_ident!("{}", f.name);
-                let ty = ref_ty(&f.ty);
-                quote! { pub #id: #ty }
-            });
-            quote! {
-                #[repr(C)]
-                #[derive(Copy, Clone)]
-                #[allow(non_snake_case)]
-                pub struct #name { #(#fields),* }
-            }
-        })
-        .collect();
-
-    let flatten_fns: Vec<TokenStream> = schema.structs.iter().map(gen_rust_flatten).collect();
-    let restore_fns: Vec<TokenStream> = schema.structs.iter().map(gen_rust_restore).collect();
-
-    let mut stubs = Vec::new();
-    let mut trampolines = Vec::new();
-    for m in &schema.methods {
-        let stub_name = format_ident!("CGolangCall_{}", m.name);
-        let req_ref = format_ident!("{}Ref", m.req);
-        let method_id = m.index;
-        let tramp_name = format_ident!("__r2g_trampoline_{}", m.name);
-
-        let stub = match (&m.resp, m.is_async) {
-            (Some(_resp), false) => {
-                let flatten = format_ident!("__r2g_flatten_{}", m.req);
+        FieldKind::List(elem) => match *elem {
+            FieldKind::Primitive(p) => {
+                let t = format_ident!("{}", p);
                 quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc)]
-                    pub unsafe fn #stub_name(
-                        req: #req_ref,
-                        slot: *mut ::std::ffi::c_void,
-                        cb: *mut ::std::ffi::c_void,
-                    ) {
-                        let mut enc = ::rust2go::ipc::Encoder::new();
-                        #flatten(&mut enc, &req);
-                        ::rust2go::ipc::dispatch_sync(
-                            env!("RUST2GO_IPC_SERVER"),
-                            #port,
-                            #method_id,
-                            &enc.take(),
-                            slot as *const (),
-                            cb as *const (),
-                            #tramp_name,
-                        );
+                    {
+                        let #r = #value;
+                        enc.prim_list::<#t>(#r.ptr, #r.len);
                     }
                 }
             }
-            (Some(_resp), true) => {
-                let flatten = format_ident!("__r2g_flatten_{}", m.req);
+            FieldKind::String => quote! {
+                {
+                    let #r = #value;
+                    enc.list_header(#r.len);
+                    if #r.len > 0 {
+                        let items = ::std::slice::from_raw_parts(
+                            #r.ptr as *const ::rust2go::ipc::RawStringRef,
+                            #r.len,
+                        );
+                        for item in items {
+                            enc.string(*item);
+                        }
+                    }
+                }
+            },
+            FieldKind::Custom(n) => {
+                let f = format_ident!("__r2g_flatten_{}", n);
+                let rt = format_ident!("{}Ref", n);
                 quote! {
+                    {
+                        let #r = #value;
+                        enc.list_header(#r.len);
+                        if #r.len > 0 {
+                            let items = ::std::slice::from_raw_parts(
+                                #r.ptr as *const #rt,
+                                #r.len,
+                            );
+                            for item in items {
+                                #f(enc, item);
+                            }
+                        }
+                    }
+                }
+            }
+            FieldKind::List(_) => unreachable!("nested lists rejected by check_supported"),
+        },
+    }
+}
+
+fn min_wire_width(kind: &FieldKind, widths: &std::collections::HashMap<String, usize>) -> usize {
+    match kind {
+        FieldKind::String | FieldKind::List(_) => 8,
+        FieldKind::Primitive(p) => match p.as_str() {
+            "bool" | "i8" | "u8" => 1,
+            "i16" | "u16" => 2,
+            "i32" | "u32" | "f32" | "char" => 4,
+            _ => 8,
+        },
+        FieldKind::Custom(n) => *widths.get(n).unwrap_or(&1),
+    }
+}
+
+fn struct_wire_widths(schema: &Schema) -> std::collections::HashMap<String, usize> {
+    let mut widths: std::collections::HashMap<String, usize> =
+        schema.structs.iter().map(|s| (s.name.clone(), 1)).collect();
+    for _ in 0..8 {
+        let mut changed = false;
+        for st in &schema.structs {
+            let w: usize = st
+                .fields
+                .iter()
+                .map(|f| min_wire_width(&classify(&f.ty), &widths))
+                .sum();
+            if widths.get(&st.name) != Some(&w) {
+                widths.insert(st.name.clone(), w);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    widths
+}
+
+fn restore_expr(ty: &Type, widths: &std::collections::HashMap<String, usize>) -> TokenStream {
+    match classify(ty) {
+        FieldKind::String => quote! { dec.string() },
+        FieldKind::Primitive(_) => quote! { dec.prim() },
+        FieldKind::Custom(n) => {
+            let f = format_ident!("__r2g_restore_{}", n);
+            quote! { #f(dec) }
+        }
+        FieldKind::List(elem) => match *elem {
+            FieldKind::Primitive(p) => {
+                let t = format_ident!("{}", p);
+                quote! { dec.prim_list::<#t>() }
+            }
+            FieldKind::String => quote! {
+                {
+                    let n = dec.list_len_of::<::rust2go::ipc::RawStringRef>();
+                    let mut items = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        items.push(dec.string());
+                    }
+                    dec.ref_list(items)
+                }
+            },
+            FieldKind::Custom(n) => {
+                let f = format_ident!("__r2g_restore_{}", n);
+                let min_wire = widths.get(&n).copied().unwrap_or(1);
+                quote! {
+                    {
+                        let min_wire = #min_wire;
+                        let n = dec.list_len_min(min_wire);
+                        let mut items = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            items.push(#f(dec));
+                        }
+                        dec.ref_list(items)
+                    }
+                }
+            }
+            FieldKind::List(_) => unreachable!("nested lists rejected by check_supported"),
+        },
+    }
+}
+
+fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
+    let widths = struct_wire_widths(schema);
+    let mut out = TokenStream::new();
+    out.extend(quote! {
+        // Generated by rust2go-ipc. Do not edit.
+        const _: () = assert!(
+            ::std::mem::size_of::<usize>() == 8,
+            "rust2go-ipc requires a 64-bit target (wire usize is 8 bytes)"
+        );
+        pub type StringRef = ::rust2go::ipc::RawStringRef;
+        pub type ListRef = ::rust2go::ipc::RawListRef;
+    });
+
+    for st in &schema.structs {
+        let name = format_ident!("{}Ref", st.name);
+        let fields = st.fields.iter().map(|f| {
+            let id = format_ident!("{}", f.name);
+            let ty = rust_ref_type(&f.ty);
+            quote! { pub #id: #ty }
+        });
+        out.extend(quote! {
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            #[allow(non_snake_case)]
+            pub struct #name { #(#fields),* }
+        });
+    }
+
+    for st in &schema.structs {
+        let name = format_ident!("__r2g_flatten_{}", st.name);
+        let st_name = format_ident!("{}Ref", st.name);
+        let fields: Vec<TokenStream> = st
+            .fields
+            .iter()
+            .map(|f| {
+                let id = format_ident!("{}", f.name);
+                flatten_expr(&f.ty, quote! { v.#id })
+            })
+            .collect();
+        out.extend(quote! {
+            #[allow(non_snake_case, clippy::all, unused_variables)]
+            unsafe fn #name(enc: &mut ::rust2go::ipc::Encoder, v: &#st_name) {
+                #(#fields)*
+            }
+        });
+    }
+
+    for st in &schema.structs {
+        let name = format_ident!("__r2g_restore_{}", st.name);
+        let st_name = format_ident!("{}Ref", st.name);
+        let fields: Vec<TokenStream> = st
+            .fields
+            .iter()
+            .map(|f| {
+                let id = format_ident!("{}", f.name);
+                let expr = restore_expr(&f.ty, &widths);
+                quote! { #id: #expr, }
+            })
+            .collect();
+        out.extend(quote! {
+            #[allow(non_snake_case, clippy::all, unused_variables)]
+            unsafe fn #name(dec: &mut ::rust2go::ipc::Decoder<'_>) -> #st_name {
+                #st_name { #(#fields)* }
+            }
+        });
+    }
+
+    for m in &schema.methods {
+        let stub = format_ident!("C{}_{}", m.trait_name, m.name);
+        let tramp = format_ident!("__r2g_trampoline_{}", m.name);
+        let cleanup = format_ident!("__r2g_cleanup_{}", m.name);
+        let method_id = m.index;
+        let param_decls: Vec<TokenStream> = m
+            .params
+            .iter()
+            .map(|p| {
+                let id = format_ident!("{}", p.name);
+                let ty = rust_ref_type(&p.ty);
+                quote! { #id: #ty }
+            })
+            .collect();
+        let flatten_stmts: Vec<TokenStream> = m
+            .params
+            .iter()
+            .map(|p| {
+                let id = format_ident!("{}", p.name);
+                flatten_expr(&p.ty, quote! { #id })
+            })
+            .collect();
+
+        match (&m.resp, m.is_async) {
+            (Some(resp), is_async) => {
+                let resp_ref = rust_ref_type(resp);
+                let resp_owned = rust_owned_path(resp);
+                let restore = restore_expr(resp, &widths);
+                let slot_cb = quote! {
+                    slot: *mut ::std::ffi::c_void,
+                    cb: *mut ::std::ffi::c_void,
+                };
+                let cleanup_arg = if is_async {
+                    quote! { Some(#cleanup) }
+                } else {
+                    quote! { None }
+                };
+                let call = if is_async {
+                    quote! { ::rust2go::ipc::dispatch }
+                } else {
+                    quote! { ::rust2go::ipc::dispatch_sync }
+                };
+                out.extend(quote! {
                     #[allow(non_snake_case, clippy::missing_safety_doc)]
-                    pub unsafe fn #stub_name(
-                        req: #req_ref,
-                        slot: *mut ::std::ffi::c_void,
-                        cb: *mut ::std::ffi::c_void,
-                    ) {
+                    pub unsafe fn #stub(#(#param_decls,)* #slot_cb) {
                         let mut enc = ::rust2go::ipc::Encoder::new();
-                        #flatten(&mut enc, &req);
-                        ::rust2go::ipc::dispatch(
+                        {
+                            let enc = &mut enc;
+                            #(#flatten_stmts)*
+                        }
+                        let handler = ::rust2go::ipc::ResponseHandler::new(#tramp, #cleanup_arg);
+                        #call(
                             env!("RUST2GO_IPC_SERVER"),
                             #port,
                             #method_id,
                             &enc.take(),
                             slot as *const (),
                             cb as *const (),
-                            #tramp_name,
+                            handler,
                         );
                     }
+                });
+
+                let owned_types: Vec<TokenStream> =
+                    m.params.iter().map(|p| rust_owned_path(&p.ty)).collect();
+                let write_back = if is_async {
+                    quote! {
+                        ::rust2go::SlotWriter::<#resp_owned, ((#(#owned_types,)*), Vec<u8>)>
+                            ::from_ptr(slot)
+                            .write(::rust2go::FromRef::from_ref(::std::mem::transmute(&resp)));
+                    }
+                } else {
+                    quote! {
+                        *(slot as *mut Option<#resp_owned>) =
+                            Some(::rust2go::FromRef::from_ref(::std::mem::transmute(&resp)));
+                    }
+                };
+                out.extend(quote! {
+                    #[allow(non_snake_case, clippy::missing_safety_doc)]
+                    unsafe extern "C-unwind" fn #tramp(
+                        payload: *const u8,
+                        len: usize,
+                        slot: *const (),
+                        _cb: *const (),
+                    ) {
+                        let mut dec = ::rust2go::ipc::Decoder::new(
+                            ::std::slice::from_raw_parts(payload, len)
+                        );
+                        let resp: #resp_ref = {
+                            let dec = &mut dec;
+                            #restore
+                        };
+                        #write_back
+                    }
+                });
+                if is_async {
+                    out.extend(quote! {
+                        #[allow(non_snake_case, clippy::missing_safety_doc)]
+                        unsafe fn #cleanup(slot: *const ()) {
+                            drop(::rust2go::SlotWriter::<
+                                #resp_owned,
+                                ((#(#owned_types,)*), Vec<u8>),
+                            >::from_ptr(slot));
+                        }
+                    });
                 }
             }
             (None, _) => {
-                let flatten = format_ident!("__r2g_flatten_{}", m.req);
-                quote! {
+                out.extend(quote! {
                     #[allow(non_snake_case, clippy::missing_safety_doc)]
-                    pub unsafe fn #stub_name(
-                        req: #req_ref,
-                    ) {
+                    pub unsafe fn #stub(#(#param_decls,)*) {
                         let mut enc = ::rust2go::ipc::Encoder::new();
-                        #flatten(&mut enc, &req);
+                        {
+                            let enc = &mut enc;
+                            #(#flatten_stmts)*
+                        }
                         ::rust2go::ipc::dispatch_oneway(
                             env!("RUST2GO_IPC_SERVER"),
                             #port,
@@ -571,161 +1000,19 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                             &enc.take(),
                         );
                     }
-                }
+                });
             }
-        };
-        stubs.push(stub);
-
-        if let Some(resp) = &m.resp {
-            let resp_ref = format_ident!("{}Ref", resp);
-            let restore = format_ident!("__r2g_restore_{}", resp);
-            let tramp = quote! {
-                #[allow(non_snake_case, clippy::missing_safety_doc)]
-                // C-unwind (not C) so a panic from restore can unwind into the
-                // reactor's catch_unwind instead of aborting the process.
-                unsafe extern "C-unwind" fn #tramp_name(
-                    payload: *const u8,
-                    len: usize,
-                    slot: *const (),
-                    cb: *const (),
-                ) {
-                    let mut dec = ::rust2go::ipc::Decoder::new(
-                        ::std::slice::from_raw_parts(payload, len)
-                    );
-                    let resp: #resp_ref = #restore(&mut dec);
-                    type Cb = unsafe extern "C" fn(*const #resp_ref, *const ());
-                    let f: Cb = ::std::mem::transmute(cb);
-                    f(&resp, slot);
-                }
-            };
-            trampolines.push(tramp);
         }
     }
-
-    let header = quote! {
-        // Generated by rust2go-ipc. Do not edit.
-    };
-
-    out.extend(header);
-    out.extend(quote! { #(#structs)* });
-    out.extend(quote! { #(#flatten_fns)* });
-    out.extend(quote! { #(#restore_fns)* });
-    out.extend(quote! { #(#stubs)* });
-    out.extend(quote! { #(#trampolines)* });
     out
 }
 
-fn gen_rust_flatten(s: &StructDef) -> TokenStream {
-    let name = format_ident!("__r2g_flatten_{}", s.name);
-    let ref_name = format_ident!("{}Ref", s.name);
-    let body: Vec<TokenStream> = s
-        .fields
-        .iter()
-        .map(|f| {
-            let id = format_ident!("{}", f.name);
-            match classify(&f.ty) {
-                FieldKind::String => quote! { enc.string(v.#id); },
-                FieldKind::List(elem) => match *elem {
-                    FieldKind::Primitive(p) => {
-                        let ty = format_ident!("{}", p);
-                        quote! { enc.prim_list::<#ty>(v.#id.ptr, v.#id.len); }
-                    }
-                    FieldKind::String => quote! {
-                        enc.list_header(v.#id.len);
-                        if v.#id.len > 0 {
-                            let items = ::std::slice::from_raw_parts(
-                                v.#id.ptr as *const ::rust2go::ipc::RawStringRef,
-                                v.#id.len,
-                            );
-                            for item in items { enc.string(*item); }
-                        }
-                    },
-                    FieldKind::Custom(n) => {
-                        let flatten = format_ident!("__r2g_flatten_{}", n);
-                        let rt = format_ident!("{}Ref", n);
-                        quote! {
-                            enc.list_header(v.#id.len);
-                            if v.#id.len > 0 {
-                                let items = ::std::slice::from_raw_parts(
-                                    v.#id.ptr as *const #rt,
-                                    v.#id.len,
-                                );
-                                for item in items { #flatten(enc, item); }
-                            }
-                        }
-                    }
-                    FieldKind::List(_) => quote! {},
-                },
-                FieldKind::Primitive(_) => quote! { enc.prim(v.#id); },
-                FieldKind::Custom(n) => {
-                    let flatten = format_ident!("__r2g_flatten_{}", n);
-                    quote! { #flatten(enc, &v.#id); }
-                }
-            }
-        })
-        .collect();
-    quote! {
-        #[allow(non_snake_case, clippy::all, unused_variables)]
-        unsafe fn #name(enc: &mut ::rust2go::ipc::Encoder, v: &#ref_name) {
-            #(#body)*
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Go generation
+// ---------------------------------------------------------------------------
 
-fn gen_rust_restore(s: &StructDef) -> TokenStream {
-    let name = format_ident!("__r2g_restore_{}", s.name);
-    let ref_name = format_ident!("{}Ref", s.name);
-    let body: Vec<TokenStream> = s
-        .fields
-        .iter()
-        .map(|f| {
-            let id = format_ident!("{}", f.name);
-            match classify(&f.ty) {
-                FieldKind::String => quote! { #id: dec.string(), },
-                FieldKind::List(elem) => match *elem {
-                    FieldKind::Primitive(p) => {
-                        let ty = format_ident!("{}", p);
-                        quote! { #id: dec.prim_list::<#ty>(), }
-                    }
-                    FieldKind::String => quote! {
-                        #id: {
-                            let n = dec.list_len();
-                            let mut items = Vec::with_capacity(n);
-                            for _ in 0..n { items.push(dec.string()); }
-                            dec.ref_list(items)
-                        },
-                    },
-                    FieldKind::Custom(n) => {
-                        let restore = format_ident!("__r2g_restore_{}", n);
-                        quote! {
-                            #id: {
-                                let n = dec.list_len();
-                                let mut items = Vec::with_capacity(n);
-                                for _ in 0..n { items.push(#restore(dec)); }
-                                dec.ref_list(items)
-                            },
-                        }
-                    }
-                    FieldKind::List(_) => quote! { #id: ::rust2go::ipc::RawListRef { ptr: ::std::ptr::null(), len: 0 }, },
-                },
-                FieldKind::Primitive(_) => quote! { #id: dec.prim(), },
-                FieldKind::Custom(n) => {
-                    let restore = format_ident!("__r2g_restore_{}", n);
-                    quote! { #id: #restore(dec), }
-                }
-            }
-        })
-        .collect();
-    quote! {
-        #[allow(non_snake_case, clippy::all, unused_variables)]
-        unsafe fn #name(dec: &mut ::rust2go::ipc::Decoder<'_>) -> #ref_name {
-            #ref_name { #(#body)* }
-        }
-    }
-}
-
-fn go_prim(p: &str) -> String {
-    let ty = match p {
+fn go_prim(p: &str) -> &'static str {
+    match p {
         "bool" => "bool",
         "i8" => "int8",
         "i16" => "int16",
@@ -739,301 +1026,575 @@ fn go_prim(p: &str) -> String {
         "u128" => "uint64",
         "f32" => "float32",
         "f64" => "float64",
-        // usize/isize are pointer-width in Rust (8 bytes on 64-bit targets).
-        // Keep them 8 bytes on the wire and use fixed-width Go types so the
-        // generated Ref fields match the decoder's return type exactly.
         "usize" => "uint64",
         "isize" => "int64",
+        "char" => "uint32",
         _ => "uint64",
-    };
-    ty.to_string()
+    }
 }
 
-fn go_type(ty: &Type) -> String {
+fn go_owned_prim(p: &str) -> &'static str {
+    match p {
+        "usize" => "uint",
+        "isize" => "int",
+        "char" => "rune",
+        _ => go_prim(p),
+    }
+}
+
+fn go_type(ty: &Type, owned: bool) -> String {
     match classify(ty) {
         FieldKind::String => "string".to_string(),
-        FieldKind::List(elem) => match *elem {
-            FieldKind::Primitive(p) => format!("[]{}", go_prim(&p)),
-            FieldKind::String => "[]string".to_string(),
-            FieldKind::Custom(n) => format!("[]{}", n),
-            FieldKind::List(_) => "[]byte".to_string(),
-        },
-        FieldKind::Primitive(p) => go_prim(&p),
+        FieldKind::List(elem) => format!("[]{}", go_type_inner(&elem, owned)),
+        FieldKind::Primitive(p) => {
+            if owned {
+                go_owned_prim(&p).to_string()
+            } else {
+                go_prim(&p).to_string()
+            }
+        }
         FieldKind::Custom(n) => n,
     }
 }
 
+fn go_type_inner(kind: &FieldKind, owned: bool) -> String {
+    match kind {
+        FieldKind::String => "string".to_string(),
+        FieldKind::List(elem) => format!("[]{}", go_type_inner(elem, owned)),
+        FieldKind::Primitive(p) => {
+            if owned {
+                go_owned_prim(p).to_string()
+            } else {
+                go_prim(p).to_string()
+            }
+        }
+        FieldKind::Custom(n) => n.clone(),
+    }
+}
+
+fn go_ref_type(ty: &Type) -> String {
+    match classify(ty) {
+        FieldKind::String => "StringRef".to_string(),
+        FieldKind::List(_) => "ListRef".to_string(),
+        FieldKind::Primitive(p) => go_prim(&p).to_string(),
+        FieldKind::Custom(n) => format!("{n}Ref"),
+    }
+}
+
+/// Stable Go helper name for a non-struct top-level type.
+fn top_name(ty: &Type) -> String {
+    match classify(ty) {
+        FieldKind::String => "String".to_string(),
+        FieldKind::Primitive(p) => p,
+        FieldKind::List(elem) => format!("List_{}", top_name_kind(&elem)),
+        FieldKind::Custom(n) => n,
+    }
+}
+
+fn top_name_kind(kind: &FieldKind) -> String {
+    match kind {
+        FieldKind::String => "String".to_string(),
+        FieldKind::Primitive(p) => p.clone(),
+        FieldKind::List(elem) => format!("List_{}", top_name_kind(elem)),
+        FieldKind::Custom(n) => n.clone(),
+    }
+}
+
+fn go_restore_expr(
+    ty: &Type,
+    d: &str,
+    _widths: &std::collections::HashMap<String, usize>,
+) -> String {
+    match classify(ty) {
+        FieldKind::String => format!("{d}.str()"),
+        FieldKind::Primitive(p) => match p.as_str() {
+            "bool" => format!("{d}.boolean()"),
+            "i8" => format!("{d}.i8()"),
+            "i16" => format!("{d}.i16()"),
+            "i32" => format!("{d}.i32()"),
+            "i64" => format!("{d}.i64()"),
+            "u8" => format!("{d}.u8()"),
+            "u16" => format!("{d}.u16()"),
+            "u32" | "char" => format!("{d}.u32()"),
+            "u64" | "usize" => format!("{d}.u64()"),
+            "isize" => format!("{d}.i64()"),
+            "f32" => format!("{d}.f32()"),
+            "f64" => format!("{d}.f64()"),
+            _ => panic!("rust2go-ipc: unsupported go primitive {p}"),
+        },
+        FieldKind::List(elem) => match *elem {
+            FieldKind::Primitive(_) => format!("primList[{}]({d})", go_type_inner(&elem, true)),
+            FieldKind::String => format!("stringList({d})"),
+            FieldKind::Custom(n) => format!("{n}ListRef({d})"),
+            FieldKind::List(_) => unreachable!(),
+        },
+        FieldKind::Custom(n) => format!("restore{n}Ref({d})"),
+    }
+}
+
+fn go_owned_expr(ty: &Type, var: &str) -> String {
+    match classify(ty) {
+        FieldKind::Custom(_) => var.to_string(),
+        FieldKind::String => format!("newString({var})"),
+        FieldKind::List(elem) => match *elem {
+            FieldKind::Primitive(_) => {
+                format!("newPrimList[{}]({var})", go_type_inner(&elem, true))
+            }
+            FieldKind::String => format!("newStringList({var})"),
+            FieldKind::Custom(n) => format!("new{n}List({var})"),
+            FieldKind::List(_) => unreachable!(),
+        },
+        FieldKind::Primitive(p) if p == "usize" || p == "isize" || p == "char" => {
+            format!("{}({var})", go_owned_prim(&p))
+        }
+        FieldKind::Primitive(_) => var.to_string(),
+    }
+}
+
 fn generate_go_sources(schema: &Schema) -> String {
+    let widths = struct_wire_widths(schema);
     let mut s = String::new();
     s.push_str("// Code generated by rust2go-ipc. DO NOT EDIT.\npackage main\n\n");
-    s.push_str(
-        "import (\n\t\"encoding/binary\"\n\t\"fmt\"\n\t\"math\"\n\t\"os\"\n\t\"unsafe\"\n)\n\n",
-    );
+    s.push_str("import (\n\t\"encoding/binary\"\n\t\"fmt\"\n\t\"math\"\n\t\"os\"\n\t\"strings\"\n\t\"unsafe\"\n)\n\n");
     s.push_str("type StringRef struct {\n\tptr unsafe.Pointer\n\tlen uint64\n}\n\n");
     s.push_str("type ListRef struct {\n\tptr unsafe.Pointer\n\tlen uint64\n}\n\n");
 
-    // Owned business structs (same shape as rust2go-cli output).
+    // Fixed helpers. `decodePrims` always copies into an aligned, owned slice,
+    // avoiding both overflow in n*sz and unsafe misaligned pointer casts.
+    s.push_str(r#"
+func newString(r StringRef) string {
+	if r.len == 0 {
+		return ""
+	}
+	return strings.Clone(unsafe.String((*byte)(r.ptr), int(r.len)))
+}
+
+func decodePrims[T any](b []byte, n int) []T {
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	if n <= 0 {
+		return nil
+	}
+	if n > len(b)/sz {
+		panic("rust2go-ipc: primitive list out of bounds")
+	}
+	out := make([]T, n)
+	switch any(zero).(type) {
+	case bool:
+		for i := 0; i < n; i++ {
+			v := b[i]
+			if v > 1 {
+				panic("rust2go-ipc: invalid bool byte in list")
+			}
+			out[i] = any(v != 0).(T)
+		}
+	case int8:
+		for i := 0; i < n; i++ { out[i] = any(int8(b[i])).(T) }
+	case uint8:
+		for i := 0; i < n; i++ { out[i] = any(b[i]).(T) }
+	case int16:
+		for i := 0; i < n; i++ { out[i] = any(int16(binary.LittleEndian.Uint16(b[i*2:]))).(T) }
+	case uint16:
+		for i := 0; i < n; i++ { out[i] = any(binary.LittleEndian.Uint16(b[i*2:])).(T) }
+	case int32:
+		for i := 0; i < n; i++ { out[i] = any(int32(binary.LittleEndian.Uint32(b[i*4:]))).(T) }
+	case uint32:
+		for i := 0; i < n; i++ { out[i] = any(binary.LittleEndian.Uint32(b[i*4:])).(T) }
+	case int64:
+		for i := 0; i < n; i++ { out[i] = any(int64(binary.LittleEndian.Uint64(b[i*8:]))).(T) }
+	case uint64:
+		for i := 0; i < n; i++ { out[i] = any(binary.LittleEndian.Uint64(b[i*8:])).(T) }
+	case uint:
+		for i := 0; i < n; i++ { out[i] = any(uint(binary.LittleEndian.Uint64(b[i*8:]))).(T) }
+	case int:
+		for i := 0; i < n; i++ { out[i] = any(int(binary.LittleEndian.Uint64(b[i*8:]))).(T) }
+	case float32:
+		for i := 0; i < n; i++ { out[i] = any(math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))).(T) }
+	case float64:
+		for i := 0; i < n; i++ { out[i] = any(math.Float64frombits(binary.LittleEndian.Uint64(b[i*8:]))).(T) }
+	default:
+		panic("rust2go-ipc: unsupported primitive list element")
+	}
+	return out
+}
+
+func newPrimList[T any](r ListRef) []T {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	src := unsafe.Slice((*byte)(r.ptr), n*sz)
+	return decodePrims[T](src, n)
+}
+
+func newStringList(r ListRef) []string {
+	n := int(r.len)
+	if n <= 0 {
+		return nil
+	}
+	src := unsafe.Slice((*StringRef)(r.ptr), n)
+	out := make([]string, n)
+	for i := range out {
+		out[i] = newString(src[i])
+	}
+	return out
+}
+
+type enc struct{ b []byte }
+
+func (e *enc) put(v any) {
+	switch x := v.(type) {
+	case bool:
+		if x { e.b = append(e.b, 1) } else { e.b = append(e.b, 0) }
+	case int8:
+		e.b = append(e.b, byte(x))
+	case uint8:
+		e.b = append(e.b, x)
+	case int16:
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(x))
+		e.b = append(e.b, b[:]...)
+	case uint16:
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], x)
+		e.b = append(e.b, b[:]...)
+	case int32:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(x))
+		e.b = append(e.b, b[:]...)
+	case uint32:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], x)
+		e.b = append(e.b, b[:]...)
+	case int64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case uint64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], x)
+		e.b = append(e.b, b[:]...)
+	case uint:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case int:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		e.b = append(e.b, b[:]...)
+	case float32:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(x))
+		e.b = append(e.b, b[:]...)
+	case float64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], math.Float64bits(x))
+		e.b = append(e.b, b[:]...)
+	case string:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(len(x)))
+		e.b = append(e.b, b[:]...)
+		e.b = append(e.b, x...)
+	default:
+		panic("rust2go-ipc: unsupported wire type")
+	}
+}
+
+type dec struct {
+	b   []byte
+	p   int
+	err bool
+}
+
+func (d *dec) take(n int) []byte {
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: decode out of bounds")
+	}
+	v := d.b[d.p : d.p+n]
+	d.p += n
+	return v
+}
+func (d *dec) u64() uint64 { return binary.LittleEndian.Uint64(d.take(8)) }
+func (d *dec) i64() int64  { return int64(d.u64()) }
+func (d *dec) u32() uint32 { return binary.LittleEndian.Uint32(d.take(4)) }
+func (d *dec) i32() int32  { return int32(d.u32()) }
+func (d *dec) u16() uint16 { return binary.LittleEndian.Uint16(d.take(2)) }
+func (d *dec) i16() int16  { return int16(d.u16()) }
+func (d *dec) u8() uint8   { return d.take(1)[0] }
+func (d *dec) i8() int8    { return int8(d.u8()) }
+func (d *dec) boolean() bool {
+	b := d.take(1)[0]
+	if b > 1 {
+		d.err = true
+		panic("rust2go-ipc: invalid bool byte")
+	}
+	return b == 1
+}
+func (d *dec) f32() float32 { return math.Float32frombits(d.u32()) }
+func (d *dec) f64() float64 { return math.Float64frombits(d.u64()) }
+func (d *dec) str() StringRef {
+	n := int(d.u64())
+	if n < 0 || n > len(d.b)-d.p {
+		d.err = true
+		panic("rust2go-ipc: string len out of bounds")
+	}
+	if n == 0 {
+		return StringRef{}
+	}
+	p := unsafe.Pointer(&d.b[d.p])
+	d.p += n
+	return StringRef{ptr: p, len: uint64(n)}
+}
+func primList[T any](d *dec) ListRef {
+	n := int(d.u64())
+	if n < 0 {
+		d.err = true
+		panic("rust2go-ipc: negative list len")
+	}
+	if n == 0 {
+		return ListRef{}
+	}
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	b := d.take(n * sz)
+	arr := decodePrims[T](b, n)
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
+}
+func stringList(d *dec) ListRef {
+	n := int(d.u64())
+	if n < 0 || n > (len(d.b)-d.p)/int(unsafe.Sizeof(StringRef{})) {
+		d.err = true
+		panic("rust2go-ipc: string list len out of bounds")
+	}
+	if n == 0 {
+		return ListRef{}
+	}
+	arr := make([]StringRef, n)
+	for i := range arr {
+		arr[i] = d.str()
+	}
+	return ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}
+}
+"#);
+
+    // Owned and Ref struct declarations.
     for st in &schema.structs {
         s.push_str(&format!("type {} struct {{\n", st.name));
         for f in &st.fields {
-            s.push_str(&format!("\t{} {}\n", f.name, go_type(&f.ty)));
+            s.push_str(&format!("\t{} {}\n", f.name, go_type(&f.ty, true)));
         }
         s.push_str("}\n\n");
-    }
-
-    // Ref structs mirroring Rust #[repr(C)] layout.
-    for st in &schema.structs {
         s.push_str(&format!("type {}Ref struct {{\n", st.name));
         for f in &st.fields {
-            let ty = match classify(&f.ty) {
-                FieldKind::String => "StringRef".to_string(),
-                FieldKind::List(_) => "ListRef".to_string(),
-                FieldKind::Primitive(ref p) => go_prim(p),
-                FieldKind::Custom(ref n) => format!("{}Ref", n),
-            };
-            s.push_str(&format!("\t{} {}\n", f.name, ty));
+            s.push_str(&format!("\t{} {}\n", f.name, go_ref_type(&f.ty)));
         }
         s.push_str("}\n\n");
     }
 
-    // Generic Ref -> owned helpers.
-    s.push_str("func newString(r StringRef) string {\n\tif r.len == 0 { return \"\" }\n\treturn unsafe.String((*byte)(r.ptr), int(r.len))\n}\n\n");
-    s.push_str("func newPrimList[T any](r ListRef) []T {\n\tif r.len == 0 { return nil }\n\treturn append([]T(nil), unsafe.Slice((*T)(r.ptr), int(r.len))...)\n}\n\n");
-    s.push_str("func newStringList(r ListRef) []string {\n\tif r.len == 0 { return nil }\n\tsrc := unsafe.Slice((*StringRef)(r.ptr), int(r.len))\n\tout := make([]string, int(r.len))\n\tfor i := range out { out[i] = newString(src[i]) }\n\treturn out\n}\n\n");
-
-    // new<Type>: Ref -> owned, plus new<Type>List for complex elements.
+    // new* / *ListRef / flatten / restore per struct.
     for st in &schema.structs {
         s.push_str(&format!(
-            "func new{}(r {}Ref) {} {{\n\treturn {}{{\n",
+            "func new{}(r {}Ref) {} {{\n\tvar v {}\n",
             st.name, st.name, st.name, st.name
         ));
         for f in &st.fields {
-            let expr = match classify(&f.ty) {
-                FieldKind::String => format!("newString(r.{})", f.name),
-                FieldKind::List(ref elem) => match **elem {
-                    FieldKind::Primitive(ref p) => {
-                        format!("newPrimList[{}](r.{})", go_prim(p), f.name)
-                    }
-                    FieldKind::String => format!("newStringList(r.{})", f.name),
-                    FieldKind::Custom(ref n) => format!("new{}List(r.{})", n, f.name),
-                    FieldKind::List(_) => "nil".to_string(),
-                },
-                FieldKind::Primitive(_) => format!("r.{}", f.name),
-                FieldKind::Custom(ref n) => format!("new{}(r.{})", n, f.name),
-            };
-            s.push_str(&format!("\t\t{}: {},\n", f.name, expr));
+            s.push_str(&format!(
+                "\tv.{} = {}\n",
+                f.name,
+                go_owned_expr(&f.ty, &format!("r.{}", f.name))
+            ));
         }
-        s.push_str("\t}\n}\n\n");
+        s.push_str("\treturn v\n}\n\n");
 
         s.push_str(&format!(
             "func new{}List(r ListRef) []{} {{\n",
             st.name, st.name
         ));
-        s.push_str("\tif r.len == 0 { return nil }\n");
+        s.push_str("\tn := int(r.len)\n\tif n <= 0 { return nil }\n");
         s.push_str(&format!(
-            "\tsrc := unsafe.Slice((*{}Ref)(r.ptr), int(r.len))\n",
-            st.name
+            "\tsrc := unsafe.Slice((*{}Ref)(r.ptr), n)\n\tout := make([]{}, n)\n\tfor i := range out {{ out[i] = new{}(src[i]) }}\n\treturn out\n}}\n\n",
+            st.name, st.name, st.name
         ));
-        s.push_str(&format!("\tout := make([]{}, int(r.len))\n", st.name));
-        s.push_str(&format!(
-            "\tfor i := range out {{ out[i] = new{}(src[i]) }}\n",
-            st.name
-        ));
-        s.push_str("\treturn out\n}\n\n");
-    }
 
-    // Flat codec on Go side. Primitive widths must match Rust memory layout.
-    s.push_str("type enc struct{ b []byte }\n");
-    s.push_str("func (e *enc) put(v any) {\n\tswitch x := v.(type) {\n");
-    s.push_str("\tcase bool:\n\t\tif x { e.b = append(e.b, 1) } else { e.b = append(e.b, 0) }\n");
-    s.push_str("\tcase int8:\n\t\te.b = append(e.b, byte(x))\n");
-    s.push_str("\tcase uint8:\n\t\te.b = append(e.b, x)\n");
-    s.push_str("\tcase int16:\n\t\tvar t [2]byte; binary.LittleEndian.PutUint16(t[:], uint16(x)); e.b = append(e.b, t[:]...)\n");
-    s.push_str("\tcase uint16:\n\t\tvar t [2]byte; binary.LittleEndian.PutUint16(t[:], x); e.b = append(e.b, t[:]...)\n");
-    s.push_str("\tcase int32:\n\t\tvar t [4]byte; binary.LittleEndian.PutUint32(t[:], uint32(x)); e.b = append(e.b, t[:]...)\n");
-    s.push_str("\tcase uint32:\n\t\tvar t [4]byte; binary.LittleEndian.PutUint32(t[:], x); e.b = append(e.b, t[:]...)\n");
-    s.push_str("\tcase int64:\n\t\tvar t [8]byte; binary.LittleEndian.PutUint64(t[:], uint64(x)); e.b = append(e.b, t[:]...)\n");
-    s.push_str("\tcase uint64:\n\t\tvar t [8]byte; binary.LittleEndian.PutUint64(t[:], x); e.b = append(e.b, t[:]...)\n");
-    s.push_str("\tcase int:\n\t\te.put(int64(x))\n");
-    s.push_str("\tcase uint:\n\t\te.put(uint64(x))\n");
-    s.push_str("\tcase float32:\n\t\te.put(math.Float32bits(x))\n");
-    s.push_str("\tcase float64:\n\t\te.put(math.Float64bits(x))\n");
-    s.push_str("\tcase string:\n\t\te.put(uint64(len(x))); e.b = append(e.b, x...)\n");
-    s.push_str("\tdefault:\n\t\tpanic(\"rust2go-ipc: unsupported wire type\")\n");
-    s.push_str("\t}\n}\n\n");
-
-    s.push_str("type dec struct{ b []byte; p int; err bool }\n");
-    // Bounds-checked take: a corrupt length panics with a Go slice-bounds error,
-    // which dispatch's recover converts to status=1. Critically, we never build
-    // an unsafe.Pointer past the payload, so no SIGSEGV can escape recover.
-    s.push_str("func (d *dec) take(n int) []byte {\n\tif n < 0 || n > len(d.b)-d.p {\n\t\td.err = true\n\t\tpanic(\"rust2go-ipc: decode out of bounds\")\n\t}\n\tv := d.b[d.p : d.p+n]\n\td.p += n\n\treturn v\n}\n");
-    s.push_str("func (d *dec) u64() uint64 { return binary.LittleEndian.Uint64(d.take(8)) }\n");
-    s.push_str("func (d *dec) i64() int64 { return int64(d.u64()) }\n");
-    s.push_str("func (d *dec) u32() uint32 { return binary.LittleEndian.Uint32(d.take(4)) }\n");
-    s.push_str("func (d *dec) i32() int32 { return int32(d.u32()) }\n");
-    s.push_str("func (d *dec) u16() uint16 { return binary.LittleEndian.Uint16(d.take(2)) }\n");
-    s.push_str("func (d *dec) i16() int16 { return int16(d.u16()) }\n");
-    s.push_str("func (d *dec) u8() uint8 { return d.take(1)[0] }\n");
-    s.push_str("func (d *dec) i8() int8 { return int8(d.u8()) }\n");
-    // Strict bool: non-0/1 is a corrupt frame, not a lenient true.
-    s.push_str("func (d *dec) boolean() bool {\n\tb := d.take(1)[0]\n\tif b > 1 { d.err = true; panic(\"rust2go-ipc: invalid bool byte\") }\n\treturn b == 1\n}\n");
-    s.push_str("func (d *dec) f32() float32 { return math.Float32frombits(d.u32()) }\n");
-    s.push_str("func (d *dec) f64() float64 { return math.Float64frombits(d.u64()) }\n");
-    // str/primList take() the exact byte span first, so the pointer always
-    // references validated bytes inside the payload.
-    s.push_str("func (d *dec) str() StringRef {\n\tn := int(d.u64())\n\tif n < 0 || n > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: string len out of bounds\") }\n\tif n == 0 { return StringRef{} }\n\tb := d.take(n)\n\treturn StringRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}\n}\n");
-    s.push_str("func primList[T any](d *dec) ListRef {\n\tn := int(d.u64())\n\tif n < 0 { d.err = true; panic(\"rust2go-ipc: negative list len\") }\n\tif n == 0 { return ListRef{} }\n\tvar zero T\n\tsz := int(unsafe.Sizeof(zero))\n\tnbytes := n * sz\n\tif nbytes < 0 || nbytes > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: list len out of bounds\") }\n\tb := d.take(nbytes)\n\treturn ListRef{ptr: unsafe.Pointer(&b[0]), len: uint64(n)}\n}\n");
-    s.push_str("func stringList(d *dec) ListRef {\n\tn := int(d.u64())\n\tif n < 0 || n > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: string list len out of bounds\") }\n\tif n == 0 { return ListRef{} }\n\tarr := make([]StringRef, n)\n\tfor i := range arr { arr[i] = d.str() }\n\treturn ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(n)}\n}\n\n");
-
-    // flatten_<T> (owned -> bytes) and restore_<T>Ref (bytes -> Ref).
-    for st in &schema.structs {
         s.push_str(&format!(
             "func flatten{}(v *{}, e *enc) {{\n",
             st.name, st.name
         ));
         for f in &st.fields {
-            match classify(&f.ty) {
-                FieldKind::String => s.push_str(&format!("\te.put(v.{})\n", f.name)),
-                FieldKind::List(ref elem) => match **elem {
-                    FieldKind::Primitive(_) => {
-                        s.push_str(&format!("\te.put(uint64(len(v.{})))\n", f.name));
-                        s.push_str(&format!(
-                            "\tfor _, item := range v.{} {{ e.put(item) }}\n",
-                            f.name
-                        ));
-                    }
-                    FieldKind::String => {
-                        s.push_str(&format!("\te.put(uint64(len(v.{})))\n", f.name));
-                        s.push_str(&format!(
-                            "\tfor _, item := range v.{} {{ e.put(item) }}\n",
-                            f.name
-                        ));
-                    }
-                    FieldKind::Custom(ref n) => {
-                        s.push_str(&format!("\te.put(uint64(len(v.{})))\n", f.name));
-                        s.push_str(&format!(
-                            "\tfor i := range v.{} {{ flatten{}(&v.{}[i], e) }}\n",
-                            f.name, n, f.name
-                        ));
-                    }
-                    FieldKind::List(_) => s.push_str("\te.put(uint64(0))\n"),
-                },
-                FieldKind::Primitive(_) => s.push_str(&format!("\te.put(v.{})\n", f.name)),
-                FieldKind::Custom(ref n) => {
-                    s.push_str(&format!("\tflatten{}(&v.{}, e)\n", n, f.name));
-                }
-            }
+            s.push_str(&format!(
+                "\t{}\n",
+                go_flatten_stmt(&f.ty, &format!("v.{}", f.name))
+            ));
         }
         s.push_str("}\n\n");
 
         s.push_str(&format!(
-            "func restore{}Ref(d *dec) {}Ref {{\n\treturn {}Ref{{\n",
+            "func restore{}Ref(d *dec) {}Ref {{\n\tvar r {}Ref\n",
             st.name, st.name, st.name
         ));
         for f in &st.fields {
-            match classify(&f.ty) {
-                FieldKind::String => {
-                    s.push_str(&format!("\t\t{}: d.str(),\n", f.name));
-                }
-                FieldKind::List(ref elem) => match **elem {
-                    FieldKind::Primitive(ref p) => {
-                        s.push_str(&format!("\t\t{}: primList[{}](d),\n", f.name, go_prim(p)));
-                    }
-                    FieldKind::String => {
-                        s.push_str(&format!("\t\t{}: stringList(d),\n", f.name));
-                    }
-                    FieldKind::Custom(ref n) => {
-                        s.push_str(&format!("\t\t{}: func() ListRef {{\n", f.name));
-                        s.push_str("\t\t\tcnt := int(d.u64())\n");
-                        s.push_str("\t\t\tif cnt < 0 || cnt > len(d.b)-d.p { d.err = true; panic(\"rust2go-ipc: struct list len out of bounds\") }\n");
-                        s.push_str("\t\t\tif cnt == 0 { return ListRef{} }\n");
-                        s.push_str(&format!("\t\t\tarr := make([]{}Ref, cnt)\n", n));
-                        s.push_str(&format!(
-                            "\t\t\tfor i := range arr {{ arr[i] = restore{}Ref(d) }}\n",
-                            n
-                        ));
-                        s.push_str("\t\t\treturn ListRef{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}\n");
-                        s.push_str("\t\t}(),\n");
-                    }
-                    FieldKind::List(_) => {
-                        s.push_str(&format!("\t\t{}: ListRef{{}},\n", f.name));
-                    }
-                },
-                FieldKind::Primitive(ref p) => {
-                    let rd = match p.as_str() {
-                        "bool" => "d.boolean()",
-                        "i8" => "d.i8()",
-                        "u8" => "d.u8()",
-                        "i16" => "d.i16()",
-                        "u16" => "d.u16()",
-                        "i32" | "i128" => "d.i32()",
-                        "u32" | "u128" => "d.u32()",
-                        "isize" => "d.i64()",
-                        "usize" => "d.u64()",
-                        "i64" => "d.i64()",
-                        "f32" => "d.f32()",
-                        "f64" => "d.f64()",
-                        _ => "d.u64()",
-                    };
-                    s.push_str(&format!("\t\t{}: {},\n", f.name, rd));
-                }
-                FieldKind::Custom(ref n) => {
-                    s.push_str(&format!("\t\t{}: restore{}Ref(d),\n", f.name, n));
+            s.push_str(&format!(
+                "\tr.{} = {}\n",
+                f.name,
+                go_restore_expr(&f.ty, "d", &widths)
+            ));
+        }
+        s.push_str("\tif d.err { panic(\"rust2go-ipc: invalid payload\") }\n\treturn r\n}\n\n");
+
+        let size = widths.get(&st.name).copied().unwrap_or(1).to_string();
+        s.push_str(&format!(
+            "func {}ListRef(d *dec) ListRef {{\n\tcnt := int(d.u64())\n\tsize := {}\n\tif size == 0 {{ size = 1 }}\n\tif cnt < 0 || cnt > (len(d.b)-d.p)/size {{\n\t\td.err = true\n\t\tpanic(\"rust2go-ipc: struct list len out of bounds\")\n\t}}\n\tif cnt == 0 {{ return ListRef{{}} }}\n\tarr := make([]{}Ref, cnt)\n\tfor i := range arr {{ arr[i] = restore{}Ref(d) }}\n\treturn ListRef{{ptr: unsafe.Pointer(&arr[0]), len: uint64(cnt)}}\n}}\n\n",
+            st.name, size, st.name, st.name
+        ));
+    }
+
+    // Top-level helpers for non-struct method parameters / returns.
+    let mut tops: Vec<(String, Type)> = Vec::new();
+    for m in &schema.methods {
+        for p in &m.params {
+            if !matches!(classify(&p.ty), FieldKind::Custom(_)) {
+                let n = top_name(&p.ty);
+                if !tops.iter().any(|(existing, _)| existing == &n) {
+                    tops.push((n, p.ty.clone()));
                 }
             }
         }
-        s.push_str("\t}\n}\n\n");
+        if let Some(ty) = &m.resp {
+            if !matches!(classify(ty), FieldKind::Custom(_)) {
+                let n = top_name(ty);
+                if !tops.iter().any(|(existing, _)| existing == &n) {
+                    tops.push((n, ty.clone()));
+                }
+            }
+        }
+    }
+    for (n, ty) in &tops {
+        let ref_ty = go_ref_type(ty);
+        let owned_ty = go_type(ty, true);
+        s.push_str(&format!(
+            "func restoreTop{n}(d *dec) {ref_ty} {{ return {} }}\n",
+            go_restore_expr(ty, "d", &widths)
+        ));
+        s.push_str(&format!(
+            "func newTop{n}(r {ref_ty}) {owned_ty} {{ return {} }}\n\n",
+            go_owned_expr(ty, "r")
+        ));
     }
 
-    // Interface + package-level impl variable. Business code (impl.go) assigns
-    // `GolangCallImpl = &Golang{}` in its init(); upstream rust2go emits this
-    // declaration in gen.go, so we must too or `go build` fails with
-    // "undefined: GolangCallImpl".
-    s.push_str("var GolangCallImpl GolangCall\n\n");
-    s.push_str("type GolangCall interface {\n");
-    for m in &schema.methods {
-        let req = go_ptr(&m.req);
-        let ret = m
-            .resp
-            .as_ref()
-            .map(|r| format!(" {}", r))
-            .unwrap_or_default();
-        s.push_str(&format!("\t{}(req {}){}\n", m.name, req, ret));
+    // One Go interface per #[r2g] trait, mirroring upstream naming.
+    for trait_name in &schema.traits {
+        s.push_str(&format!("var {trait_name}Impl {trait_name}\n"));
+        s.push_str(&format!("type {trait_name} interface {{\n"));
+        for m in schema
+            .methods
+            .iter()
+            .filter(|m| &m.trait_name == trait_name)
+        {
+            let params: Vec<String> = m
+                .params
+                .iter()
+                .map(|p| {
+                    let star = if m.go_ptr { "*" } else { "" };
+                    format!("{} {}{}", p.name, star, go_type(&p.ty, true))
+                })
+                .collect();
+            let ret = m
+                .resp
+                .as_ref()
+                .map(|t| format!(" {}", go_type(t, true)))
+                .unwrap_or_default();
+            s.push_str(&format!("\t{}({}){}\n", m.name, params.join(", "), ret));
+        }
+        s.push_str("}\n\n");
     }
-    s.push_str("}\n\n");
 
+    // dispatch with panic containment.
     s.push_str("func dispatch(methodID uint32, payload []byte) (out []byte, ok bool) {\n");
-    s.push_str("\tdefer func() {\n");
-    s.push_str("\t\tif r := recover(); r != nil {\n");
+    s.push_str("\tdefer func() {\n\t\tif r := recover(); r != nil {\n");
     s.push_str("\t\t\tfmt.Fprintf(os.Stderr, \"rust2go-ipc: Go handler panic: %v\\n\", r)\n");
-    s.push_str("\t\t\tout, ok = nil, false\n");
-    s.push_str("\t\t}\n");
-    s.push_str("\t}()\n");
-    s.push_str("\td := &dec{b: payload}\n");
-    s.push_str("\tswitch methodID {\n");
+    s.push_str("\t\t\tout, ok = nil, false\n\t\t}\n\t}()\n");
+    s.push_str("\td := &dec{b: payload}\n\tswitch methodID {\n");
     for m in &schema.methods {
-        if m.resp.is_none() {
-            let new_fn = format!("new{}", m.req);
-            s.push_str(&format!(
-                "\tcase {}:\n\t\tr := {}(restore{}Ref(d))\n\t\tGolangCallImpl.{}(&r)\n\t\treturn nil, true\n",
-                m.index, new_fn, m.req, m.name
+        let mut decls = String::new();
+        let mut args = String::new();
+        for (i, p) in m.params.iter().enumerate() {
+            let var = format!("_a{i}");
+            let ref_var = format!("_r{i}");
+            let ref_ty = go_ref_type(&p.ty);
+            let restore = if matches!(classify(&p.ty), FieldKind::Custom(_)) {
+                format!("restore{}Ref(d)", ref_ty.trim_end_matches("Ref"))
+            } else {
+                format!("restoreTop{}(d)", top_name(&p.ty))
+            };
+            let owned = if matches!(classify(&p.ty), FieldKind::Custom(_)) {
+                format!("new{}({ref_var})", ref_ty.trim_end_matches("Ref"))
+            } else {
+                format!("newTop{}({ref_var})", top_name(&p.ty))
+            };
+            decls.push_str(&format!(
+                "\t\t{ref_var} := {restore}\n\t\t{var} := {owned}\n"
             ));
-        } else {
-            let resp = m.resp.as_deref().expect("resp");
-            let new_fn = format!("new{}", m.req);
-            s.push_str(&format!(
-                "\tcase {}:\n\t\tr := {}(restore{}Ref(d))\n\t\tresp := GolangCallImpl.{}(&r)\n\t\te := &enc{{}}\n\t\tflatten{}(&resp, e)\n\t\treturn e.b, true\n",
-                m.index, new_fn, m.req, m.name, resp
-            ));
+            let star = if m.go_ptr { "&" } else { "" };
+            if i > 0 {
+                args.push_str(", ");
+            }
+            args.push_str(&format!("{star}{var}"));
+        }
+        let receiver = format!("{}Impl.{}", m.trait_name, m.name);
+        s.push_str(&format!("\tcase {}:\n", m.index));
+        s.push_str(&decls);
+        match &m.resp {
+            None => {
+                s.push_str(&format!(
+                    "\t\t{}({})\n\t\treturn nil, true\n",
+                    receiver, args
+                ));
+            }
+            Some(resp) => {
+                s.push_str(&format!("\t\t_resp := {}({})\n", receiver, args));
+                if matches!(classify(resp), FieldKind::Custom(_)) {
+                    let rn = type_ident(resp);
+                    s.push_str(&format!(
+                        "\t\te := &enc{{}}\n\t\tflatten{}(&_resp, e)\n\t\treturn e.b, true\n",
+                        rn
+                    ));
+                } else {
+                    let flatten = go_flatten_stmt(resp, "_resp");
+                    s.push_str(&format!(
+                        "\t\te := &enc{{}}\n\t\t{flatten}\n\t\treturn e.b, true\n"
+                    ));
+                }
+            }
         }
     }
     s.push_str("\t}\n\treturn nil, false\n}\n");
-
     s
 }
 
-fn go_ptr(n: &str) -> String {
-    format!("*{}", n)
+fn go_flatten_stmt(ty: &Type, value: &str) -> String {
+    match classify(ty) {
+        FieldKind::String => format!("e.put({value})"),
+        FieldKind::Primitive(_) => format!("e.put({value})"),
+        FieldKind::Custom(_) => format!("flatten{}(&{value}, e)", type_ident(ty)),
+        FieldKind::List(elem) => match *elem {
+            FieldKind::Primitive(_) | FieldKind::String | FieldKind::Custom(_) => format!(
+                "e.put(uint64(len({value})))\n\tfor _, _item := range {value} {{\n\t\t{}\n\t}}",
+                go_put_item(&elem, "_item")
+            ),
+            FieldKind::List(_) => unreachable!(),
+        },
+    }
+}
+
+fn go_put_item(kind: &FieldKind, item: &str) -> String {
+    match kind {
+        FieldKind::Primitive(_) | FieldKind::String => format!("e.put({item})"),
+        FieldKind::Custom(n) => format!("flatten{n}(&{item}, e)"),
+        FieldKind::List(_) => unreachable!(),
+    }
 }
 
 fn generate_go_main() -> String {
@@ -1069,13 +1630,10 @@ func main() {
 	transport := os.Getenv("RUST2GO_IPC_TRANSPORT")
 	endpoint := os.Getenv("RUST2GO_IPC_ENDPOINT")
 	if endpoint == "" {
-		// Backward compat: older Rust clients only set RUST2GO_IPC_PORT.
 		port := os.Getenv("RUST2GO_IPC_PORT")
 		if port == "" {
 			panic("RUST2GO_IPC_ENDPOINT / RUST2GO_IPC_PORT not set")
 		}
-		// Do not overwrite an explicitly requested transport; only infer tcp
-		// when the caller did not specify one.
 		if transport == "" {
 			transport = "tcp"
 		}
@@ -1089,8 +1647,9 @@ func main() {
 	var err error
 	switch transport {
 	case "unix":
-		// A killed server leaves its socket file behind. Unlink before listen
-		// so a respawned process can rebind the same path.
+		if len(endpoint) >= 100 {
+			panic("rust2go-ipc: unix endpoint path too long")
+		}
 		_ = os.Remove(endpoint)
 		ln, err = net.Listen("unix", endpoint)
 	case "tcp":
@@ -1105,10 +1664,6 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// net.Error.Temporary is deprecated ("Do not use this method").
-			// Treat every non-closed error as transient: back off exponentially
-			// instead of spinning. A bounded retry count keeps a permanently
-			// broken listener from hiding forever; Rust respawns on panic.
 			if errors.Is(err, net.ErrClosed) {
 				panic("rust2go-ipc: listener closed: " + err.Error())
 			}
@@ -1128,6 +1683,10 @@ func serve(conn net.Conn) {
 	defer conn.Close()
 	hdr := make([]byte, 22)
 	for {
+		// Set an idle deadline before every read. Setting it only after the
+		// header leaves an absolute deadline that expires on long-idle
+		// connections and makes the Rust side restart the server.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return
 		}
@@ -1139,29 +1698,24 @@ func serve(conn net.Conn) {
 		}
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
 		methodID := binary.LittleEndian.Uint32(hdr[14:18])
-		// Compare as uint32 before converting to int: on 32-bit targets a value
-		// > 2^31 would wrap negative and bypass the size check.
 		length32 := binary.LittleEndian.Uint32(hdr[18:22])
 		if length32 > 64*1024*1024 {
 			return
 		}
-		length := int(length32)
-		// Bound a half-open connection so a peer that declares a large frame
-		// and stalls cannot pin a goroutine and its buffer forever.
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		payload := make([]byte, length)
+		payload := make([]byte, int(length32))
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
 
 		if reqID == 0 {
 			_, _ = dispatch(methodID, payload)
-			continue // oneway: no response frame
+			continue
 		}
 		resp, ok := dispatch(methodID, payload)
 		status := byte(0)
-		if !ok {
+		if !ok || len(resp) > 64*1024*1024 {
 			status = 1
+			resp = nil
 		}
 		out := make([]byte, 19+len(resp))
 		copy(out[0:4], magic)
@@ -1175,7 +1729,88 @@ func serve(conn net.Conn) {
 		}
 	}
 }
-
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EDGE_SCHEMA: &str = r#"
+#[derive(r2g::R2G, Default)]
+pub struct Empty {}
+
+#[derive(R2G, Default)]
+pub struct Req {
+    pub text: String,
+    pub flags: Vec<bool>,
+    pub scalar: char,
+}
+
+#[derive(R2G, Default)]
+pub struct Resp {
+    pub ok: bool,
+}
+
+#[r2g]
+pub trait First {
+    fn zero() -> Resp;
+    fn multi(a: Req, b: i32) -> Resp;
+    fn scalar(name: String) -> String;
+    #[go_pass_struct]
+    fn byval(req: Req);
+}
+
+#[r2g]
+pub trait Second {
+    fn other(req: Req) -> Vec<u8>;
+    async fn async_one(req: Req) -> Resp;
+}
+"#;
+
+    #[test]
+    fn edge_schema_generates_valid_rust_and_go() {
+        let schema = parse_schema(EDGE_SCHEMA);
+        assert_eq!(schema.methods.len(), 6);
+        assert_eq!(
+            schema.traits,
+            vec!["First".to_string(), "Second".to_string()]
+        );
+        let ids: Vec<u32> = schema.methods.iter().map(|m| m.index).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+        assert!(!schema.methods.iter().any(|m| m.go_ptr && m.name == "byval"));
+
+        let rust = generate_rust_bindings(&schema, 1234).to_string();
+        syn::parse_file(&rust).expect("generated Rust must parse");
+        assert!(rust.contains("CFirst_zero"));
+        assert!(rust.contains("CSecond_other"));
+        assert!(rust.contains("SlotWriter"));
+
+        let go = generate_go_sources(&schema);
+        assert!(go.contains("var FirstImpl First"));
+        assert!(go.contains("var SecondImpl Second"));
+        assert!(go.contains("primList[bool]"));
+        assert!(go.contains("func dispatch("));
+
+        if let Some(gofmt) = find_gofmt() {
+            let path = std::env::temp_dir().join(format!(
+                "rust2go-ipc-edge-{}-{}.go",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::write(&path, &go).unwrap();
+            let status = Command::new(gofmt).arg("-e").arg(&path).output();
+            let _ = fs::remove_file(&path);
+            let status = status.expect("cannot run gofmt");
+            assert!(
+                status.status.success(),
+                "generated Go failed gofmt parse: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+    }
 }
