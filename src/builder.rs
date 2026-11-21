@@ -1042,6 +1042,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -1050,6 +1051,19 @@ import (
 
 const magic = "R2GI"
 const version = uint16(1)
+
+const maxAcceptErrs = 10
+
+func acceptBackoff(attempt int) time.Duration {
+	d := 5 * time.Millisecond
+	for i := 1; i < attempt && d < time.Second; i++ {
+		d *= 2
+	}
+	if d > time.Second {
+		d = time.Second
+	}
+	return d
+}
 
 func main() {
 	transport := os.Getenv("RUST2GO_IPC_TRANSPORT")
@@ -1087,17 +1101,25 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	acceptErrs := 0
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Temporary errors (e.g. EMFILE) should back off rather than spin.
-			// Permanent listener errors let the process exit so Rust respawns it.
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				time.Sleep(50 * time.Millisecond)
-				continue
+			// net.Error.Temporary is deprecated ("Do not use this method").
+			// Treat every non-closed error as transient: back off exponentially
+			// instead of spinning. A bounded retry count keeps a permanently
+			// broken listener from hiding forever; Rust respawns on panic.
+			if errors.Is(err, net.ErrClosed) {
+				panic("rust2go-ipc: listener closed: " + err.Error())
 			}
-			panic("rust2go-ipc: accept failed: " + err.Error())
+			acceptErrs++
+			if acceptErrs >= maxAcceptErrs {
+				panic("rust2go-ipc: accept failed repeatedly: " + err.Error())
+			}
+			time.Sleep(acceptBackoff(acceptErrs))
+			continue
 		}
+		acceptErrs = 0
 		go serve(conn)
 	}
 }

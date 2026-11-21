@@ -3,13 +3,28 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
+	"time"
 )
 
 const magic = "R2GI"
 const version = uint16(1)
+
+const maxAcceptErrs = 10
+
+func acceptBackoff(attempt int) time.Duration {
+	d := 5 * time.Millisecond
+	for i := 1; i < attempt && d < time.Second; i++ {
+		d *= 2
+	}
+	if d > time.Second {
+		d = time.Second
+	}
+	return d
+}
 
 func main() {
 	transport := os.Getenv("RUST2GO_IPC_TRANSPORT")
@@ -20,7 +35,11 @@ func main() {
 		if port == "" {
 			panic("RUST2GO_IPC_ENDPOINT / RUST2GO_IPC_PORT not set")
 		}
-		transport = "tcp"
+		// Do not overwrite an explicitly requested transport; only infer tcp
+		// when the caller did not specify one.
+		if transport == "" {
+			transport = "tcp"
+		}
 		endpoint = "127.0.0.1:" + port
 	}
 	if transport == "" {
@@ -43,11 +62,25 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	acceptErrs := 0
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			// net.Error.Temporary is deprecated ("Do not use this method").
+			// Treat every non-closed error as transient: back off exponentially
+			// instead of spinning. A bounded retry count keeps a permanently
+			// broken listener from hiding forever; Rust respawns on panic.
+			if errors.Is(err, net.ErrClosed) {
+				panic("rust2go-ipc: listener closed: " + err.Error())
+			}
+			acceptErrs++
+			if acceptErrs >= maxAcceptErrs {
+				panic("rust2go-ipc: accept failed repeatedly: " + err.Error())
+			}
+			time.Sleep(acceptBackoff(acceptErrs))
 			continue
 		}
+		acceptErrs = 0
 		go serve(conn)
 	}
 }
@@ -67,10 +100,16 @@ func serve(conn net.Conn) {
 		}
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
 		methodID := binary.LittleEndian.Uint32(hdr[14:18])
-		length := int(binary.LittleEndian.Uint32(hdr[18:22]))
-		if length > 64*1024*1024 {
+		// Compare as uint32 before converting to int: on 32-bit targets a value
+		// > 2^31 would wrap negative and bypass the size check.
+		length32 := binary.LittleEndian.Uint32(hdr[18:22])
+		if length32 > 64*1024*1024 {
 			return
 		}
+		length := int(length32)
+		// Bound a half-open connection so a peer that declares a large frame
+		// and stalls cannot pin a goroutine and its buffer forever.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return

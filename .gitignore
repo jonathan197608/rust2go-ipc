@@ -6,6 +6,8 @@
 *.exe
 *.test
 go-ipc-server
+tests/fixture/go_app/r2g-ipc-fixture
+tests/fixture/real_go_app/r2g-ipc-real-schema-check
 
 # IDE / editor
 .idea/
