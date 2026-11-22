@@ -230,10 +230,24 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         // (e.g. "-linkmode external"). Re-run the build script when it changes
         // so a CI cache does not keep serving a stale, non-PIE server binary.
         println!("cargo:rerun-if-env-changed=RUST2GO_GOFLAGS");
+        // go version is discovered via PATH; a toolchain switch must re-run us.
+        println!("cargo:rerun-if-env-changed=PATH");
+        // Fail fast: the generated server's sem-wait timer reuse relies on Go
+        // >= 1.23 synchronous timer channels. On 1.20–1.22 a stale timer value
+        // can survive Stop+drain and prematurely close connections. A hidden
+        // runtime bug is worse than a clear build-time error, so gate here.
+        require_go_1_23(&self.go_comp);
+        let ipc_main_path = go_dir.join("ipc_main.go");
         if let Ok(entries) = fs::read_dir(&go_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("go") {
+                // Do not watch our own generated outputs: Cargo would see the
+                // mtime bump on every run and rebuild forever. Hand-written Go
+                // sources (impl.go, function.go, ...) remain watched.
+                if p.extension().and_then(|e| e.to_str()) == Some("go")
+                    && p != regen_dst
+                    && p != ipc_main_path
+                {
                     println!("cargo:rerun-if-changed={}", p.display());
                 }
             }
@@ -365,6 +379,45 @@ fn with_extra_ldflags(mut args: Vec<OsString>, extra: &str) -> Vec<OsString> {
 }
 
 /// Locate gofmt: prefer PATH, then `$GOROOT/bin/gofmt`, then `go env GOROOT`.
+/// Assert the Go toolchain in PATH is >= 1.23. The generated IPC server reuses
+/// a single `time.Timer` via Stop+drain+Reset; only Go 1.23+ has the synchronous
+/// timer channel that makes draining exact. Older toolchains can leave a stale
+/// tick in the channel and prematurely close connections under load — a build
+/// error here is far easier to diagnose than intermittent runtime drops.
+fn require_go_1_23(go_comp: &impl GoCompiler) {
+    let mut cmd = Command::new("go");
+    cmd.args(["env", "GOVERSION"]);
+    for (k, v) in go_comp.envs() {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap_or_else(|e| {
+        panic!("rust2go-ipc: cannot run `go env GOVERSION` (Go >= 1.23 required): {e}")
+    });
+    assert!(
+        out.status.success(),
+        "rust2go-ipc: `go env GOVERSION` failed; Go >= 1.23 is required"
+    );
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v = raw.trim();
+    // Typical forms: "go1.26.4", "go1.23", "devel go1.24-abc123".
+    let digits: Vec<u32> = v
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .take(2)
+        .collect();
+    let ok = match digits.as_slice() {
+        [major, _] if *major > 1 => true,
+        [1, minor] => *minor >= 23,
+        _ => false,
+    };
+    assert!(
+        ok,
+        "rust2go-ipc requires Go >= 1.23 (generated server uses synchronous timer channels), got `{}`",
+        v
+    );
+}
+
 fn find_gofmt() -> Option<PathBuf> {
     if Command::new("gofmt")
         .arg("--help")
@@ -621,7 +674,10 @@ fn has_derive(s: &ItemStruct, name: &str) -> bool {
                     .to_string()
                     .split(',')
                     .map(|s| s.trim().to_string())
-                    .any(|s| s.rsplit("::").next() == Some(name))
+                    // proc-macro2 prints `r2g::R2G` as `r2g :: R2G`, so the
+                    // last segment carries a leading space. Trim it before
+                    // comparing or qualified derive paths get silently missed.
+                    .any(|s| s.rsplit("::").next().map(str::trim) == Some(name))
             } else {
                 false
             }

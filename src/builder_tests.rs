@@ -35,6 +35,12 @@ pub trait Second {
 #[test]
 fn edge_schema_generates_valid_rust_and_go() {
     let schema = parse_schema(EDGE_SCHEMA);
+    // Qualified derive paths (r2g::R2G) must be recognized just like bare R2G.
+    assert!(
+        schema.structs.iter().any(|s| s.name == "Empty"),
+        "qualified #[derive(r2g::R2G)] must be recognized, got structs: {:?}",
+        schema.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
     assert_eq!(schema.methods.len(), 6);
     assert_eq!(
         schema.traits,

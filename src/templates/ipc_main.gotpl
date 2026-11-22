@@ -91,11 +91,15 @@ func main() {
 		_ = os.Remove(endpoint)
 		ln, err = net.Listen("unix", endpoint)
 		if err == nil {
-			// net.Listen creates the socket node with 0777 & ^umask (typically
-			// 0755), letting any local user connect and invoke handlers. Restrict
-			// it to the owner so only the process that spawned this server (same
-			// uid) can reach the IPC endpoint.
-			err = os.Chmod(endpoint, 0600)
+			// The Rust parent tightens this child's umask to 0077 in pre_exec,
+			// so net.Listen creates the node as 0700 with no race window. Chmod
+			// to 0600 as defence in depth, and never leave a listening socket
+			// behind if it fails.
+			if cerr := os.Chmod(endpoint, 0600); cerr != nil {
+				_ = ln.Close()
+				_ = os.Remove(endpoint)
+				err = cerr
+			}
 		}
 	case "tcp":
 		ln, err = net.Listen("tcp", endpoint)

@@ -483,8 +483,8 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
 /// variant exists for `reconnect`, which holds the lock while reaping the
 /// previous child so no new child can slip in after the reap.
 fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
-    let child = Command::new(server)
-        .env("RUST2GO_IPC_PORT", port.to_string())
+    let mut cmd = Command::new(server);
+    cmd.env("RUST2GO_IPC_PORT", port.to_string())
         .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
         .env("RUST2GO_IPC_ENDPOINT", &endpoint.addr)
         // Isolate the child from the parent's stdio. stdin is unused; stdout
@@ -492,7 +492,25 @@ fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
         // a Go-side panic remains diagnosable (the Rust side also logs the
         // child's exit status during startup/respawn).
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The Go server calls net.Listen("unix", ...) which creates the socket
+        // node as 0777 & ^umask before its Chmod(0600). With the parent's
+        // default umask that node is briefly 0755 on a world-writable /tmp,
+        // letting any local user connect. Tighten the *child's* umask in the
+        // pre-exec window so the node is born 0700; Chmod then narrows it to
+        // 0600. This touches only the spawned Go process, never the host.
+        // umask(2) is async-signal-safe, valid inside pre_exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+    }
+    let child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"));
     // Record the pid immediately, before the caller stores the Child handle,
