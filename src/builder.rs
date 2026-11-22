@@ -452,6 +452,11 @@ fn parse_schema(src: &str) -> Schema {
                     _ => panic!("rust2go-ipc: only simple parameter patterns are supported"),
                 };
                 validate_ident(&pname, "parameter");
+                assert!(
+                    !RESERVED_PARAM_NAMES.contains(&pname.as_str()),
+                    "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier ({}); rename it",
+                    RESERVED_PARAM_NAMES.join(", ")
+                );
                 let (ty, is_reference) = strip_reference(&p.ty);
                 let _ = is_reference;
                 params.push(ParamDef { name: pname, ty });
@@ -500,11 +505,15 @@ fn parse_schema(src: &str) -> Schema {
     // wire bytes, so a non-empty list is indistinguishable from an empty one
     // and the count bound rejects every value. Fail at build time with a clear
     // message instead of a confusing runtime "list length out of bounds".
-    let empty_structs: HashSet<String> = schema
-        .structs
+    // Use the converged wire width, not just `fields.is_empty()`: a composite
+    // such as `Wrapper { inner: Empty }` also collapses to zero wire bytes and
+    // is equally unencodable as a list element. struct_wire_widths runs a
+    // fixed-point iteration so nested zero-width structs are caught.
+    let widths_for_empty = struct_wire_widths(&schema);
+    let empty_structs: HashSet<String> = widths_for_empty
         .iter()
-        .filter(|s| s.fields.is_empty())
-        .map(|s| s.name.clone())
+        .filter(|(_, w)| **w == 0)
+        .map(|(name, _)| name.clone())
         .collect();
     if !empty_structs.is_empty() {
         let check = |kind: &FieldKind, ctx: &str| {
@@ -676,6 +685,13 @@ fn check_supported(kind: &FieldKind, ctx: &str, structs: &HashSet<String>) {
         _ => {}
     }
 }
+
+/// Bare identifiers introduced by generated Rust stubs. A user parameter with
+/// one of these names would collide with generated code: `slot`/`cb` duplicate
+/// the appended callback parameters, `enc` is shadowed by the encoder local
+/// before flatten expressions run, and `handler`/`dec` are stub locals. Reject
+/// at build time with a clear message instead of emitting uncompilable Rust.
+const RESERVED_PARAM_NAMES: &[&str] = &["enc", "dec", "slot", "cb", "handler"];
 
 fn validate_ident(name: &str, what: &str) {
     const RUST: &[&str] = &[

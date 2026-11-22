@@ -123,3 +123,81 @@ fn port_override_zero_is_rejected() {
         .unwrap_or(7777);
     assert_eq!(parsed, 5555);
 }
+
+// A Read that yields a fixed set of byte chunks, then either blocks forever
+// (returning TimedOut) or ends the stream. Used to test mid-frame timeout
+// handling in read_exact_frame.
+struct ChunkReader {
+    chunks: Vec<Vec<u8>>,
+    then_timeout: bool,
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(chunk) = self.chunks.first() {
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            let remaining = chunk.len() - n;
+            if remaining == 0 {
+                self.chunks.remove(0);
+            } else {
+                self.chunks[0].drain(..n);
+            }
+            return Ok(n);
+        }
+        if self.then_timeout {
+            Err(IoError::new(ErrorKind::TimedOut, "idle"))
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+#[test]
+fn read_exact_frame_idle_timeout_stays_timed_out() {
+    // No bytes consumed before the timeout: must stay TimedOut so the reactor
+    // probes child liveness and continues.
+    let mut r = ChunkReader {
+        chunks: vec![],
+        then_timeout: true,
+    };
+    let mut buf = [0u8; 19];
+    let err = read_exact_frame(&mut r, &mut buf).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+}
+
+#[test]
+fn read_exact_frame_mid_frame_timeout_becomes_invalid_data() {
+    // Some header bytes consumed before the timeout: must be InvalidData so
+    // the reactor resyncs the connection instead of parsing frame bytes as a
+    // fresh header (which would desynchronise the stream forever).
+    let mut r = ChunkReader {
+        chunks: vec![vec![0x52, 0x32, 0x47, 0x49]],
+        then_timeout: true,
+    };
+    let mut buf = [0u8; 19];
+    let err = read_exact_frame(&mut r, &mut buf).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn read_exact_frame_eof_mid_frame_is_unexpected_eof() {
+    let mut r = ChunkReader {
+        chunks: vec![vec![0x52, 0x32]],
+        then_timeout: false,
+    };
+    let mut buf = [0u8; 19];
+    let err = read_exact_frame(&mut r, &mut buf).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn read_exact_frame_full_read_succeeds() {
+    let mut r = ChunkReader {
+        chunks: vec![vec![1, 2, 3], vec![4, 5]],
+        then_timeout: true,
+    };
+    let mut buf = [0u8; 5];
+    read_exact_frame(&mut r, &mut buf).unwrap();
+    assert_eq!(buf, [1, 2, 3, 4, 5]);
+}

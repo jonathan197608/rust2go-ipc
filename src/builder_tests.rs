@@ -223,10 +223,16 @@ fn go_server_dispatches_concurrently_with_bounded_semaphore() {
         "semaphore acquire must be cancellable via done channel"
     );
     // HARDEN: a hung handler holding every slot must not leak the blocked
-    // serve goroutine forever after Rust times out and closes its side.
+    // serve goroutine forever after Rust times out and closes its side. The
+    // timeout uses one reusable timer (not a per-request time.After) so bursts
+    // don't pile up uncollectable timers.
     assert!(
-        main.contains("case <-time.After(60 * time.Second):"),
+        main.contains("case <-semWait.C:"),
         "semaphore acquire must have a timeout to avoid goroutine leak"
+    );
+    assert!(
+        !main.contains("case <-time.After(60 * time.Second):"),
+        "semaphore timeout must not allocate a per-request time.After timer"
     );
     assert!(
         main.contains("close(done)") && main.contains("sync.Once"),
@@ -384,4 +390,62 @@ fn extra_ldflags_adds_ldflags_when_absent() {
     assert_eq!(out[args.len() + 1], OsString::from("-linkmode external"));
     // The upstream args (including the trailing package ".") stay in order.
     assert_eq!(&out[..args.len()], args.as_slice());
+}
+
+#[test]
+#[should_panic(expected = "parameter name `slot` conflicts")]
+fn reserved_param_name_slot_is_rejected() {
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct R { pub ok: bool }
+#[r2g]
+trait T { fn f(slot: R) -> R; }
+"#;
+    parse_schema(src);
+}
+
+#[test]
+#[should_panic(expected = "parameter name `enc` conflicts")]
+fn reserved_param_name_enc_is_rejected() {
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct R { pub ok: bool }
+#[r2g]
+trait T { fn f(enc: R) -> R; }
+"#;
+    parse_schema(src);
+}
+
+#[test]
+#[should_panic(expected = "list of empty struct Wrapper")]
+fn indirect_empty_struct_in_list_is_rejected() {
+    // Wrapper has one field but that field is an empty struct, so its wire
+    // width converges to 0. A list of it cannot round-trip.
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct Empty {}
+#[derive(R2G, Default)]
+pub struct Wrapper { pub inner: Empty }
+#[r2g]
+trait T { fn f(items: Vec<Wrapper>) -> bool; }
+"#;
+    parse_schema(src);
+}
+
+#[test]
+fn single_empty_struct_field_is_allowed() {
+    // An empty struct on its own (not as a list element) is fine: it occupies
+    // 0 wire bytes but there is exactly one, so it round-trips unambiguously.
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct Empty {}
+#[derive(R2G, Default)]
+pub struct Wrapper { pub inner: Empty }
+#[r2g]
+trait T { fn f(w: Wrapper) -> bool; }
+"#;
+    let schema = parse_schema(src);
+    assert_eq!(schema.structs.len(), 2);
+    // Must still generate parseable Rust/Go (no panic, valid syntax).
+    syn::parse_file(&generate_rust_bindings(&schema, 1).to_string()).unwrap();
 }

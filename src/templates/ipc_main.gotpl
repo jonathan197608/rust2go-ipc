@@ -128,6 +128,17 @@ func serve(conn net.Conn) {
 	var writeMu sync.Mutex
 	var wg sync.WaitGroup
 	done := make(chan struct{})
+	// Reusable timer for the semaphore-wait timeout. time.After(60s) allocated
+	// a fresh timer per request that stayed live until it fired, piling up
+	// under bursts. Stop+drain before Reset keeps this safe on Go < 1.23 too.
+	semWait := time.NewTimer(0)
+	if !semWait.Stop() {
+		select {
+		case <-semWait.C:
+		default:
+		}
+	}
+	defer semWait.Stop()
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
@@ -192,11 +203,18 @@ func serve(conn net.Conn) {
 		// forever on the channel (a read deadline does not cover channel ops),
 		// leaking a goroutine. Both paths are bounded. The wait exceeds the
 		// Rust sync timeout (30 s) so normal queuing is not cut short.
+		semWait.Reset(60 * time.Second)
 		select {
 		case sem <- struct{}{}:
+			if !semWait.Stop() {
+				select {
+				case <-semWait.C:
+				default:
+				}
+			}
 		case <-done:
 			return
-		case <-time.After(60 * time.Second):
+		case <-semWait.C:
 			return
 		}
 		wg.Add(1)

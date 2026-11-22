@@ -435,7 +435,19 @@ extern "C" fn cleanup_on_exit() {
 
 /// Spawn the Go server once and start the reactor. `server` is the path to the
 /// compiled Go IPC binary; `port` was reserved by the build script.
+///
+/// Holds CHILD_MGMT across spawn + pid publication so the atexit hook can never
+/// observe a spawned child whose pid has not been recorded yet (which would
+/// leave an orphan on process exit).
 fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
+    let _mgmt = lock_or_recover(&CHILD_MGMT);
+    spawn_server_locked(server, port, endpoint)
+}
+
+/// Spawn and publish the child pid. The caller must hold CHILD_MGMT; this
+/// variant exists for `reconnect`, which holds the lock while reaping the
+/// previous child so no new child can slip in after the reap.
+fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
     let child = Command::new(server)
         .env("RUST2GO_IPC_PORT", port.to_string())
         .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
@@ -452,6 +464,22 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
     // so atexit can still kill it during the OnceLock initialization window.
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
     child
+}
+
+/// kill + wait + clear pid. The caller must hold CHILD_MGMT.
+fn kill_child_locked(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+    CHILD_PID.store(0, Ordering::SeqCst);
+}
+
+/// Kill and reap a child whose pid was published by spawn_server, clearing the
+/// pid under CHILD_MGMT. Keeping kill + wait + clear inside the same lock the
+/// atexit hook takes guarantees the hook can never act on a stale (and possibly
+/// recycled) pid after this function returns.
+fn kill_and_reap(child: &mut Child) {
+    let _mgmt = lock_or_recover(&CHILD_MGMT);
+    kill_child_locked(child);
 }
 
 /// Recover a Mutex after a panic in a previous holder. A poisoning panic must
@@ -499,8 +527,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         let start_deadline = Instant::now() + Duration::from_secs(30);
         let stream = loop {
             if Instant::now() >= start_deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child);
                 panic!("rust2go-ipc: Go server never became ready within 30s");
             }
             if let Some(status) = child.try_wait().unwrap_or_else(|e| {
@@ -508,17 +535,20 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
                 None
             }) {
                 eprintln!("rust2go-ipc: Go server exited during startup ({status}); respawning");
-                let _ = child.kill();
-                let _ = child.wait();
-                child = spawn_server(&server, port, &endpoint);
+                // Reap the old child and spawn its replacement inside one
+                // CHILD_MGMT critical section. Otherwise atexit could run in
+                // the gap, see pid 0 (already cleared) and skip reaping, while
+                // the fresh child spawned right after would outlive us.
+                let _mgmt = lock_or_recover(&CHILD_MGMT);
+                kill_child_locked(&mut child);
+                child = spawn_server_locked(&server, port, &endpoint);
             }
             if let Some(s) = connect_with_retry(&endpoint, Duration::from_millis(500)) {
                 break s;
             }
         };
         let reader = stream.try_clone().unwrap_or_else(|e| {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             panic!("rust2go-ipc: cannot clone IPC stream: {e}")
         });
         let _ = stream.set_write_timeout(Duration::from_secs(30));
@@ -644,6 +674,15 @@ pub unsafe fn dispatch(
     cb: *const (),
     handler: ResponseHandler,
 ) {
+    // Reject oversized payloads BEFORE allocating a req_id or inserting a
+    // pending entry: build_frame's assert runs later on the write path, and a
+    // panic there would skip the pending cleanup below, leaking the slot until
+    // the TTL sweep (10 min). Failing early keeps the pending map untouched.
+    assert!(
+        payload.len() <= MAX_PAYLOAD,
+        "rust2go-ipc: request payload too large ({})",
+        payload.len()
+    );
     let rt = runtime(server, port);
     sweep_pending(rt);
     let req_id = next_req_id(rt);
@@ -762,9 +801,44 @@ pub unsafe fn dispatch_sync(
     }
 }
 
+/// Read exactly `buf.len()` bytes, preserving the reactor's idle-timeout
+/// protocol: a timeout before ANY byte is consumed stays a TimedOut/WouldBlock
+/// (the reactor probes child liveness and `continue`s). A timeout after a
+/// partial read is upgraded to InvalidData, because the stream is now
+/// desynchronised and continuing would parse frame bytes as a new header.
+fn read_exact_frame<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+    let mut off = 0usize;
+    while off < buf.len() {
+        match reader.read(&mut buf[off..]) {
+            Ok(0) => {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    "connection closed mid-frame",
+                ))
+            }
+            Ok(n) => off += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e)
+                if (e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock)
+                    && off > 0 =>
+            {
+                // Bytes already consumed: the only safe recovery is a full
+                // reconnect. Report InvalidData so the reactor resyncs instead
+                // of treating this as an idle tick.
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("timeout mid-frame after {off} bytes: {e}"),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
     let mut header = [0u8; 19];
-    reader.read_exact(&mut header)?;
+    read_exact_frame(reader, &mut header)?;
     if header[..4] != MAGIC {
         return Err(IoError::new(ErrorKind::InvalidData, "bad response magic"));
     }
@@ -785,7 +859,7 @@ fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
         ));
     }
     let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
+    read_exact_frame(reader, &mut payload)?;
     Ok((req_id, status, payload))
 }
 
