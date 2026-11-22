@@ -508,8 +508,43 @@ mod api {
     assert_eq!(schema.structs[0].name, "Req");
     assert_eq!(schema.traits, vec!["T".to_string()]);
     assert_eq!(schema.methods.len(), 1);
+    assert_eq!(schema.structs[0].module_path, vec!["types".to_string()]);
     let rust = generate_rust_bindings(&schema, 1234).to_string();
     syn::parse_file(&rust).expect("generated Rust must parse");
+    // The nested struct's owned type must be addressed as `super::types::Req`
+    // (not `super::Req`), or the generated binding fails to compile.
+    assert!(
+        rust.contains("super :: types :: Req"),
+        "nested module path missing in generated owned type: {rust}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "#[cfg] on struct")]
+fn cfg_gated_r2g_struct_is_rejected() {
+    let _ = parse_schema(
+        r#"
+#[cfg(feature = "x")]
+#[derive(R2G, Default)]
+pub struct Foo { pub v: i32 }
+"#,
+    );
+}
+
+#[test]
+#[should_panic(expected = "#[cfg] on method")]
+fn cfg_gated_r2g_method_is_rejected() {
+    let _ = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Foo { pub v: i32 }
+#[r2g]
+pub trait T {
+    #[cfg(target_os = "linux")]
+    fn f(r: Foo);
+}
+"#,
+    );
 }
 
 #[test]

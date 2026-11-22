@@ -137,8 +137,28 @@ fn resolve_endpoint(port: u16) -> Endpoint {
             // it. This avoids a process-wide umask(0077) on the Go child, which
             // would silently narrow every file its business handlers create.
             // A per-(pid,port) directory keeps concurrent IPC endpoints apart.
+            // sockaddr_un.sun_path is ~108 bytes on Linux / 104 on macOS. The
+            // endpoint crossed to Go as a UTF-8 `String`, so the directory is
+            // only usable when its full path is valid UTF-8 *and* short enough.
+            // `to_string_lossy()` would silently replace invalid bytes with
+            // U+FFFD, making the path Rust creates differ from the one Go binds
+            // (bind lands in a non-existent dir -> 30s startup panic). Detect
+            // that case and use the fixed ASCII fallback instead.
             let dir_name = format!("rust2go-ipc-{}-{}.d", process_id(), port);
-            let dir = env::temp_dir().join(&dir_name);
+            let preferred = env::temp_dir().join(&dir_name);
+            let preferred_addr = preferred.join("ipc.sock");
+            let utf8_ok = preferred_addr
+                .to_str()
+                .map(|s| s.len() < 100)
+                .unwrap_or(false);
+
+            let dir = if utf8_ok {
+                preferred
+            } else {
+                // Fall back to a fixed short ASCII root; still nest under a
+                // 0700 private dir so the isolation guarantee is preserved.
+                std::path::PathBuf::from(format!("/tmp/r2g-{}-{}", process_id(), port))
+            };
             // create_dir_all is idempotent across reconnect; explicitly set
             // 0700 (not relying on umask) so a reused dir cannot stay broad.
             fs::create_dir_all(&dir).unwrap_or_else(|e| {
@@ -153,26 +173,12 @@ fn resolve_endpoint(port: u16) -> Endpoint {
                     dir.display()
                 )
             });
-            let path = dir.join("ipc.sock");
-            // sockaddr_un.sun_path is ~108 bytes on Linux / 104 on macOS.
-            // Measure the exact string handed to both sides: Rust connects with
-            // this `String` and Go measures `len(endpoint)`. Checking raw OS
-            // bytes here (before to_string_lossy) would disagree with Go for
-            // non-UTF-8 TMPDIR paths and let an over-long path reach bind().
-            let mut addr = path.to_string_lossy().into_owned();
-            if addr.len() >= 100 {
-                // Fall back to a fixed short root; still nest under a private
-                // dir so the 0700 isolation guarantee is preserved.
-                let short_dir = format!("/tmp/r2g-{}-{}", process_id(), port);
-                let sd = std::path::Path::new(&short_dir);
-                fs::create_dir_all(sd).unwrap_or_else(|e| {
-                    panic!("rust2go-ipc: cannot create fallback socket dir {short_dir}: {e}")
-                });
-                fs::set_permissions(sd, fs::Permissions::from_mode(0o700)).unwrap_or_else(|e| {
-                    panic!("rust2go-ipc: cannot restrict fallback socket dir {short_dir}: {e}")
-                });
-                addr = format!("{short_dir}/ipc.sock");
-            }
+            let _ = SOCKET_DIR.set(dir.clone());
+            let addr = dir
+                .join("ipc.sock")
+                .to_str()
+                .expect("private socket dir is valid UTF-8 (checked above)")
+                .to_owned();
             Endpoint {
                 transport: Transport::Unix,
                 addr,
@@ -435,6 +441,14 @@ struct Runtime {
 /// receive the runtime directly instead of spin-waiting for `OnceLock` to be
 /// populated after this initialization closure returns.
 static RUNTIME: OnceLock<&'static Runtime> = OnceLock::new();
+
+/// Private UDS socket directory created by `resolve_endpoint` (Unix only).
+/// Recorded so `cleanup_on_exit` can remove it; otherwise a start/stop cycle
+/// leaves one empty dir per run (and a stale socket after SIGKILL/abort).
+/// Only reset on first init; a reused `(pid, port)` dir is harmless because the
+/// Go server unlinks any stale socket before `net.Listen`.
+#[cfg(unix)]
+static SOCKET_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 static ATEXIT: Once = Once::new();
 /// Set by the atexit hook before reaping the child. `reconnect` checks it so a
 /// concurrent reactor restart cannot spawn a fresh child that outlives exit.
@@ -501,6 +515,14 @@ extern "C" fn cleanup_on_exit() {
                 .stderr(Stdio::null())
                 .status();
         }
+    }
+    // Remove the private UDS directory this process created so repeated
+    // start/stop cycles do not leave one stale dir (and a stale socket after
+    // SIGKILL/abort, where the Go side never gets to unlink it). Best-effort:
+    // a failure here must not change the process exit path.
+    #[cfg(unix)]
+    if let Some(dir) = SOCKET_DIR.get() {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

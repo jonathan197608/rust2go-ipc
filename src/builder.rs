@@ -466,6 +466,10 @@ struct FieldDef {
 struct StructDef {
     name: String,
     fields: Vec<FieldDef>,
+    /// Modules from the schema root down to this struct (empty = top level).
+    /// Generated bindings live in a `binding` module, so a nested struct's
+    /// owned path must be `super::<mod>::<...>::<Name>`, not just `super::Name`.
+    module_path: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -504,26 +508,55 @@ enum FieldKind {
 /// The proc macro does not require schema types to be top-level, so the builder
 /// must see nested R2G structs/traits too; otherwise they are silently dropped
 /// and references to them report a misleading "missing derive" error.
-fn collect_items<'a>(items: &'a [Item], out: &mut Vec<&'a Item>) {
+fn collect_items<'a>(
+    items: &'a [Item],
+    mod_path: &mut Vec<String>,
+    depth: u32,
+    out: &mut Vec<(&'a Item, Vec<String>)>,
+) {
+    // `syn::parse_file` is itself recursive, but an explicit cap gives a clear
+    // diagnostic instead of a stack abort on pathologically nested input.
+    assert!(
+        depth <= 64,
+        "rust2go-ipc: schema module nesting exceeds 64 levels"
+    );
     for item in items {
-        out.push(item);
+        out.push((item, mod_path.clone()));
         if let Item::Mod(m) = item {
             if let Some((_, inner)) = &m.content {
-                collect_items(inner, out);
+                mod_path.push(m.ident.to_string());
+                collect_items(inner, mod_path, depth + 1, out);
+                mod_path.pop();
             }
         }
     }
+}
+
+/// Reject `#[cfg]`/`#[cfg_attr]` on schema items. The builder parses source
+/// without evaluating cfg, so a cfg-gated struct/trait/method would be emitted
+/// unconditionally into Go, disagreeing with the Rust side (which sees only
+/// activated items after cfg stripping). Fail fast with an actionable message.
+fn reject_schema_cfg(attrs: &[syn::Attribute], what: &str) {
+    assert!(
+        !attrs
+            .iter()
+            .any(|a| { a.path().is_ident("cfg") || a.path().is_ident("cfg_attr") }),
+        "rust2go-ipc: #[cfg] on {what} is not supported in schema sources; \
+         keep R2G types/methods unconditional"
+    );
 }
 
 fn parse_schema(src: &str) -> Schema {
     let file = syn::parse_file(src).expect("rust2go-ipc: cannot parse schema source");
     let mut schema = Schema::default();
     let mut all_items = Vec::new();
-    collect_items(&file.items, &mut all_items);
+    let mut mod_path = Vec::new();
+    collect_items(&file.items, &mut mod_path, 0, &mut all_items);
 
-    for item in &all_items {
+    for (item, path) in &all_items {
         if let Item::Struct(s) = item {
             if has_derive(s, "R2G") {
+                reject_schema_cfg(&s.attrs, &format!("struct `{}`", bare_ident(&s.ident)));
                 // Generics carry no wire representation; reject clearly rather
                 // than letting `T` fall through to a bogus "missing derive".
                 assert!(
@@ -531,7 +564,7 @@ fn parse_schema(src: &str) -> Schema {
                     "rust2go-ipc: generic struct `{}` is not wire-encodable; use a concrete type",
                     bare_ident(&s.ident)
                 );
-                schema.structs.push(parse_struct(s));
+                schema.structs.push(parse_struct(s, path.clone()));
             }
         }
     }
@@ -541,11 +574,12 @@ fn parse_schema(src: &str) -> Schema {
     // Go `case` labels.
     let mut idx = 0u32;
     let mut stub_names = HashSet::new();
-    for item in &all_items {
+    for (item, _path) in &all_items {
         let Item::Trait(t) = item else { continue };
         if !has_marker_attr(&t.attrs, "r2g") {
             continue;
         }
+        reject_schema_cfg(&t.attrs, &format!("trait `{}`", bare_ident(&t.ident)));
         let trait_name = bare_ident(&t.ident);
         validate_ident(&trait_name, "trait");
         if !schema.traits.contains(&trait_name) {
@@ -554,6 +588,7 @@ fn parse_schema(src: &str) -> Schema {
         for m in &t.items {
             let TraitItem::Fn(f) = m else { continue };
             let name = bare_ident(&f.sig.ident);
+            reject_schema_cfg(&f.attrs, &format!("method `{name}`"));
             validate_ident(&name, "method");
             let resp = match &f.sig.output {
                 ReturnType::Type(_, ty) => Some(strip_reference(ty).0),
@@ -721,7 +756,7 @@ fn bare_ident(ident: &proc_macro2::Ident) -> String {
     s.strip_prefix("r#").unwrap_or(&s).to_string()
 }
 
-fn parse_struct(s: &ItemStruct) -> StructDef {
+fn parse_struct(s: &ItemStruct, module_path: Vec<String>) -> StructDef {
     let name = bare_ident(&s.ident);
     let fields = match &s.fields {
         Fields::Named(named) => named
@@ -741,7 +776,11 @@ fn parse_struct(s: &ItemStruct) -> StructDef {
             "rust2go-ipc: struct `{name}` must have named fields; tuple and unit structs are not supported"
         ),
     };
-    StructDef { name, fields }
+    StructDef {
+        name,
+        fields,
+        module_path,
+    }
 }
 
 fn strip_reference(ty: &Type) -> (Type, bool) {
@@ -1002,16 +1041,28 @@ fn check_go_name_collisions(schema: &Schema) {
     }
 }
 
-fn rust_owned_kind_path(kind: &FieldKind) -> TokenStream {
+fn rust_owned_kind_path(kind: &FieldKind, schema: &Schema) -> TokenStream {
     match kind {
         FieldKind::String => quote! { ::std::string::String },
         FieldKind::List(elem) => {
-            let inner = rust_owned_kind_path(elem);
+            let inner = rust_owned_kind_path(elem, schema);
             quote! { ::std::vec::Vec<#inner> }
         }
         FieldKind::Custom(n) => {
             let id = format_ident!("{}", n);
-            quote! { super::#id }
+            // The generated file is included from a `binding` module. A struct
+            // declared at the schema root lives in `super`; one declared inside
+            // `mod types { ... }` lives at `super::types`. Emit the full path so
+            // nested-module schemas actually compile (collect_items now finds
+            // them, so this path must follow).
+            let mods = schema
+                .structs
+                .iter()
+                .find(|s| s.name == *n)
+                .map(|s| s.module_path.as_slice())
+                .unwrap_or(&[]);
+            let segs: Vec<syn::Ident> = mods.iter().map(|m| format_ident!("{}", m)).collect();
+            quote! { super::#(#segs::)*#id }
         }
         FieldKind::Primitive(p) => {
             let id = format_ident!("{}", p);
@@ -1021,16 +1072,16 @@ fn rust_owned_kind_path(kind: &FieldKind) -> TokenStream {
 }
 
 /// Owned type as seen from the generated `binding` module. Schema structs live
-/// in the parent module, hence the `super::` prefix (the generated file is
-/// included from a sibling `binding` module).
-fn rust_owned_path(ty: &Type) -> TokenStream {
+/// in the parent module (or a module nested within it), hence the `super::`
+/// prefix (the generated file is included from a sibling `binding` module).
+fn rust_owned_path(ty: &Type, schema: &Schema) -> TokenStream {
     match classify(ty) {
         FieldKind::List(_) if type_ident(ty) == "Option" => {
             let elem = generic_arg(ty).expect("Option<T>");
-            let inner = rust_owned_path(&elem);
+            let inner = rust_owned_path(&elem, schema);
             quote! { ::std::option::Option<#inner> }
         }
-        other => rust_owned_kind_path(&other),
+        other => rust_owned_kind_path(&other, schema),
     }
 }
 
@@ -1297,7 +1348,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
         match (&m.resp, m.is_async) {
             (Some(resp), is_async) => {
                 let resp_ref = rust_ref_type(resp);
-                let resp_owned = rust_owned_path(resp);
+                let resp_owned = rust_owned_path(resp, schema);
                 let restore = restore_expr(resp, &widths);
                 let slot_cb = quote! {
                     slot: *mut ::std::ffi::c_void,
@@ -1334,8 +1385,11 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     }
                 });
 
-                let owned_types: Vec<TokenStream> =
-                    m.params.iter().map(|p| rust_owned_path(&p.ty)).collect();
+                let owned_types: Vec<TokenStream> = m
+                    .params
+                    .iter()
+                    .map(|p| rust_owned_path(&p.ty, schema))
+                    .collect();
                 let write_back = if is_async {
                     quote! {
                         ::rust2go::SlotWriter::<#resp_owned, ((#(#owned_types,)*), Vec<u8>)>
