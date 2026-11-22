@@ -291,7 +291,6 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
     }
 }
 
-/// Locate gofmt: prefer PATH, then `$GOROOT/bin/gofmt`, then `go env GOROOT`.
 /// Merge extra linker flags (from `RUST2GO_GOFLAGS`) into the go build args.
 ///
 /// Some linker flags — notably `-linkmode external` — cannot be passed as a
@@ -311,9 +310,12 @@ fn with_extra_ldflags(mut args: Vec<OsString>, extra: &str) -> Vec<OsString> {
         let cur = args[i].to_string_lossy();
         if cur == "-ldflags" {
             if i + 1 < args.len() {
-                let mut merged = OsString::from(extra);
+                // Append, do not prepend: cmd/link lets the last occurrence of
+                // a string flag win, so an env-injected -linkmode must be able
+                // to override a conflicting value already in build.rs.
+                let mut merged = OsString::from(&args[i + 1]);
                 merged.push(" ");
-                merged.push(&args[i + 1]);
+                merged.push(extra);
                 args[i + 1] = merged;
             } else {
                 // `-ldflags` with no value: treat the next push as its value.
@@ -322,7 +324,7 @@ fn with_extra_ldflags(mut args: Vec<OsString>, extra: &str) -> Vec<OsString> {
             return args;
         }
         if let Some(val) = cur.strip_prefix("-ldflags=") {
-            let merged = format!("{extra} {val}");
+            let merged = format!("{val} {extra}");
             args[i] = OsString::from(format!("-ldflags={merged}"));
             return args;
         }
@@ -334,6 +336,7 @@ fn with_extra_ldflags(mut args: Vec<OsString>, extra: &str) -> Vec<OsString> {
     args
 }
 
+/// Locate gofmt: prefer PATH, then `$GOROOT/bin/gofmt`, then `go env GOROOT`.
 fn find_gofmt() -> Option<PathBuf> {
     if Command::new("gofmt")
         .arg("--help")
@@ -442,7 +445,12 @@ fn parse_schema(src: &str) -> Schema {
             let TraitItem::Fn(f) = m else { continue };
             let name = bare_ident(&f.sig.ident);
             validate_ident(&name, "method");
+            let resp = match &f.sig.output {
+                ReturnType::Type(_, ty) => Some(strip_reference(ty).0),
+                ReturnType::Default => None,
+            };
             let mut params = Vec::new();
+            let mut param_names = HashSet::new();
             for arg in &f.sig.inputs {
                 let FnArg::Typed(p) = arg else {
                     panic!("rust2go-ipc: receiver is not supported in #[r2g] trait methods");
@@ -453,18 +461,19 @@ fn parse_schema(src: &str) -> Schema {
                 };
                 validate_ident(&pname, "parameter");
                 assert!(
-                    !RESERVED_PARAM_NAMES.contains(&pname.as_str())
-                        && !pname.starts_with(GENERATED_IDENT_PREFIX),
+                    param_names.insert(pname.clone()),
+                    "rust2go-ipc: duplicate parameter name `{pname}` in method `{name}`"
+                );
+                let reserved = ALWAYS_RESERVED_PARAM_NAMES.contains(&pname.as_str())
+                    || (resp.is_some() && RESPONSE_RESERVED_PARAM_NAMES.contains(&pname.as_str()));
+                assert!(
+                    !reserved && !pname.starts_with(GENERATED_IDENT_PREFIX),
                     "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier; rename it"
                 );
                 let (ty, is_reference) = strip_reference(&p.ty);
                 let _ = is_reference;
                 params.push(ParamDef { name: pname, ty });
             }
-            let resp = match &f.sig.output {
-                ReturnType::Type(_, ty) => Some(strip_reference(ty).0),
-                ReturnType::Default => None,
-            };
             let go_ptr = !f
                 .attrs
                 .iter()
@@ -686,13 +695,14 @@ fn check_supported(kind: &FieldKind, ctx: &str, structs: &HashSet<String>) {
     }
 }
 
-/// Bare identifiers introduced by generated Rust stubs that a user parameter
-/// name would collide with: `slot`/`cb` duplicate the appended callback
-/// parameters, `enc` is shadowed by the encoder local before flatten runs.
+/// `enc` is always shadowed by the encoder local before flatten runs.
+/// `slot`/`cb` only collide in methods that have a response (they are appended
+/// callback parameters there); oneway methods do not emit them.
 /// (`dec`/`handler` live in separate scopes or are declared after the flatten
 /// statements consume the parameters, so they are deliberately not reserved.)
 /// Reject at build time instead of emitting uncompilable Rust.
-const RESERVED_PARAM_NAMES: &[&str] = &["enc", "slot", "cb"];
+const ALWAYS_RESERVED_PARAM_NAMES: &[&str] = &["enc"];
+const RESPONSE_RESERVED_PARAM_NAMES: &[&str] = &["slot", "cb"];
 /// The generator emits `__r2g_*` bindings and helper calls inside the same
 /// stub scope as user parameters. A parameter using that prefix (e.g.
 /// `__r2g_flatten_Foo`) would shadow a helper function and break compilation.
@@ -760,6 +770,7 @@ const GO_FIXED_SYMBOLS: &[&str] = &[
     // ipc_main.go fixed symbols
     "magic",
     "version",
+    "_require64bitGoTarget",
     "maxAcceptErrs",
     "sem",
     "acceptBackoff",

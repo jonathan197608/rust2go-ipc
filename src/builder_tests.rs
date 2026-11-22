@@ -284,6 +284,20 @@ fn trait_name_colliding_with_go_helper_is_rejected() {
 }
 
 #[test]
+#[should_panic(expected = "collides with")]
+fn struct_name_colliding_with_64bit_assert_is_rejected() {
+    let schema = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct _require64bitGoTarget { pub v: i32 }
+        #[r2g]
+        pub trait GolangCall { fn f(x: _require64bitGoTarget) -> _require64bitGoTarget; }
+        "#,
+    );
+    let _ = generate_go_sources(&schema);
+}
+
+#[test]
 #[should_panic(expected = "must have named fields")]
 fn tuple_struct_is_rejected() {
     let _ = parse_schema(
@@ -365,7 +379,7 @@ fn extra_ldflags_merges_into_separate_ldflags() {
     assert_eq!(out[0], OsString::from("-ldflags"));
     assert_eq!(
         out[1],
-        OsString::from(r#"-linkmode external -extldflags "-static-pie" -s -w"#)
+        OsString::from(r#"-extldflags "-static-pie" -s -w -linkmode external"#)
     );
 }
 
@@ -374,7 +388,32 @@ fn extra_ldflags_merges_into_equals_ldflags() {
     let args = vec![OsString::from("-ldflags=-s -w")];
     let out = with_extra_ldflags(args, "-linkmode external");
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0], OsString::from("-ldflags=-linkmode external -s -w"));
+    assert_eq!(out[0], OsString::from("-ldflags=-s -w -linkmode external"));
+}
+
+#[test]
+fn extra_ldflags_completes_trailing_separate_flag() {
+    let args = vec![OsString::from("-ldflags")];
+    let out = with_extra_ldflags(args, "-linkmode external");
+    assert_eq!(
+        out,
+        vec![
+            OsString::from("-ldflags"),
+            OsString::from("-linkmode external")
+        ]
+    );
+}
+
+#[test]
+fn extra_ldflags_env_value_wins_on_duplicate_linkmode() {
+    // cmd/link takes the last occurrence of a string flag. The env-injected
+    // value must come last so it can override a conflicting build.rs value.
+    let args = vec![OsString::from("-ldflags=-linkmode internal -s -w")];
+    let out = with_extra_ldflags(args, "-linkmode external");
+    assert_eq!(
+        out[0],
+        OsString::from("-ldflags=-linkmode internal -s -w -linkmode external")
+    );
 }
 
 #[test]
@@ -414,6 +453,32 @@ pub struct R { pub ok: bool }
 trait T { fn f(enc: R) -> R; }
 "#;
     parse_schema(src);
+}
+
+#[test]
+#[should_panic(expected = "duplicate parameter name `x`")]
+fn duplicate_parameter_names_are_rejected() {
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct R { pub ok: bool }
+#[r2g]
+trait T { fn f(x: R, x: bool) -> R; }
+"#;
+    parse_schema(src);
+}
+
+#[test]
+fn oneway_method_may_use_slot_as_parameter_name() {
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct R { pub ok: bool }
+#[r2g]
+trait T { fn notify(slot: R); }
+"#;
+    let schema = parse_schema(src);
+    let _ = generate_go_sources(&schema);
+    let rust = generate_rust_bindings(&schema, 1234).to_string();
+    syn::parse_file(&rust).expect("generated Rust must parse");
 }
 
 #[test]

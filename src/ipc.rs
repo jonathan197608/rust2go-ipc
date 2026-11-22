@@ -104,6 +104,18 @@ fn sync_timeout_secs() -> u64 {
 fn resolve_endpoint(port: u16) -> Endpoint {
     let transport = default_transport();
     if let Some(addr) = env_nonempty(ENV_ENDPOINT_OVERRIDE) {
+        // The Go server fail-closes on >=100-byte UDS endpoints with a panic.
+        // Apply the same bound here so Rust fails at startup with a clear
+        // message instead of looping through respawns until the 30s deadline.
+        #[cfg(unix)]
+        {
+            if transport == Transport::Unix && addr.len() >= 100 {
+                panic!(
+                    "rust2go-ipc: {ENV_ENDPOINT_OVERRIDE} Unix socket path must be <100 bytes, got {}",
+                    addr.len()
+                );
+            }
+        }
         return Endpoint { transport, addr };
     }
     match transport {
@@ -490,6 +502,15 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Apply the timeouts the reactor and dispatch paths rely on. A silent failure
+/// here would remove the idle tick that sweeps expired pending entries (reader)
+/// or let a wedged write block a dispatch forever (writer).
+fn set_stream_timeouts(writer: &mut IpcStream, reader: &mut IpcStream) -> std::io::Result<()> {
+    writer.set_write_timeout(Duration::from_secs(30))?;
+    reader.set_read_timeout(Duration::from_secs(300))?;
+    Ok(())
+}
+
 fn runtime(server: &str, port: u16) -> &'static Runtime {
     // Build-time paths live under OUT_DIR and do not exist in a stripped
     // runtime image; let deployment point at the copied binary.
@@ -525,44 +546,54 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         // A total deadline bounds startup so a permanently broken server fails
         // fast instead of hanging the very first dispatch call forever.
         let start_deadline = Instant::now() + Duration::from_secs(30);
-        let stream = loop {
+        let mut stream = loop {
             if Instant::now() >= start_deadline {
                 kill_and_reap(&mut child);
                 panic!("rust2go-ipc: Go server never became ready within 30s");
             }
-            if let Some(status) = child.try_wait().unwrap_or_else(|e| {
-                eprintln!("rust2go-ipc: try_wait during startup: {e}");
-                None
-            }) {
-                eprintln!("rust2go-ipc: Go server exited during startup ({status}); respawning");
-                // Reap the old child and spawn its replacement inside one
-                // CHILD_MGMT critical section. Otherwise atexit could run in
-                // the gap, see pid 0 (already cleared) and skip reaping, while
-                // the fresh child spawned right after would outlive us.
+            // Probe, reap and respawn under ONE CHILD_MGMT critical section.
+            // try_wait() reaps an exited child immediately; if CHILD_PID were
+            // left set past that point, a concurrent atexit hook could kill a
+            // recycled pid. connect_with_retry stays outside the lock.
+            {
                 let _mgmt = lock_or_recover(&CHILD_MGMT);
-                // atexit may have run while we were starting up (RUNTIME not yet
-                // published, so its hook could only kill by pid). Do not spawn a
-                // replacement that would outlive the exiting process as an orphan.
-                if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                let status = match child.try_wait() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("rust2go-ipc: try_wait during startup: {e}");
+                        None
+                    }
+                };
+                if let Some(status) = status {
+                    eprintln!(
+                        "rust2go-ipc: Go server exited during startup ({status}); respawning"
+                    );
+                    // atexit may have run while we were starting up (RUNTIME not
+                    // yet published, so its hook could only kill by pid). Do not
+                    // spawn a replacement that would outlive the exiting process.
+                    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                        kill_child_locked(&mut child);
+                        panic!("rust2go-ipc: shutting down during startup; aborting respawn");
+                    }
                     kill_child_locked(&mut child);
-                    panic!("rust2go-ipc: shutting down during startup; aborting respawn");
+                    child = spawn_server_locked(&server, port, &endpoint);
                 }
-                kill_child_locked(&mut child);
-                child = spawn_server_locked(&server, port, &endpoint);
             }
             if let Some(s) = connect_with_retry(&endpoint, Duration::from_millis(500)) {
                 break s;
             }
         };
-        let reader = stream.try_clone().unwrap_or_else(|e| {
+        let mut reader = stream.try_clone().unwrap_or_else(|e| {
             kill_and_reap(&mut child);
             panic!("rust2go-ipc: cannot clone IPC stream: {e}")
         });
-        let _ = stream.set_write_timeout(Duration::from_secs(30));
-        // A read timeout bounds the reactor's blocking read. On timeout the
-        // reactor probes child liveness instead of treating it as a dead frame:
-        // a healthy but quiet server must not be restarted.
-        let _ = reader.set_read_timeout(Duration::from_secs(300));
+        // A read timeout bounds the reactor's blocking read and is the only
+        // periodic tick that sweeps expired pending entries. Do not ignore a
+        // failure here: fail fast while we can still reap the child.
+        if let Err(e) = set_stream_timeouts(&mut stream, &mut reader) {
+            kill_and_reap(&mut child);
+            panic!("rust2go-ipc: cannot configure IPC stream timeouts: {e}");
+        }
         let ttl = env_nonempty("RUST2GO_IPC_PENDING_TTL_SECS")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
@@ -702,17 +733,19 @@ pub unsafe fn dispatch(
     sweep_pending(rt);
     let req_id = next_req_id(rt);
 
-    // Defensive against u64 wraparound: if a recycled id still has a live
-    // pending entry, release its slot before overwriting it. Unreachable in
-    // practice (~1.8e19 calls), but HashMap::insert would otherwise silently
-    // drop the old Pending without running its cleanup.
-    // Drop the guard at the semicolon BEFORE cleaning up: cleanup wakes the
-    // future (SlotWriter::drop), which may re-enter the runtime and try to lock
-    // rt.pending again. An `if let Some(x) = lock(..).insert(..)` temporary lives
-    // until the end of the if-let, so cleanup there would self-deadlock.
-    let displaced: Option<Pending> = {
+    // Insert pending and write the frame as one critical section. Lock order
+    // is writer -> pending everywhere (reconnect uses the same order), and both
+    // guards drop at the semicolon BEFORE any cleanup: cleanup wakes the future
+    // (SlotWriter::drop), which may re-enter the runtime and try to take either
+    // lock again. Holding writer across insert+write also closes the reconnect
+    // race where a request was inserted just before the writer swap, drained by
+    // reconnect, yet still sent on the new connection.
+    // The displaced entry is only a defensive u64-wraparound case (~1.8e19
+    // calls); HashMap::insert would otherwise drop it without running cleanup.
+    let (displaced, write_failed): (Option<Pending>, Option<Pending>) = {
+        let mut writer = lock_or_recover(&rt.writer);
         let mut pending = lock_or_recover(&rt.pending);
-        pending.insert(
+        let displaced = pending.insert(
             req_id,
             Pending {
                 slot: slot as usize,
@@ -721,23 +754,20 @@ pub unsafe fn dispatch(
                 cleanup: handler.cleanup,
                 created: Instant::now(),
             },
-        )
+        );
+        if write_frame_locked(&mut writer, req_id, method_id, payload) {
+            (displaced, None)
+        } else {
+            // The frame never left: no response can arrive. Drop the pending
+            // entry now instead of holding the slot until the TTL sweep.
+            (displaced, pending.remove(&req_id))
+        }
     };
     if let Some(old) = displaced {
         cleanup_pending(old);
     }
-
-    if !write_frame(rt, req_id, method_id, payload) {
-        // The frame never left: no response can arrive. Drop the pending entry
-        // now instead of holding the slot until the TTL sweep. Same lock-discipline
-        // as above: release rt.pending before waking the future via cleanup.
-        let removed: Option<Pending> = {
-            let mut pending = lock_or_recover(&rt.pending);
-            pending.remove(&req_id)
-        };
-        if let Some(p) = removed {
-            cleanup_pending(p);
-        }
+    if let Some(p) = write_failed {
+        cleanup_pending(p);
     }
 }
 
@@ -936,8 +966,18 @@ fn build_frame(req_id: u64, method_id: u32, payload: &[u8]) -> Vec<u8> {
 /// loop while the reactor (which only probes child liveness on idle) keeps the
 /// broken connection. In-flight futures are released by `drop_all_pending`.
 fn write_frame(rt: &Runtime, req_id: u64, method_id: u32, payload: &[u8]) -> bool {
-    let frame = build_frame(req_id, method_id, payload);
     let mut writer = lock_or_recover(&rt.writer);
+    write_frame_locked(&mut writer, req_id, method_id, payload)
+}
+
+/// Write a frame while the caller already holds `rt.writer`.
+///
+/// Dispatch uses this to make "insert pending" and "write frame" one critical
+/// section with reconnect's writer swap. Otherwise reconnect could drain
+/// pending between the insert and the write, wake the future with an error and
+/// still send the request on the new connection.
+fn write_frame_locked(writer: &mut IpcStream, req_id: u64, method_id: u32, payload: &[u8]) -> bool {
+    let frame = build_frame(req_id, method_id, payload);
     match writer.write_all(&frame).and_then(|_| writer.flush()) {
         Ok(()) => true,
         Err(e) => {
@@ -950,14 +990,20 @@ fn write_frame(rt: &Runtime, req_id: u64, method_id: u32, payload: &[u8]) -> boo
     }
 }
 
+/// Take every pending entry out of the map without cleaning it up. The caller
+/// must run `cleanup_pending` for each entry after releasing the locks it holds
+/// (cleanup wakes futures and may re-enter the runtime).
+fn take_all_pending(rt: &Runtime) -> Vec<Pending> {
+    lock_or_recover(&rt.pending)
+        .drain()
+        .map(|(_, p)| p)
+        .collect()
+}
+
 /// Remove every pending entry and release its slot. Called when the transport
 /// dies: no late response can arrive on a dead connection.
 fn drop_all_pending(rt: &Runtime) {
-    let stale: Vec<Pending> = lock_or_recover(&rt.pending)
-        .drain()
-        .map(|(_, p)| p)
-        .collect();
-    for p in stale {
+    for p in take_all_pending(rt) {
         cleanup_pending(p);
     }
 }
@@ -1027,19 +1073,30 @@ fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
             *lock_or_recover(&rt.child) = Some(child);
             return false; // caller's loop re-enters and connects to the fresh child
         }
-        if let Some(stream) = connect_with_retry(&rt.endpoint, Duration::from_millis(500)) {
+        if let Some(mut stream) = connect_with_retry(&rt.endpoint, Duration::from_millis(500)) {
             match stream.try_clone() {
-                Ok(r) => {
-                    let _ = stream.set_write_timeout(Duration::from_secs(30));
-                    let _ = r.set_read_timeout(Duration::from_secs(300));
-                    // Swap both ends while holding the writer lock. write_frame
-                    // takes the same lock, so a concurrent dispatch cannot slip
-                    // a request onto the old stream in the gap between replacing
-                    // the reactor's reader and the shared writer (which would
-                    // leave that response unread until TTL expiry).
-                    let mut writer = lock_or_recover(&rt.writer);
-                    *writer = stream;
-                    *reader = r;
+                Ok(mut r) => {
+                    if let Err(e) = set_stream_timeouts(&mut stream, &mut r) {
+                        eprintln!("rust2go-ipc: cannot set reconnected stream timeouts: {e}");
+                        return false;
+                    }
+                    // Swap both ends while holding the writer lock, and drain
+                    // pending in the same critical section. The reactor already
+                    // called drop_all_pending before entering reconnect, but a
+                    // dispatch may have inserted a request during connect; its
+                    // frame went to the old stream, whose reader is about to be
+                    // dropped. Cleanup must happen AFTER releasing the writer
+                    // lock because it wakes futures that can re-enter dispatch.
+                    let stale = {
+                        let mut writer = lock_or_recover(&rt.writer);
+                        let stale = take_all_pending(rt);
+                        *writer = stream;
+                        *reader = r;
+                        stale
+                    };
+                    for p in stale {
+                        cleanup_pending(p);
+                    }
                     return true;
                 }
                 Err(e) => eprintln!("rust2go-ipc: cannot clone reconnected stream: {e}"),
