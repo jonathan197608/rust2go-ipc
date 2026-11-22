@@ -2,6 +2,18 @@ use super::*;
 use std::mem::align_of;
 
 #[test]
+fn child_pid_keeps_full_u32_range() {
+    // Windows pids can exceed i32::MAX. The atexit hook must see the exact u32
+    // value so taskkill targets the right process; storing as AtomicI32 would
+    // sign-flip and the `pid > 0` guard would skip the kill entirely.
+    let high_pid: u32 = 0xF000_0000;
+    CHILD_PID.store(high_pid, Ordering::SeqCst);
+    assert_eq!(CHILD_PID.load(Ordering::SeqCst), high_pid);
+    // Restore the sentinel so this test cannot affect others.
+    CHILD_PID.store(0, Ordering::SeqCst);
+}
+
+#[test]
 #[should_panic(expected = "decode out of bounds")]
 fn decoder_prim_panics_on_truncation() {
     let mut dec = Decoder::new(&[0x01, 0x02]);

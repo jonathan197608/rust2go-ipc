@@ -18,7 +18,7 @@ use std::{
     ptr::null,
     slice::from_raw_parts,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Mutex, Once, OnceLock,
     },
     thread::{self, sleep},
@@ -406,7 +406,7 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 /// The child's pid, recorded at spawn time (before `RUNTIME` is populated) so
 /// the atexit hook can still kill it during the OnceLock initialization window.
 /// 0 means either no child yet or already reaped.
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 /// Serialises child reap/spawn between the atexit hook and the reactor so a
 /// newly spawned child can never slip in after the hook has already reaped.
 static CHILD_MGMT: Mutex<()> = Mutex::new(());
@@ -434,25 +434,36 @@ extern "C" fn cleanup_on_exit() {
         // readiness loop runs inside the closure -- so both platforms must kill
         // by the pid recorded at spawn time. The process is exiting anyway; the
         // OS reaps the orphan and the Go side removes any stale socket.
+        let pid = CHILD_PID.swap(0, Ordering::SeqCst);
         #[cfg(unix)]
-        {
-            let pid = CHILD_PID.swap(0, Ordering::SeqCst);
-            if pid > 0 {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
+        if pid > 0 && pid <= i32::MAX as u32 {
+            // libc::kill takes i32; a pid above i32::MAX (not possible with
+            // normal Linux pid_max, but guard anyway) would wrap negative and
+            // turn into a process-group kill. Skip it instead.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
             }
         }
         #[cfg(not(unix))]
-        {
-            let pid = CHILD_PID.swap(0, Ordering::SeqCst);
-            if pid > 0 {
-                // Terminate the whole tree: taskkill /T covers any children the
-                // Go server spawned. Ignore errors (process may have exited).
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .status();
-            }
+        if pid > 0 {
+            // Terminate the whole tree: taskkill /T covers any children the Go
+            // server spawned. Use an absolute System32 path so a same-named
+            // executable in the (possibly user-writable) CWD cannot hijack the
+            // call, and null stdio so a full inherited pipe cannot block exit.
+            // Ignore errors (process may have already exited). This runs while
+            // CHILD_MGMT is held, so keep it non-blocking.
+            let taskkill = std::env::var_os("SystemRoot")
+                .map(|root| {
+                    std::path::Path::new(&root)
+                        .join("System32")
+                        .join("taskkill.exe")
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\taskkill.exe"));
+            let _ = std::process::Command::new(taskkill)
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
     }
 }
@@ -486,7 +497,7 @@ fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"));
     // Record the pid immediately, before the caller stores the Child handle,
     // so atexit can still kill it during the OnceLock initialization window.
-    CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+    CHILD_PID.store(child.id(), Ordering::SeqCst);
     child
 }
 
