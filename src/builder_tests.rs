@@ -449,3 +449,30 @@ trait T { fn f(w: Wrapper) -> bool; }
     // Must still generate parseable Rust/Go (no panic, valid syntax).
     syn::parse_file(&generate_rust_bindings(&schema, 1).to_string()).unwrap();
 }
+
+#[test]
+#[should_panic(expected = "parameter name `__r2g_flatten_R` conflicts")]
+fn generated_prefix_param_name_is_rejected() {
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct R { pub ok: bool }
+#[r2g]
+trait T { fn f(__r2g_flatten_R: R) -> bool; }
+"#;
+    parse_schema(src);
+}
+
+#[test]
+fn dec_and_handler_param_names_are_allowed() {
+    // dec lives in the trampoline's separate scope; handler is declared after
+    // flatten consumes the parameters. Neither collides, so both are legal.
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct R { pub ok: bool }
+#[r2g]
+trait T { fn f(dec: R, handler: R) -> bool; }
+"#;
+    let schema = parse_schema(src);
+    assert_eq!(schema.methods.len(), 1);
+    syn::parse_file(&generate_rust_bindings(&schema, 1).to_string()).unwrap();
+}

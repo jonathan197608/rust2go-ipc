@@ -453,9 +453,9 @@ fn parse_schema(src: &str) -> Schema {
                 };
                 validate_ident(&pname, "parameter");
                 assert!(
-                    !RESERVED_PARAM_NAMES.contains(&pname.as_str()),
-                    "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier ({}); rename it",
-                    RESERVED_PARAM_NAMES.join(", ")
+                    !RESERVED_PARAM_NAMES.contains(&pname.as_str())
+                        && !pname.starts_with(GENERATED_IDENT_PREFIX),
+                    "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier; rename it"
                 );
                 let (ty, is_reference) = strip_reference(&p.ty);
                 let _ = is_reference;
@@ -686,12 +686,17 @@ fn check_supported(kind: &FieldKind, ctx: &str, structs: &HashSet<String>) {
     }
 }
 
-/// Bare identifiers introduced by generated Rust stubs. A user parameter with
-/// one of these names would collide with generated code: `slot`/`cb` duplicate
-/// the appended callback parameters, `enc` is shadowed by the encoder local
-/// before flatten expressions run, and `handler`/`dec` are stub locals. Reject
-/// at build time with a clear message instead of emitting uncompilable Rust.
-const RESERVED_PARAM_NAMES: &[&str] = &["enc", "dec", "slot", "cb", "handler"];
+/// Bare identifiers introduced by generated Rust stubs that a user parameter
+/// name would collide with: `slot`/`cb` duplicate the appended callback
+/// parameters, `enc` is shadowed by the encoder local before flatten runs.
+/// (`dec`/`handler` live in separate scopes or are declared after the flatten
+/// statements consume the parameters, so they are deliberately not reserved.)
+/// Reject at build time instead of emitting uncompilable Rust.
+const RESERVED_PARAM_NAMES: &[&str] = &["enc", "slot", "cb"];
+/// The generator emits `__r2g_*` bindings and helper calls inside the same
+/// stub scope as user parameters. A parameter using that prefix (e.g.
+/// `__r2g_flatten_Foo`) would shadow a helper function and break compilation.
+const GENERATED_IDENT_PREFIX: &str = "__r2g_";
 
 fn validate_ident(name: &str, what: &str) {
     const RUST: &[&str] = &[

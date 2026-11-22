@@ -130,7 +130,8 @@ func serve(conn net.Conn) {
 	done := make(chan struct{})
 	// Reusable timer for the semaphore-wait timeout. time.After(60s) allocated
 	// a fresh timer per request that stayed live until it fired, piling up
-	// under bursts. Stop+drain before Reset keeps this safe on Go < 1.23 too.
+	// under bursts. Stop+drain before Reset avoids stacking timers; the project
+	// requires Go >= 1.23, where the synchronous timer channel makes this exact.
 	semWait := time.NewTimer(0)
 	if !semWait.Stop() {
 		select {

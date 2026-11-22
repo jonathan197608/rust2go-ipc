@@ -582,6 +582,10 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
             .name("rust2go-ipc-reactor".to_string())
             .spawn(move || reactor_loop(reader, rt))
         {
+            // Take CHILD_MGMT so every reap runs under the same lock the atexit
+            // hook uses, keeping the invariant uniform even though RUNTIME is
+            // not published yet here (so no concurrent reap is possible).
+            let _mgmt = lock_or_recover(&CHILD_MGMT);
             reap_child(rt);
             panic!("rust2go-ipc: cannot spawn reactor thread: {e}");
         }
@@ -678,11 +682,15 @@ pub unsafe fn dispatch(
     // pending entry: build_frame's assert runs later on the write path, and a
     // panic there would skip the pending cleanup below, leaking the slot until
     // the TTL sweep (10 min). Failing early keeps the pending map untouched.
-    assert!(
-        payload.len() <= MAX_PAYLOAD,
-        "rust2go-ipc: request payload too large ({})",
-        payload.len()
-    );
+    // The upstream stub has already handed SlotWriter ownership to us via its
+    // raw pointer, so on this early panic we must release it ourselves — else
+    // the slot leaks permanently (no pending entry means no sweep/cleanup).
+    if payload.len() > MAX_PAYLOAD {
+        if let Some(cleanup) = handler.cleanup {
+            unsafe { cleanup(slot) };
+        }
+        panic!("rust2go-ipc: request payload too large ({})", payload.len());
+    }
     let rt = runtime(server, port);
     sweep_pending(rt);
     let req_id = next_req_id(rt);
@@ -802,14 +810,22 @@ pub unsafe fn dispatch_sync(
 }
 
 /// Read exactly `buf.len()` bytes, preserving the reactor's idle-timeout
-/// protocol: a timeout before ANY byte is consumed stays a TimedOut/WouldBlock
-/// (the reactor probes child liveness and `continue`s). A timeout after a
-/// partial read is upgraded to InvalidData, because the stream is now
-/// desynchronised and continuing would parse frame bytes as a new header.
-fn read_exact_frame<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
-    let mut off = 0usize;
-    while off < buf.len() {
-        match reader.read(&mut buf[off..]) {
+/// protocol: a timeout before ANY byte of the whole frame is consumed stays a
+/// TimedOut/WouldBlock (the reactor probes child liveness and `continue`s). A
+/// timeout after a partial read is upgraded to InvalidData, because the stream
+/// is now desynchronised and continuing would parse frame bytes as a new header.
+///
+/// `frame_offset` is the number of frame bytes already consumed by earlier
+/// calls (the 19-byte header). It must be passed for the payload segment so a
+/// header-then-stall is recognised as mid-frame even if no payload byte landed.
+fn read_exact_frame<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    frame_offset: usize,
+) -> io::Result<()> {
+    let mut off = frame_offset;
+    while off < frame_offset + buf.len() {
+        match reader.read(&mut buf[off - frame_offset..]) {
             Ok(0) => {
                 return Err(IoError::new(
                     ErrorKind::UnexpectedEof,
@@ -838,7 +854,7 @@ fn read_exact_frame<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
 
 fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
     let mut header = [0u8; 19];
-    read_exact_frame(reader, &mut header)?;
+    read_exact_frame(reader, &mut header, 0)?;
     if header[..4] != MAGIC {
         return Err(IoError::new(ErrorKind::InvalidData, "bad response magic"));
     }
@@ -859,7 +875,10 @@ fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
         ));
     }
     let mut payload = vec![0u8; len];
-    read_exact_frame(reader, &mut payload)?;
+    // The 19-byte header was already consumed. If the payload stalls before
+    // its first byte, that is still mid-frame (not an idle tick): passing 19
+    // makes the timeout upgrade to InvalidData so the reactor resyncs.
+    read_exact_frame(reader, &mut payload, 19)?;
     Ok((req_id, status, payload))
 }
 
@@ -946,7 +965,11 @@ fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
             .unwrap_or(false);
         if !alive {
             reap_child(rt);
-            let child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+            // CHILD_MGMT is already held above: use the caller-must-hold-lock
+            // variant, otherwise spawn_server's internal lock re-enters the
+            // same non-reentrant Mutex and deadlocks the reactor (and the
+            // atexit hook waiting on it).
+            let child = spawn_server_locked(&rt.server, rt.port, &rt.endpoint);
             *lock_or_recover(&rt.child) = Some(child);
         }
     }
@@ -978,7 +1001,9 @@ fn reconnect(rt: &Runtime, reader: &mut IpcStream) -> bool {
                 return false;
             }
             reap_child(rt);
-            let child = spawn_server(&rt.server, rt.port, &rt.endpoint);
+            // CHILD_MGMT already held above (line 976): use the locked variant
+            // to avoid re-entering the non-reentrant Mutex.
+            let child = spawn_server_locked(&rt.server, rt.port, &rt.endpoint);
             *lock_or_recover(&rt.child) = Some(child);
             return false; // caller's loop re-enters and connects to the fresh child
         }

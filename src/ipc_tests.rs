@@ -162,7 +162,7 @@ fn read_exact_frame_idle_timeout_stays_timed_out() {
         then_timeout: true,
     };
     let mut buf = [0u8; 19];
-    let err = read_exact_frame(&mut r, &mut buf).unwrap_err();
+    let err = read_exact_frame(&mut r, &mut buf, 0).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::TimedOut);
 }
 
@@ -176,7 +176,21 @@ fn read_exact_frame_mid_frame_timeout_becomes_invalid_data() {
         then_timeout: true,
     };
     let mut buf = [0u8; 19];
-    let err = read_exact_frame(&mut r, &mut buf).unwrap_err();
+    let err = read_exact_frame(&mut r, &mut buf, 0).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn read_exact_frame_payload_stall_after_header_is_invalid_data() {
+    // The 19-byte header is already consumed (frame_offset=19). A timeout
+    // before the first payload byte must still be InvalidData, otherwise the
+    // reactor treats it as an idle tick and parses payload bytes as a header.
+    let mut r = ChunkReader {
+        chunks: vec![],
+        then_timeout: true,
+    };
+    let mut buf = [0u8; 8];
+    let err = read_exact_frame(&mut r, &mut buf, 19).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidData);
 }
 
@@ -187,7 +201,7 @@ fn read_exact_frame_eof_mid_frame_is_unexpected_eof() {
         then_timeout: false,
     };
     let mut buf = [0u8; 19];
-    let err = read_exact_frame(&mut r, &mut buf).unwrap_err();
+    let err = read_exact_frame(&mut r, &mut buf, 0).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
 }
 
@@ -198,6 +212,6 @@ fn read_exact_frame_full_read_succeeds() {
         then_timeout: true,
     };
     let mut buf = [0u8; 5];
-    read_exact_frame(&mut r, &mut buf).unwrap();
+    read_exact_frame(&mut r, &mut buf, 0).unwrap();
     assert_eq!(buf, [1, 2, 3, 4, 5]);
 }
