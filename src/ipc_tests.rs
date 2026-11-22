@@ -256,3 +256,14 @@ fn decoder_depth_enter_leave_is_balanced() {
         dec.enter();
     }
 }
+
+#[test]
+#[should_panic(expected = "payload too large")]
+fn oneway_oversized_payload_panics_before_initializing_runtime() {
+    // The guard must run before runtime() so an oversized oneway payload cannot
+    // panic while holding the global writer mutex (which would poison it).
+    // A bogus server path proves runtime() is never reached: if it were, spawn
+    // would fail with a different error instead of our payload message.
+    let huge = vec![0u8; MAX_PAYLOAD + 1];
+    dispatch_oneway("/nonexistent/rust2go-ipc-test.sock", 0, 1, &huge);
+}

@@ -614,3 +614,59 @@ fn restore_helpers_guard_recursion_depth() {
         "Go decoder must define the depth limit"
     );
 }
+
+#[test]
+fn option_fields_generate_consistent_wire() {
+    // Option<T> is the only type reinterpreted as a 0/1-element list on the
+    // wire but restored as Option<T> on the Rust owned side. Four separate
+    // builder branches (classify / rust_owned_path / go_type / go_restore_expr)
+    // cooperate here; lock them down together so a regression in any one is
+    // caught even though no cross-language round-trip fixture exercises it.
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct Inner { pub v: i32 }
+#[derive(R2G, Default)]
+pub struct Req {
+    pub maybe_string: Option<String>,
+    pub maybe_struct: Option<Inner>,
+    pub maybe_int: Option<i64>,
+}
+#[r2g]
+trait T {
+    fn f(r: Req) -> Option<String>;
+    fn g(r: Req) -> Option<Inner>;
+}
+"#;
+    let schema = parse_schema(src);
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    let compact: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("::std::option::Option<::std::string::String>"),
+        "Option<String> owned return slot missing in generated Rust:\n{rust}"
+    );
+    assert!(
+        compact.contains("option::Option<Inner>")
+            || compact.contains("option::Option<super::Inner>"),
+        "Option<struct> owned return slot missing in generated Rust:\n{rust}"
+    );
+    syn::parse_file(&rust).expect("generated Rust must parse");
+
+    let go = generate_go_sources(&schema);
+    // On the Go side every Option degrades to a slice: []string / []Inner / []int64.
+    assert!(
+        go.contains("[]string"),
+        "Option<String> must map to []string in Go"
+    );
+    assert!(
+        go.contains("[]Inner"),
+        "Option<struct> must map to []Inner in Go"
+    );
+    assert!(
+        go.contains("[]int64"),
+        "Option<i64> must map to []int64 in Go"
+    );
+    assert!(
+        go.contains("stringList(d)"),
+        "Option<String> must use the minimal-width string list decoder"
+    );
+}

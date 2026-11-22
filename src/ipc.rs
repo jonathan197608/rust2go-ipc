@@ -954,6 +954,15 @@ fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
 /// server must be running for the frame to be delivered, but that is a
 /// liveness concern, not a memory-safety one.
 pub fn dispatch_oneway(server: &str, port: u16, method_id: u32, payload: &[u8]) {
+    // Mirror the oversized-payload guard of `dispatch`/`dispatch_sync`, but run
+    // it BEFORE `runtime()` so the panic cannot happen while holding the global
+    // writer mutex (build_frame's assert would otherwise poison it). oneway has
+    // no slot to clean up, so there is no further bookkeeping to undo.
+    assert!(
+        payload.len() <= MAX_PAYLOAD,
+        "rust2go-ipc: request payload too large ({})",
+        payload.len()
+    );
     let rt = runtime(server, port);
     let _ = write_frame(rt, 0, method_id, payload);
 }
