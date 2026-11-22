@@ -23,10 +23,24 @@ fn decoder_accepts_valid_bool() {
 }
 
 #[test]
-#[should_panic(expected = "decode out of bounds")]
+#[should_panic(expected = "string length")]
 fn decoder_string_rejects_huge_len() {
-    // u64 len = 0xFFFF_FFFF_FFFF_FFFF, no payload follows.
+    // u64 len = 0xFFFF_FFFF_FFFF_FFFF, no payload follows. The length is now
+    // validated in the u64 domain before narrowing to usize (32-bit safety).
     let mut dec = Decoder::new(&[0xff; 8]);
+    let _ = dec.string();
+}
+
+#[test]
+#[should_panic(expected = "string length")]
+fn decoder_string_rejects_len_above_usize_max_even_with_payload() {
+    // On a 64-bit host this exercises the u64-domain guard directly; on a
+    // 32-bit host it additionally proves no wraparound to a small len occurs.
+    // 8-byte header declares 0x1_0000_0000 bytes, then one trailing byte.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0x1_0000_0000u64.to_le_bytes());
+    buf.push(0x41);
+    let mut dec = Decoder::new(&buf);
     let _ = dec.string();
 }
 
@@ -214,4 +228,31 @@ fn read_exact_frame_full_read_succeeds() {
     let mut buf = [0u8; 5];
     read_exact_frame(&mut r, &mut buf, 0).unwrap();
     assert_eq!(buf, [1, 2, 3, 4, 5]);
+}
+
+#[test]
+#[should_panic(expected = "restore nesting exceeds")]
+fn decoder_depth_guard_stops_runaway_recursion() {
+    // Simulates the generated restore helper's enter() on every level. Without
+    // the guard, a self-referential schema could recurse until stack overflow
+    // (a fatal abort that catch_unwind cannot intercept).
+    let mut dec = Decoder::new(&[]);
+    for _ in 0..=MAX_RESTORE_DEPTH {
+        dec.enter();
+    }
+}
+
+#[test]
+fn decoder_depth_enter_leave_is_balanced() {
+    let mut dec = Decoder::new(&[]);
+    for _ in 0..MAX_RESTORE_DEPTH {
+        dec.enter();
+    }
+    for _ in 0..MAX_RESTORE_DEPTH {
+        dec.leave();
+    }
+    // Back to zero: a fresh restore chain may use the full budget again.
+    for _ in 0..MAX_RESTORE_DEPTH {
+        dec.enter();
+    }
 }

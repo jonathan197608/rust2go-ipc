@@ -541,3 +541,76 @@ trait T { fn f(dec: R, handler: R) -> bool; }
     assert_eq!(schema.methods.len(), 1);
     syn::parse_file(&generate_rust_bindings(&schema, 1).to_string()).unwrap();
 }
+
+#[test]
+fn all_primitive_types_generate_wire_accessors() {
+    // Every primitive maps to a distinct Go dec accessor / primList element
+    // type. Lock all of them down so a regression in any dispatch arm is caught
+    // without needing a full cross-language round trip.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct AllPrims {
+    pub a: i8, pub b: i16, pub c: i32, pub d: i64,
+    pub e: u8, pub f: u16, pub g: u32, pub h: u64,
+    pub i: f32, pub j: f64, pub k: bool, pub l: char,
+    pub m: usize, pub n: isize,
+    pub ints: Vec<i32>, pub floats: Vec<f64>, pub usizes: Vec<usize>,
+}
+#[r2g]
+trait T { fn echo(p: AllPrims) -> AllPrims; }
+"#,
+    );
+    let go = generate_go_sources(&schema);
+    for needle in [
+        "d.i8()",
+        "d.i16()",
+        "d.i32()",
+        "d.i64()",
+        "d.u8()",
+        "d.u16()",
+        "d.u32()",
+        "d.u64()",
+        "d.f32()",
+        "d.f64()",
+        "d.boolean()",
+        "primList[int32](d)",
+        "primList[float64](d)",
+        "primList[uint](d)",
+    ] {
+        assert!(go.contains(needle), "missing Go accessor {needle}");
+    }
+    // The generic decodePrims/enc.put dispatch tables must cover all widths.
+    let main = generate_go_main();
+    let _ = main; // prefix lives in gen.go, checked via go string above
+    assert!(go.contains("case int8:"), "decodePrims missing int8");
+    assert!(go.contains("case uint64:"), "decodePrims missing uint64");
+    assert!(go.contains("case float32:"), "decodePrims missing float32");
+    assert!(go.contains("case float64:"), "decodePrims missing float64");
+
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    syn::parse_file(&rust).expect("generated Rust must parse");
+}
+
+#[test]
+fn restore_helpers_guard_recursion_depth() {
+    // Every generated restore helper (Rust and Go) must enter/leave a depth
+    // counter so a self-referential schema or a hostile frame cannot recurse
+    // past MAX_RESTORE_DEPTH and overflow the stack.
+    let schema = parse_schema(NESTED_SCHEMA);
+    let rust = generate_rust_bindings(&schema, 1234).to_string();
+    assert!(
+        (rust.contains("dec.enter()") || rust.contains("dec . enter ()"))
+            && (rust.contains("dec.leave()") || rust.contains("dec . leave ()")),
+        "generated Rust restore helpers must guard recursion depth:\n{rust}"
+    );
+    let go = generate_go_sources(&schema);
+    assert!(
+        go.contains("d.enter()") && go.contains("d.leave()"),
+        "generated Go restore helpers must guard recursion depth"
+    );
+    assert!(
+        go.contains("const maxRestoreDepth = 64"),
+        "Go decoder must define the depth limit"
+    );
+}

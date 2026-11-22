@@ -190,11 +190,27 @@ func (e *enc) put(v any) {
 	}
 }
 
+// maxRestoreDepth mirrors MAX_RESTORE_DEPTH in the Rust runtime. Generated
+// restore helpers call enter/leave around their body; a self-referential schema
+// or hostile frame cannot recurse past this and overflow the Go stack (a fatal
+// error that recover() cannot intercept).
+const maxRestoreDepth = 64
+
 type dec struct {
-	b   []byte
-	p   int
-	err bool
+	b     []byte
+	p     int
+	err   bool
+	depth int
 }
+
+func (d *dec) enter() {
+	d.depth++
+	if d.depth > maxRestoreDepth {
+		d.err = true
+		panic("rust2go-ipc: restore nesting too deep")
+	}
+}
+func (d *dec) leave() { d.depth-- }
 
 func (d *dec) take(n int) []byte {
 	if n < 0 || n > len(d.b)-d.p {
@@ -368,10 +384,12 @@ func flattenEmptyRequest(v *EmptyRequest, e *enc) {
 }
 
 func restoreEmptyRequestRef(d *dec) EmptyRequestRef {
+	d.enter()
 	var r EmptyRequestRef
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -419,11 +437,13 @@ func flattenHashRequest(v *HashRequest, e *enc) {
 }
 
 func restoreHashRequestRef(d *dec) HashRequestRef {
+	d.enter()
 	var r HashRequestRef
 	r.message = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -471,11 +491,13 @@ func flattenHashResponse(v *HashResponse, e *enc) {
 }
 
 func restoreHashResponseRef(d *dec) HashResponseRef {
+	d.enter()
 	var r HashResponseRef
 	r.hash = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -525,12 +547,14 @@ func flattenNestedItem(v *NestedItem, e *enc) {
 }
 
 func restoreNestedItemRef(d *dec) NestedItemRef {
+	d.enter()
 	var r NestedItemRef
 	r.tag = d.str()
 	r.value = d.i32()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -600,6 +624,7 @@ func flattenListRequest(v *ListRequest, e *enc) {
 }
 
 func restoreListRequestRef(d *dec) ListRequestRef {
+	d.enter()
 	var r ListRequestRef
 	r.raw = primList[uint8](d)
 	r.names = stringList(d)
@@ -610,6 +635,7 @@ func restoreListRequestRef(d *dec) ListRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -679,6 +705,7 @@ func flattenListResponse(v *ListResponse, e *enc) {
 }
 
 func restoreListResponseRef(d *dec) ListResponseRef {
+	d.enter()
 	var r ListResponseRef
 	r.raw = primList[uint8](d)
 	r.names = stringList(d)
@@ -689,6 +716,7 @@ func restoreListResponseRef(d *dec) ListResponseRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 

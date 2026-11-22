@@ -22,6 +22,7 @@ const version = uint16(1)
 // strconv.IntSize/64 - 1 is 0 on 64-bit (valid [0]struct{}) and -1 on 32-bit
 // (invalid array length), with no runtime cost.
 const _require64bitGoTarget = strconv.IntSize/64 - 1
+
 var _ [_require64bitGoTarget]struct{}
 
 const maxAcceptErrs = 10

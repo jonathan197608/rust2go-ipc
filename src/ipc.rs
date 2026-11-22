@@ -38,6 +38,12 @@ const SWEEP_INTERVAL: u64 = 30;
 /// A hung Go handler must not block a synchronous business thread for the
 /// async-scale TTL; sync calls get a shorter, independent timeout.
 const DEFAULT_SYNC_TIMEOUT: u64 = 30;
+/// A self-referential struct (e.g. `Node { children: Vec<Node> }`) is legal Rust
+/// but produces unbounded mutual recursion in the generated restore helpers.
+/// A corrupt/hostile 64MB frame could otherwise drive millions of nested calls
+/// and overflow the stack — which `catch_unwind` cannot catch (it aborts). Both
+/// the Rust `Decoder` and the Go `dec` enforce this same limit symmetrically.
+const MAX_RESTORE_DEPTH: u32 = 64;
 
 const ENV_SERVER_OVERRIDE: &str = "RUST2GO_IPC_SERVER_OVERRIDE";
 const ENV_SYNC_TIMEOUT: &str = "RUST2GO_IPC_SYNC_TIMEOUT_SECS";
@@ -810,8 +816,18 @@ pub unsafe fn dispatch_sync(
     let Some(mut stream) = connect_with_retry(&rt.endpoint, Duration::from_secs(10)) else {
         panic!("rust2go-ipc: sync call to method {method_id} failed: cannot connect to Go server");
     };
-    let _ = stream.set_read_timeout(Duration::from_secs(sync_timeout_secs()));
-    let _ = stream.set_write_timeout(Duration::from_secs(30));
+    // A silent timeout failure would leave this blocking read unbounded: the
+    // sync stub has no error channel, so a wedged server would hang the caller
+    // forever. Fail fast with the same descriptive panic used for the rest of
+    // the sync path (startup/reconnect already treat this as fatal).
+    if let Err(e) = stream.set_read_timeout(Duration::from_secs(sync_timeout_secs())) {
+        panic!("rust2go-ipc: sync call to method {method_id} failed: cannot set read timeout: {e}");
+    }
+    if let Err(e) = stream.set_write_timeout(Duration::from_secs(30)) {
+        panic!(
+            "rust2go-ipc: sync call to method {method_id} failed: cannot set write timeout: {e}"
+        );
+    }
     let frame = build_frame(req_id, method_id, payload);
     if let Err(e) = stream.write_all(&frame).and_then(|_| stream.flush()) {
         panic!("rust2go-ipc: sync call to method {method_id} failed: cannot write request: {e}");
@@ -1299,6 +1315,7 @@ impl Arena {
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: u32,
     pub arena: Arena,
 }
 
@@ -1307,8 +1324,26 @@ impl<'a> Decoder<'a> {
         Self {
             buf,
             pos: 0,
+            depth: 0,
             arena: Arena::new(),
         }
+    }
+
+    /// Enter one level of struct/Ref restoration. Generated `restore` helpers
+    /// call this on entry and [`leave`](Self::leave) on return; a self-referential
+    /// schema or a hostile frame cannot recurse past [`MAX_RESTORE_DEPTH`] and
+    /// overflow the stack (a fatal abort that `catch_unwind` cannot intercept).
+    pub fn enter(&mut self) {
+        self.depth += 1;
+        assert!(
+            self.depth <= MAX_RESTORE_DEPTH,
+            "rust2go-ipc: restore nesting exceeds {MAX_RESTORE_DEPTH} levels"
+        );
+    }
+
+    /// Leave one restoration level. Paired with [`enter`](Self::enter).
+    pub fn leave(&mut self) {
+        self.depth -= 1;
     }
 
     /// Consume `n` bytes with checked arithmetic and an explicit bounds check.
@@ -1338,7 +1373,16 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn string(&mut self) -> RawStringRef {
-        let len = self.prim::<u64>() as usize;
+        // Validate in the wire's u64 domain BEFORE narrowing to usize. A
+        // corrupt/forged frame carrying len > usize::MAX on a 32-bit target
+        // would otherwise wrap to a small value and desynchronise every
+        // subsequent field (checked take() prevents OOB but not wrong data).
+        let len64 = self.prim::<u64>();
+        assert!(
+            len64 <= self.buf.len() as u64,
+            "rust2go-ipc: string length {len64} exceeds remaining bytes"
+        );
+        let len = len64 as usize;
         if len == 0 {
             return RawStringRef {
                 ptr: null(),
@@ -1353,13 +1397,16 @@ impl<'a> Decoder<'a> {
     /// Read a list length and bound it by the minimum wire width of one
     /// element, so a corrupt count cannot drive an unbounded allocation.
     pub fn list_len_min(&mut self, min_width: usize) -> usize {
-        let n = self.prim::<u64>() as usize;
+        // Same u64-domain validation as string(): narrow only after proving
+        // the count fits both usize and the remaining wire bytes, so a 32-bit
+        // target cannot wrap a huge count into a passing bounds check.
+        let n64 = self.prim::<u64>();
         let max = self.buf.len().saturating_sub(self.pos) / min_width.max(1);
         assert!(
-            n <= max,
-            "rust2go-ipc: list length {n} exceeds {max} remaining elements"
+            n64 <= max as u64,
+            "rust2go-ipc: list length {n64} exceeds {max} remaining elements"
         );
-        n
+        n64 as usize
     }
 
     /// Bound by the size of the restored Ref element (`RawStringRef` / custom

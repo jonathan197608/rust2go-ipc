@@ -1146,7 +1146,11 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
         out.extend(quote! {
             #[allow(non_snake_case, clippy::all, unused_variables)]
             unsafe fn #name(dec: &mut ::rust2go::ipc::Decoder<'_>) -> #st_name {
-                #st_name { #(#fields)* }
+                // Bound recursion for self-referential schemas / hostile frames.
+                dec.enter();
+                let restored = #st_name { #(#fields)* };
+                dec.leave();
+                restored
             }
         });
     }
@@ -1486,7 +1490,7 @@ fn generate_go_sources(schema: &Schema) -> String {
         s.push_str("}\n\n");
 
         s.push_str(&format!(
-            "func restore{}Ref(d *dec) {}Ref {{\n\tvar r {}Ref\n",
+            "func restore{}Ref(d *dec) {}Ref {{\n\td.enter()\n\tvar r {}Ref\n",
             st.name, st.name, st.name
         ));
         for f in &st.fields {
@@ -1496,7 +1500,7 @@ fn generate_go_sources(schema: &Schema) -> String {
                 go_restore_expr(&f.ty, "d", &widths)
             ));
         }
-        s.push_str("\tif d.err { panic(\"rust2go-ipc: invalid payload\") }\n\treturn r\n}\n\n");
+        s.push_str("\tif d.err { panic(\"rust2go-ipc: invalid payload\") }\n\td.leave()\n\treturn r\n}\n\n");
 
         let size = widths.get(&st.name).copied().unwrap_or(1).to_string();
         s.push_str(&format!(

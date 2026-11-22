@@ -163,11 +163,27 @@ func (e *enc) put(v any) {
 	}
 }
 
+// maxRestoreDepth mirrors MAX_RESTORE_DEPTH in the Rust runtime. Generated
+// restore helpers call enter/leave around their body; a self-referential schema
+// or hostile frame cannot recurse past this and overflow the Go stack (a fatal
+// error that recover() cannot intercept).
+const maxRestoreDepth = 64
+
 type dec struct {
-	b   []byte
-	p   int
-	err bool
+	b     []byte
+	p     int
+	err   bool
+	depth int
 }
+
+func (d *dec) enter() {
+	d.depth++
+	if d.depth > maxRestoreDepth {
+		d.err = true
+		panic("rust2go-ipc: restore nesting too deep")
+	}
+}
+func (d *dec) leave() { d.depth-- }
 
 func (d *dec) take(n int) []byte {
 	if n < 0 || n > len(d.b)-d.p {

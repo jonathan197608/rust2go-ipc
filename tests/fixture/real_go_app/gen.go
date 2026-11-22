@@ -190,11 +190,27 @@ func (e *enc) put(v any) {
 	}
 }
 
+// maxRestoreDepth mirrors MAX_RESTORE_DEPTH in the Rust runtime. Generated
+// restore helpers call enter/leave around their body; a self-referential schema
+// or hostile frame cannot recurse past this and overflow the Go stack (a fatal
+// error that recover() cannot intercept).
+const maxRestoreDepth = 64
+
 type dec struct {
-	b   []byte
-	p   int
-	err bool
+	b     []byte
+	p     int
+	err   bool
+	depth int
 }
+
+func (d *dec) enter() {
+	d.depth++
+	if d.depth > maxRestoreDepth {
+		d.err = true
+		panic("rust2go-ipc: restore nesting too deep")
+	}
+}
+func (d *dec) leave() { d.depth-- }
 
 func (d *dec) take(n int) []byte {
 	if n < 0 || n > len(d.b)-d.p {
@@ -808,10 +824,12 @@ func flattenEmptyRequest(v *EmptyRequest, e *enc) {
 }
 
 func restoreEmptyRequestRef(d *dec) EmptyRequestRef {
+	d.enter()
 	var r EmptyRequestRef
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -859,11 +877,13 @@ func flattenHashRequest(v *HashRequest, e *enc) {
 }
 
 func restoreHashRequestRef(d *dec) HashRequestRef {
+	d.enter()
 	var r HashRequestRef
 	r.message = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -915,6 +935,7 @@ func flattenEsRequest(v *EsRequest, e *enc) {
 }
 
 func restoreEsRequestRef(d *dec) EsRequestRef {
+	d.enter()
 	var r EsRequestRef
 	r.trace_id = d.str()
 	r.order_id = d.str()
@@ -922,6 +943,7 @@ func restoreEsRequestRef(d *dec) EsRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -971,12 +993,14 @@ func flattenUIMRequest(v *UIMRequest, e *enc) {
 }
 
 func restoreUIMRequestRef(d *dec) UIMRequestRef {
+	d.enter()
 	var r UIMRequestRef
 	r.trace_id = d.str()
 	r.iccid = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1032,6 +1056,7 @@ func flattenTextRequest(v *TextRequest, e *enc) {
 }
 
 func restoreTextRequestRef(d *dec) TextRequestRef {
+	d.enter()
 	var r TextRequestRef
 	r.trace_id = d.str()
 	r.rule_id = d.str()
@@ -1041,6 +1066,7 @@ func restoreTextRequestRef(d *dec) TextRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1090,12 +1116,14 @@ func flattenAddressRequest(v *AddressRequest, e *enc) {
 }
 
 func restoreAddressRequestRef(d *dec) AddressRequestRef {
+	d.enter()
 	var r AddressRequestRef
 	r.trace_id = d.str()
 	r.location = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1145,12 +1173,14 @@ func flattenLabelRequest(v *LabelRequest, e *enc) {
 }
 
 func restoreLabelRequestRef(d *dec) LabelRequestRef {
+	d.enter()
 	var r LabelRequestRef
 	r.trace_id = d.str()
 	r.address_id = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1208,6 +1238,7 @@ func flattenImageRequest(v *ImageRequest, e *enc) {
 }
 
 func restoreImageRequestRef(d *dec) ImageRequestRef {
+	d.enter()
 	var r ImageRequestRef
 	r.trace_id = d.str()
 	r.rule_id = d.str()
@@ -1218,6 +1249,7 @@ func restoreImageRequestRef(d *dec) ImageRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1277,6 +1309,7 @@ func flattenCoverRequest(v *CoverRequest, e *enc) {
 }
 
 func restoreCoverRequestRef(d *dec) CoverRequestRef {
+	d.enter()
 	var r CoverRequestRef
 	r.trace_id = d.str()
 	r.img1_bucket = d.str()
@@ -1288,6 +1321,7 @@ func restoreCoverRequestRef(d *dec) CoverRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1341,6 +1375,7 @@ func flattenCloudRequest(v *CloudRequest, e *enc) {
 }
 
 func restoreCloudRequestRef(d *dec) CloudRequestRef {
+	d.enter()
 	var r CloudRequestRef
 	r.trace_id = d.str()
 	r.bucket = d.str()
@@ -1349,6 +1384,7 @@ func restoreCloudRequestRef(d *dec) CloudRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1400,6 +1436,7 @@ func flattenQYWXRequest(v *QYWXRequest, e *enc) {
 }
 
 func restoreQYWXRequestRef(d *dec) QYWXRequestRef {
+	d.enter()
 	var r QYWXRequestRef
 	r.trace_id = d.str()
 	r.phone = d.str()
@@ -1407,6 +1444,7 @@ func restoreQYWXRequestRef(d *dec) QYWXRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1465,6 +1503,7 @@ func flattenFunc014Request(v *Func014Request, e *enc) {
 }
 
 func restoreFunc014RequestRef(d *dec) Func014RequestRef {
+	d.enter()
 	var r Func014RequestRef
 	r.trace_id = d.str()
 	r.in1014001 = d.str()
@@ -1474,6 +1513,7 @@ func restoreFunc014RequestRef(d *dec) Func014RequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1530,6 +1570,7 @@ func flattenFunc015Request(v *Func015Request, e *enc) {
 }
 
 func restoreFunc015RequestRef(d *dec) Func015RequestRef {
+	d.enter()
 	var r Func015RequestRef
 	r.trace_id = d.str()
 	r.in1015001 = d.str()
@@ -1538,6 +1579,7 @@ func restoreFunc015RequestRef(d *dec) Func015RequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1591,6 +1633,7 @@ func flattenFunc019Request(v *Func019Request, e *enc) {
 }
 
 func restoreFunc019RequestRef(d *dec) Func019RequestRef {
+	d.enter()
 	var r Func019RequestRef
 	r.trace_id = d.str()
 	r.in1019001 = d.str()
@@ -1599,6 +1642,7 @@ func restoreFunc019RequestRef(d *dec) Func019RequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1662,6 +1706,7 @@ func flattenFunc157Request(v *Func157Request, e *enc) {
 }
 
 func restoreFunc157RequestRef(d *dec) Func157RequestRef {
+	d.enter()
 	var r Func157RequestRef
 	r.trace_id = d.str()
 	r.query_type = d.str()
@@ -1675,6 +1720,7 @@ func restoreFunc157RequestRef(d *dec) Func157RequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1778,6 +1824,7 @@ func flattenFunc614Request(v *Func614Request, e *enc) {
 }
 
 func restoreFunc614RequestRef(d *dec) Func614RequestRef {
+	d.enter()
 	var r Func614RequestRef
 	r.trace_id = d.str()
 	r.In1614001 = d.str()
@@ -1811,6 +1858,7 @@ func restoreFunc614RequestRef(d *dec) Func614RequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1868,6 +1916,7 @@ func flattenSMSRequest(v *SMSRequest, e *enc) {
 }
 
 func restoreSMSRequestRef(d *dec) SMSRequestRef {
+	d.enter()
 	var r SMSRequestRef
 	r.trace_id = d.str()
 	r.mobile = d.str()
@@ -1878,6 +1927,7 @@ func restoreSMSRequestRef(d *dec) SMSRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1930,12 +1980,14 @@ func flattenReceiptRequest(v *ReceiptRequest, e *enc) {
 }
 
 func restoreReceiptRequestRef(d *dec) ReceiptRequestRef {
+	d.enter()
 	var r ReceiptRequestRef
 	r.trace_id = d.str()
 	r.codes = stringList(d)
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -1990,6 +2042,7 @@ func flattenFunctionRequest(v *FunctionRequest, e *enc) {
 }
 
 func restoreFunctionRequestRef(d *dec) FunctionRequestRef {
+	d.enter()
 	var r FunctionRequestRef
 	r.trace_id = d.str()
 	r.name = d.str()
@@ -1997,6 +2050,7 @@ func restoreFunctionRequestRef(d *dec) FunctionRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2054,6 +2108,7 @@ func flattenTouchRequest(v *TouchRequest, e *enc) {
 }
 
 func restoreTouchRequestRef(d *dec) TouchRequestRef {
+	d.enter()
 	var r TouchRequestRef
 	r.trace_id = d.str()
 	r.code = d.str()
@@ -2064,6 +2119,7 @@ func restoreTouchRequestRef(d *dec) TouchRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2125,6 +2181,7 @@ func flattenBillRequest(v *BillRequest, e *enc) {
 }
 
 func restoreBillRequestRef(d *dec) BillRequestRef {
+	d.enter()
 	var r BillRequestRef
 	r.trace_id = d.str()
 	r.order_type = d.str()
@@ -2137,6 +2194,7 @@ func restoreBillRequestRef(d *dec) BillRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2191,6 +2249,7 @@ func flattenCommonResponse(v *CommonResponse, e *enc) {
 }
 
 func restoreCommonResponseRef(d *dec) CommonResponseRef {
+	d.enter()
 	var r CommonResponseRef
 	r.err_msg = d.str()
 	r.result = primList[uint8](d)
@@ -2198,6 +2257,7 @@ func restoreCommonResponseRef(d *dec) CommonResponseRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2245,11 +2305,13 @@ func flattenHashResponse(v *HashResponse, e *enc) {
 }
 
 func restoreHashResponseRef(d *dec) HashResponseRef {
+	d.enter()
 	var r HashResponseRef
 	r.hash = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2302,12 +2364,14 @@ func flattenReceiptResponse(v *ReceiptResponse, e *enc) {
 }
 
 func restoreReceiptResponseRef(d *dec) ReceiptResponseRef {
+	d.enter()
 	var r ReceiptResponseRef
 	r.err_msg = d.str()
 	r.files = stringList(d)
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2363,6 +2427,7 @@ func flattenAddressResponse(v *AddressResponse, e *enc) {
 }
 
 func restoreAddressResponseRef(d *dec) AddressResponseRef {
+	d.enter()
 	var r AddressResponseRef
 	r.province = d.str()
 	r.city = d.str()
@@ -2372,6 +2437,7 @@ func restoreAddressResponseRef(d *dec) AddressResponseRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2425,6 +2491,7 @@ func flattenAddressLabel(v *AddressLabel, e *enc) {
 }
 
 func restoreAddressLabelRef(d *dec) AddressLabelRef {
+	d.enter()
 	var r AddressLabelRef
 	r.desc = d.str()
 	r.name = d.str()
@@ -2433,6 +2500,7 @@ func restoreAddressLabelRef(d *dec) AddressLabelRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2487,6 +2555,7 @@ func flattenLabelResponse(v *LabelResponse, e *enc) {
 }
 
 func restoreLabelResponseRef(d *dec) LabelResponseRef {
+	d.enter()
 	var r LabelResponseRef
 	r.code = d.str()
 	r.message = d.str()
@@ -2494,6 +2563,7 @@ func restoreLabelResponseRef(d *dec) LabelResponseRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2541,11 +2611,13 @@ func flattenOrderResponse(v *OrderResponse, e *enc) {
 }
 
 func restoreOrderResponseRef(d *dec) OrderResponseRef {
+	d.enter()
 	var r OrderResponseRef
 	r.code = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2597,6 +2669,7 @@ func flattenFuncResult(v *FuncResult, e *enc) {
 }
 
 func restoreFuncResultRef(d *dec) FuncResultRef {
+	d.enter()
 	var r FuncResultRef
 	r.id = d.str()
 	r.name = d.str()
@@ -2604,6 +2677,7 @@ func restoreFuncResultRef(d *dec) FuncResultRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2654,11 +2728,13 @@ func flattenRowResult(v *RowResult, e *enc) {
 }
 
 func restoreRowResultRef(d *dec) RowResultRef {
+	d.enter()
 	var r RowResultRef
 	r.cols = FuncResultListRef(d)
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2713,6 +2789,7 @@ func flattenEOPResponse(v *EOPResponse, e *enc) {
 }
 
 func restoreEOPResponseRef(d *dec) EOPResponseRef {
+	d.enter()
 	var r EOPResponseRef
 	r.result_code = d.str()
 	r.err_msg = d.str()
@@ -2720,6 +2797,7 @@ func restoreEOPResponseRef(d *dec) EOPResponseRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2773,6 +2851,7 @@ func flattenFileRequest(v *FileRequest, e *enc) {
 }
 
 func restoreFileRequestRef(d *dec) FileRequestRef {
+	d.enter()
 	var r FileRequestRef
 	r.trace_id = d.str()
 	r.bucket = d.str()
@@ -2781,6 +2860,7 @@ func restoreFileRequestRef(d *dec) FileRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2835,6 +2915,7 @@ func flattenDeleteFileRequest(v *DeleteFileRequest, e *enc) {
 }
 
 func restoreDeleteFileRequestRef(d *dec) DeleteFileRequestRef {
+	d.enter()
 	var r DeleteFileRequestRef
 	r.trace_id = d.str()
 	r.bucket = d.str()
@@ -2842,6 +2923,7 @@ func restoreDeleteFileRequestRef(d *dec) DeleteFileRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2891,12 +2973,14 @@ func flattenFileNameAndPath(v *FileNameAndPath, e *enc) {
 }
 
 func restoreFileNameAndPathRef(d *dec) FileNameAndPathRef {
+	d.enter()
 	var r FileNameAndPathRef
 	r.file_name = d.str()
 	r.file_path = d.str()
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
@@ -2951,6 +3035,7 @@ func flattenOrderAuditRequest(v *OrderAuditRequest, e *enc) {
 }
 
 func restoreOrderAuditRequestRef(d *dec) OrderAuditRequestRef {
+	d.enter()
 	var r OrderAuditRequestRef
 	r.trace_id = d.str()
 	r.image_path = FileNameAndPathListRef(d)
@@ -2958,6 +3043,7 @@ func restoreOrderAuditRequestRef(d *dec) OrderAuditRequestRef {
 	if d.err {
 		panic("rust2go-ipc: invalid payload")
 	}
+	d.leave()
 	return r
 }
 
