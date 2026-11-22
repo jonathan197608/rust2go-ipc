@@ -26,6 +26,10 @@ use std::{
 };
 
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::process::id as process_id;
@@ -127,7 +131,29 @@ fn resolve_endpoint(port: u16) -> Endpoint {
     match transport {
         #[cfg(unix)]
         Transport::Unix => {
-            let path = env::temp_dir().join(format!("rust2go-ipc-{}-{}.sock", process_id(), port));
+            // The socket lives inside a 0700 private directory, so even though
+            // net.Listen briefly creates the node as 0777 & ^umask (typically
+            // 0755), no other local user can traverse the directory to reach
+            // it. This avoids a process-wide umask(0077) on the Go child, which
+            // would silently narrow every file its business handlers create.
+            // A per-(pid,port) directory keeps concurrent IPC endpoints apart.
+            let dir_name = format!("rust2go-ipc-{}-{}.d", process_id(), port);
+            let dir = env::temp_dir().join(&dir_name);
+            // create_dir_all is idempotent across reconnect; explicitly set
+            // 0700 (not relying on umask) so a reused dir cannot stay broad.
+            fs::create_dir_all(&dir).unwrap_or_else(|e| {
+                panic!(
+                    "rust2go-ipc: cannot create private socket dir {}: {e}",
+                    dir.display()
+                )
+            });
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap_or_else(|e| {
+                panic!(
+                    "rust2go-ipc: cannot restrict private socket dir {}: {e}",
+                    dir.display()
+                )
+            });
+            let path = dir.join("ipc.sock");
             // sockaddr_un.sun_path is ~108 bytes on Linux / 104 on macOS.
             // Measure the exact string handed to both sides: Rust connects with
             // this `String` and Go measures `len(endpoint)`. Checking raw OS
@@ -135,7 +161,17 @@ fn resolve_endpoint(port: u16) -> Endpoint {
             // non-UTF-8 TMPDIR paths and let an over-long path reach bind().
             let mut addr = path.to_string_lossy().into_owned();
             if addr.len() >= 100 {
-                addr = format!("/tmp/rust2go-ipc-{}-{}.sock", process_id(), port);
+                // Fall back to a fixed short root; still nest under a private
+                // dir so the 0700 isolation guarantee is preserved.
+                let short_dir = format!("/tmp/r2g-{}-{}", process_id(), port);
+                let sd = std::path::Path::new(&short_dir);
+                fs::create_dir_all(sd).unwrap_or_else(|e| {
+                    panic!("rust2go-ipc: cannot create fallback socket dir {short_dir}: {e}")
+                });
+                fs::set_permissions(sd, fs::Permissions::from_mode(0o700)).unwrap_or_else(|e| {
+                    panic!("rust2go-ipc: cannot restrict fallback socket dir {short_dir}: {e}")
+                });
+                addr = format!("{short_dir}/ipc.sock");
             }
             Endpoint {
                 transport: Transport::Unix,
@@ -483,8 +519,13 @@ fn spawn_server(server: &str, port: u16, endpoint: &Endpoint) -> Child {
 /// variant exists for `reconnect`, which holds the lock while reaping the
 /// previous child so no new child can slip in after the reap.
 fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
-    let mut cmd = Command::new(server);
-    cmd.env("RUST2GO_IPC_PORT", port.to_string())
+    // NOTE: do not set umask here. A pre_exec umask(0077) would be inherited by
+    // the Go server's *business handlers*, silently turning their os.Create /
+    // os.WriteFile(0666) outputs into 0600. Socket isolation is instead done by
+    // placing the UDS inside a 0700 private directory created in
+    // resolve_endpoint(), so no process-wide setting leaks into user code.
+    let child = Command::new(server)
+        .env("RUST2GO_IPC_PORT", port.to_string())
         .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
         .env("RUST2GO_IPC_ENDPOINT", &endpoint.addr)
         // Isolate the child from the parent's stdio. stdin is unused; stdout
@@ -492,25 +533,7 @@ fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
         // a Go-side panic remains diagnosable (the Rust side also logs the
         // child's exit status during startup/respawn).
         .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // The Go server calls net.Listen("unix", ...) which creates the socket
-        // node as 0777 & ^umask before its Chmod(0600). With the parent's
-        // default umask that node is briefly 0755 on a world-writable /tmp,
-        // letting any local user connect. Tighten the *child's* umask in the
-        // pre-exec window so the node is born 0700; Chmod then narrows it to
-        // 0600. This touches only the spawned Go process, never the host.
-        // umask(2) is async-signal-safe, valid inside pre_exec.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::umask(0o077);
-                Ok(())
-            });
-        }
-    }
-    let child = cmd
+        .stdout(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot spawn Go server {server}: {e}"));
     // Record the pid immediately, before the caller stores the Child handle,
@@ -580,6 +603,13 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
             eprintln!("rust2go-ipc: reserved port {port} is unavailable; reselecting {fresh}");
             port = fresh;
         }
+        // atexit may have run after the hook was registered but before this
+        // first spawn (RUNTIME was not published, so the hook could only kill
+        // by pid, which was still 0). Never create a child that would outlive
+        // the exiting process and hold the endpoint hostage.
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            panic!("rust2go-ipc: shutting down before startup; refusing to spawn");
+        }
         let endpoint = resolve_endpoint(port);
         let mut child = spawn_server(&server, port, &endpoint);
         // A Go server that fails to bind exits quickly (e.g. a stale port/socket
@@ -624,6 +654,13 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
                 break s;
             }
         };
+        // atexit may have fired between a successful connect and RUNTIME
+        // publication. It saw no RUNTIME and pid alone cannot reap a child it
+        // never observed; reap here so no orphan survives the exiting process.
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            kill_and_reap(&mut child);
+            panic!("rust2go-ipc: shutting down after startup; aborting init");
+        }
         let mut reader = stream.try_clone().unwrap_or_else(|e| {
             kill_and_reap(&mut child);
             panic!("rust2go-ipc: cannot clone IPC stream: {e}")

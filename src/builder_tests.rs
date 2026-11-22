@@ -488,6 +488,41 @@ trait T { fn f() -> maxRestoreDepth; }
 }
 
 #[test]
+fn nested_module_r2g_types_are_collected() {
+    let src = r#"
+mod types {
+    #[derive(R2G, Default)]
+    pub struct Req { pub id: i32 }
+}
+mod api {
+    #[r2g]
+    pub trait T { fn f(r: types::Req) -> types::Req; }
+}
+"#;
+    let schema = parse_schema(src);
+    assert_eq!(
+        schema.structs.len(),
+        1,
+        "nested R2G struct must be collected"
+    );
+    assert_eq!(schema.structs[0].name, "Req");
+    assert_eq!(schema.traits, vec!["T".to_string()]);
+    assert_eq!(schema.methods.len(), 1);
+    let rust = generate_rust_bindings(&schema, 1234).to_string();
+    syn::parse_file(&rust).expect("generated Rust must parse");
+}
+
+#[test]
+#[should_panic(expected = "generic struct `Foo` is not wire-encodable")]
+fn generic_r2g_struct_is_rejected_clearly() {
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct Foo<T> { pub v: T }
+"#;
+    parse_schema(src);
+}
+
+#[test]
 fn default_go_compiler_exposes_no_args_and_module_env() {
     // The default compiler is a marker: no extra args, but GO111MODULE=on so
     // its behaviour matches CustomArgGoCompiler::new().

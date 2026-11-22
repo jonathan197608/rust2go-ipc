@@ -92,10 +92,10 @@ func main() {
 		_ = os.Remove(endpoint)
 		ln, err = net.Listen("unix", endpoint)
 		if err == nil {
-			// The Rust parent tightens this child's umask to 0077 in pre_exec,
-			// so net.Listen creates the node as 0700 with no race window. Chmod
-			// to 0600 as defence in depth, and never leave a listening socket
-			// behind if it fails.
+			// The Rust parent places this socket inside a 0700 private
+			// directory, so the brief 0755 node net.Listen creates is not
+			// reachable by other users. Chmod to 0600 as defence in depth, and
+			// never leave a listening socket behind if it fails.
 			if cerr := os.Chmod(endpoint, 0600); cerr != nil {
 				_ = ln.Close()
 				_ = os.Remove(endpoint)

@@ -236,7 +236,7 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         // >= 1.23 synchronous timer channels. On 1.20–1.22 a stale timer value
         // can survive Stop+drain and prematurely close connections. A hidden
         // runtime bug is worse than a clear build-time error, so gate here.
-        require_go_1_23(&self.go_comp);
+        require_go_1_23(&self.go_comp, &go_dir);
         let ipc_main_path = go_dir.join("ipc_main.go");
         if let Ok(entries) = fs::read_dir(&go_dir) {
             for entry in entries.flatten() {
@@ -384,8 +384,13 @@ fn with_extra_ldflags(mut args: Vec<OsString>, extra: &str) -> Vec<OsString> {
 /// timer channel that makes draining exact. Older toolchains can leave a stale
 /// tick in the channel and prematurely close connections under load — a build
 /// error here is far easier to diagnose than intermittent runtime drops.
-fn require_go_1_23(go_comp: &impl GoCompiler) {
+fn require_go_1_23(go_comp: &impl GoCompiler, go_dir: &std::path::Path) {
     let mut cmd = Command::new("go");
+    // Run in the same module dir as `go build`: since Go 1.21 the toolchain is
+    // chosen from go.mod + GOTOOLCHAIN. Probing from the crate root could see a
+    // different toolchain than the actual build and either refuse wrongly or
+    // miss a pre-1.23 toolchain the build will really use.
+    cmd.current_dir(go_dir);
     cmd.args(["env", "GOVERSION"]);
     for (k, v) in go_comp.envs() {
         cmd.env(k, v);
@@ -495,13 +500,37 @@ enum FieldKind {
     Custom(String),
 }
 
+/// Flatten top-level items and items nested inside inline `mod { ... }` blocks.
+/// The proc macro does not require schema types to be top-level, so the builder
+/// must see nested R2G structs/traits too; otherwise they are silently dropped
+/// and references to them report a misleading "missing derive" error.
+fn collect_items<'a>(items: &'a [Item], out: &mut Vec<&'a Item>) {
+    for item in items {
+        out.push(item);
+        if let Item::Mod(m) = item {
+            if let Some((_, inner)) = &m.content {
+                collect_items(inner, out);
+            }
+        }
+    }
+}
+
 fn parse_schema(src: &str) -> Schema {
     let file = syn::parse_file(src).expect("rust2go-ipc: cannot parse schema source");
     let mut schema = Schema::default();
+    let mut all_items = Vec::new();
+    collect_items(&file.items, &mut all_items);
 
-    for item in &file.items {
+    for item in &all_items {
         if let Item::Struct(s) = item {
             if has_derive(s, "R2G") {
+                // Generics carry no wire representation; reject clearly rather
+                // than letting `T` fall through to a bogus "missing derive".
+                assert!(
+                    s.generics.params.is_empty(),
+                    "rust2go-ipc: generic struct `{}` is not wire-encodable; use a concrete type",
+                    bare_ident(&s.ident)
+                );
                 schema.structs.push(parse_struct(s));
             }
         }
@@ -512,7 +541,7 @@ fn parse_schema(src: &str) -> Schema {
     // Go `case` labels.
     let mut idx = 0u32;
     let mut stub_names = HashSet::new();
-    for item in &file.items {
+    for item in &all_items {
         let Item::Trait(t) = item else { continue };
         if !has_marker_attr(&t.attrs, "r2g") {
             continue;

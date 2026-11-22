@@ -133,8 +133,31 @@ fn unix_default_endpoint_is_a_uds_path() {
     std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
     let ep = resolve_endpoint(4321);
     assert_eq!(ep.transport, Transport::Unix);
-    assert!(ep.addr.ends_with(".sock"), "unexpected addr: {}", ep.addr);
+    assert!(
+        ep.addr.ends_with("/ipc.sock"),
+        "unexpected addr: {}",
+        ep.addr
+    );
     assert!(ep.addr.len() < 100, "path must fit sun_path: {}", ep.addr);
+    // Socket must live in a 0700 private directory so other local users cannot
+    // traverse to the briefly-0755 node net.Listen creates before Chmod.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::path::Path::new(&ep.addr).parent().unwrap();
+    let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "socket dir must be 0700, got {mode:o}");
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_umask_regression_does_not_need_process_wide_restriction() {
+    // Guard the reason the socket is in a private dir: a pre_exec umask would
+    // leak into the Go business handlers. This test just asserts the endpoint
+    // carries a directory component (so isolation is directory-based).
+    std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
+    let ep = resolve_endpoint(4322);
+    let p = std::path::Path::new(&ep.addr);
+    assert!(p.parent().and_then(|d| d.file_name()).is_some());
+    assert_eq!(p.file_name().unwrap(), "ipc.sock");
 }
 
 #[test]
