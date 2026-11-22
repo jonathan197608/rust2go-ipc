@@ -540,6 +540,13 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
                 // the gap, see pid 0 (already cleared) and skip reaping, while
                 // the fresh child spawned right after would outlive us.
                 let _mgmt = lock_or_recover(&CHILD_MGMT);
+                // atexit may have run while we were starting up (RUNTIME not yet
+                // published, so its hook could only kill by pid). Do not spawn a
+                // replacement that would outlive the exiting process as an orphan.
+                if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    kill_child_locked(&mut child);
+                    panic!("rust2go-ipc: shutting down during startup; aborting respawn");
+                }
                 kill_child_locked(&mut child);
                 child = spawn_server_locked(&server, port, &endpoint);
             }
@@ -699,23 +706,36 @@ pub unsafe fn dispatch(
     // pending entry, release its slot before overwriting it. Unreachable in
     // practice (~1.8e19 calls), but HashMap::insert would otherwise silently
     // drop the old Pending without running its cleanup.
-    if let Some(old) = lock_or_recover(&rt.pending).insert(
-        req_id,
-        Pending {
-            slot: slot as usize,
-            cb: cb as usize,
-            trampoline: handler.trampoline,
-            cleanup: handler.cleanup,
-            created: Instant::now(),
-        },
-    ) {
+    // Drop the guard at the semicolon BEFORE cleaning up: cleanup wakes the
+    // future (SlotWriter::drop), which may re-enter the runtime and try to lock
+    // rt.pending again. An `if let Some(x) = lock(..).insert(..)` temporary lives
+    // until the end of the if-let, so cleanup there would self-deadlock.
+    let displaced: Option<Pending> = {
+        let mut pending = lock_or_recover(&rt.pending);
+        pending.insert(
+            req_id,
+            Pending {
+                slot: slot as usize,
+                cb: cb as usize,
+                trampoline: handler.trampoline,
+                cleanup: handler.cleanup,
+                created: Instant::now(),
+            },
+        )
+    };
+    if let Some(old) = displaced {
         cleanup_pending(old);
     }
 
     if !write_frame(rt, req_id, method_id, payload) {
         // The frame never left: no response can arrive. Drop the pending entry
-        // now instead of holding the slot until the TTL sweep.
-        if let Some(p) = lock_or_recover(&rt.pending).remove(&req_id) {
+        // now instead of holding the slot until the TTL sweep. Same lock-discipline
+        // as above: release rt.pending before waking the future via cleanup.
+        let removed: Option<Pending> = {
+            let mut pending = lock_or_recover(&rt.pending);
+            pending.remove(&req_id)
+        };
+        if let Some(p) = removed {
             cleanup_pending(p);
         }
     }
