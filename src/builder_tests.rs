@@ -468,6 +468,43 @@ trait T { fn f(x: R, x: bool) -> R; }
 }
 
 #[test]
+#[should_panic(expected = "generated Go symbol `maxRestoreDepth`")]
+fn template_max_restore_depth_symbol_is_reserved() {
+    // gen_prefix.gotpl declares `const maxRestoreDepth = 64` at top level.
+    // A lowercase struct of the same name would redeclare it in generated Go.
+    let src = r#"
+#[derive(R2G, Default)]
+pub struct maxRestoreDepth { pub ok: bool }
+#[r2g]
+trait T { fn f() -> maxRestoreDepth; }
+"#;
+    parse_schema(src);
+}
+
+#[test]
+fn default_go_compiler_exposes_no_args_and_module_env() {
+    // The default compiler is a marker: no extra args, but GO111MODULE=on so
+    // its behaviour matches CustomArgGoCompiler::new().
+    let args = DefaultGoCompiler.args();
+    assert!(args.is_empty());
+    let envs = DefaultGoCompiler.envs();
+    assert_eq!(
+        envs,
+        vec![(OsString::from("GO111MODULE"), OsString::from("on"))]
+    );
+}
+
+#[test]
+fn custom_go_compiler_trait_exposes_its_args_and_envs() {
+    let mut comp = CustomArgGoCompiler::new();
+    comp.arg("-buildmode=pie").env("CC", "zig cc");
+    assert_eq!(comp.args(), vec![OsString::from("-buildmode=pie")]);
+    let envs = comp.envs();
+    assert!(envs.contains(&(OsString::from("CC"), OsString::from("zig cc"))));
+    assert!(envs.contains(&(OsString::from("GO111MODULE"), OsString::from("on"))));
+}
+
+#[test]
 fn oneway_method_may_use_slot_as_parameter_name() {
     let src = r#"
 #[derive(R2G, Default)]

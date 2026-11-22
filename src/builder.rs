@@ -124,10 +124,42 @@ pub trait GoCompilerArgs {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultGoCompiler;
-pub trait GoCompiler {}
 
-impl GoCompiler for DefaultGoCompiler {}
-impl GoCompiler for CustomArgGoCompiler {}
+/// Abstraction over the `go build` invocation. Mirrors rust2go v0.4's trait so
+/// existing `build.rs` code keeps compiling: `Builder::build()` is available
+/// for every `GoCompiler`, not only `CustomArgGoCompiler`.
+///
+/// Default implementations are empty so a marker compiler (like
+/// [`DefaultGoCompiler`]) needs no extra code.
+pub trait GoCompiler {
+    /// Extra command-line arguments passed to `go build`.
+    fn args(&self) -> Vec<OsString> {
+        Vec::new()
+    }
+
+    /// Extra environment variables applied to the `go build` command.
+    fn envs(&self) -> Vec<(OsString, OsString)> {
+        Vec::new()
+    }
+}
+
+impl GoCompiler for DefaultGoCompiler {
+    fn envs(&self) -> Vec<(OsString, OsString)> {
+        // Match `CustomArgGoCompiler::new()` so switching between the two
+        // compiler types does not change module resolution behaviour.
+        vec![(OsString::from("GO111MODULE"), OsString::from("on"))]
+    }
+}
+
+impl GoCompiler for CustomArgGoCompiler {
+    fn args(&self) -> Vec<OsString> {
+        self.args.clone()
+    }
+
+    fn envs(&self) -> Vec<(OsString, OsString)> {
+        self.envs.clone()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CustomArgGoCompiler {
@@ -166,7 +198,7 @@ impl GoCompilerArgs for CustomArgGoCompiler {
     }
 }
 
-impl Builder<PathBuf, CustomArgGoCompiler> {
+impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
     /// Generate pure-Go sources and Rust binding mirrors, then compile the
     /// Go IPC server.
     pub fn build(self) {
@@ -255,11 +287,11 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
             .arg("build")
             .arg("-o")
             .arg(&server_out);
-        for (k, v) in &self.go_comp.envs {
+        for (k, v) in self.go_comp.envs() {
             cmd.env(k, v);
         }
         let extra_ldflags = env::var("RUST2GO_GOFLAGS").unwrap_or_default();
-        let build_args = with_extra_ldflags(self.go_comp.args.clone(), &extra_ldflags);
+        let build_args = with_extra_ldflags(self.go_comp.args(), &extra_ldflags);
         for a in &build_args {
             cmd.arg(a);
         }
@@ -767,6 +799,7 @@ const GO_FIXED_SYMBOLS: &[&str] = &[
     "magic",
     "version",
     "_require64bitGoTarget",
+    "maxRestoreDepth",
     "maxAcceptErrs",
     "sem",
     "acceptBackoff",

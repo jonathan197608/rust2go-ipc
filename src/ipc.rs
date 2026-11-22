@@ -429,12 +429,11 @@ extern "C" fn cleanup_on_exit() {
         reap_child(rt);
     } else {
         // Initialization window: spawn already happened inside the OnceLock
-        // closure but RUNTIME is not published yet, so reap_child has no
-        // handle to work with. On Unix, kill by the pid recorded at spawn time;
-        // the process is exiting anyway, so the kernel reaps the orphan and the
-        // Go side removes any stale socket on its next start. Windows has no
-        // libc kill API and this window is microseconds wide, so the normal
-        // (RUNTIME-published) reap path is the guarantee there.
+        // closure but RUNTIME is not published yet, so reap_child has no handle
+        // to work with. This window is NOT microseconds wide -- the 30s startup
+        // readiness loop runs inside the closure -- so both platforms must kill
+        // by the pid recorded at spawn time. The process is exiting anyway; the
+        // OS reaps the orphan and the Go side removes any stale socket.
         #[cfg(unix)]
         {
             let pid = CHILD_PID.swap(0, Ordering::SeqCst);
@@ -446,7 +445,14 @@ extern "C" fn cleanup_on_exit() {
         }
         #[cfg(not(unix))]
         {
-            CHILD_PID.store(0, Ordering::SeqCst);
+            let pid = CHILD_PID.swap(0, Ordering::SeqCst);
+            if pid > 0 {
+                // Terminate the whole tree: taskkill /T covers any children the
+                // Go server spawned. Ignore errors (process may have exited).
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .status();
+            }
         }
     }
 }
