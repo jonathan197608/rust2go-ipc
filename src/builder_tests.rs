@@ -333,3 +333,55 @@ fn raw_identifiers_generate_clean_go_names() {
     );
     syn::parse_file(&rust).expect("generated Rust must parse");
 }
+
+#[test]
+fn extra_ldflags_empty_is_noop() {
+    let args = vec![
+        OsString::from("-buildmode"),
+        OsString::from("pie"),
+        OsString::from("."),
+    ];
+    let out = with_extra_ldflags(args.clone(), "");
+    assert_eq!(out, args);
+    let out = with_extra_ldflags(args.clone(), "   ");
+    assert_eq!(out, args);
+}
+
+#[test]
+fn extra_ldflags_merges_into_separate_ldflags() {
+    // Mirrors the real build.rs: `-ldflags` followed by the flags value.
+    let args = vec![
+        OsString::from("-ldflags"),
+        OsString::from(r#"-extldflags "-static-pie" -s -w"#),
+    ];
+    let out = with_extra_ldflags(args, "-linkmode external");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0], OsString::from("-ldflags"));
+    assert_eq!(
+        out[1],
+        OsString::from(r#"-linkmode external -extldflags "-static-pie" -s -w"#)
+    );
+}
+
+#[test]
+fn extra_ldflags_merges_into_equals_ldflags() {
+    let args = vec![OsString::from("-ldflags=-s -w")];
+    let out = with_extra_ldflags(args, "-linkmode external");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0], OsString::from("-ldflags=-linkmode external -s -w"));
+}
+
+#[test]
+fn extra_ldflags_adds_ldflags_when_absent() {
+    let args = vec![
+        OsString::from("-buildmode"),
+        OsString::from("pie"),
+        OsString::from("."),
+    ];
+    let out = with_extra_ldflags(args.clone(), "-linkmode external");
+    assert_eq!(out.len(), args.len() + 2);
+    assert_eq!(out[args.len()], OsString::from("-ldflags"));
+    assert_eq!(out[args.len() + 1], OsString::from("-linkmode external"));
+    // The upstream args (including the trailing package ".") stay in order.
+    assert_eq!(&out[..args.len()], args.as_slice());
+}

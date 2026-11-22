@@ -194,6 +194,10 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
         );
 
         println!("cargo:rerun-if-changed={}", src_rs.display());
+        // External linking is selected by the build image via RUST2GO_GOFLAGS
+        // (e.g. "-linkmode external"). Re-run the build script when it changes
+        // so a CI cache does not keep serving a stale, non-PIE server binary.
+        println!("cargo:rerun-if-env-changed=RUST2GO_GOFLAGS");
         if let Ok(entries) = fs::read_dir(&go_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -258,7 +262,9 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
         for (k, v) in &self.go_comp.envs {
             cmd.env(k, v);
         }
-        for a in &self.go_comp.args {
+        let extra_ldflags = env::var("RUST2GO_GOFLAGS").unwrap_or_default();
+        let build_args = with_extra_ldflags(self.go_comp.args.clone(), &extra_ldflags);
+        for a in &build_args {
             cmd.arg(a);
         }
         cmd.arg(".");
@@ -286,6 +292,48 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
 }
 
 /// Locate gofmt: prefer PATH, then `$GOROOT/bin/gofmt`, then `go env GOROOT`.
+/// Merge extra linker flags (from `RUST2GO_GOFLAGS`) into the go build args.
+///
+/// Some linker flags — notably `-linkmode external` — cannot be passed as a
+/// standalone `go build` flag and are rejected by Go's own `GOFLAGS` env var
+/// ("unknown flag -linkmode"); they are only valid inside `-ldflags`. Build
+/// images that need external linking therefore set `RUST2GO_GOFLAGS` (read by
+/// this builder) instead of `GOFLAGS`. The value is appended to the existing
+/// `-ldflags` value, or a fresh `-ldflags` is emitted when none is present.
+fn with_extra_ldflags(mut args: Vec<OsString>, extra: &str) -> Vec<OsString> {
+    let extra = extra.trim();
+    if extra.is_empty() {
+        return args;
+    }
+    // Locate `-ldflags` (either `-ldflags VALUE` or `-ldflags=VALUE`) and
+    // append extra to its value so all linker flags reach cmd/link together.
+    for i in 0..args.len() {
+        let cur = args[i].to_string_lossy();
+        if cur == "-ldflags" {
+            if i + 1 < args.len() {
+                let mut merged = OsString::from(extra);
+                merged.push(" ");
+                merged.push(&args[i + 1]);
+                args[i + 1] = merged;
+            } else {
+                // `-ldflags` with no value: treat the next push as its value.
+                args.push(OsString::from(extra));
+            }
+            return args;
+        }
+        if let Some(val) = cur.strip_prefix("-ldflags=") {
+            let merged = format!("{extra} {val}");
+            args[i] = OsString::from(format!("-ldflags={merged}"));
+            return args;
+        }
+    }
+    // No -ldflags present: append one. Go accepts `-ldflags` anywhere before
+    // the package argument, and build.rs always puts `.` last via cmd.arg(".").
+    args.push(OsString::from("-ldflags"));
+    args.push(OsString::from(extra));
+    args
+}
+
 fn find_gofmt() -> Option<PathBuf> {
     if Command::new("gofmt")
         .arg("--help")
