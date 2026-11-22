@@ -217,17 +217,13 @@ impl Builder<PathBuf, CustomArgGoCompiler> {
         let go_gen = generate_go_sources(&schema);
         fs::write(&regen_dst, &go_gen).expect("cannot write Go sources");
 
+        // ipc_main.go is a generated artifact, rewritten on every build. This
+        // is expected (the project deliberately does not hand-edit it), so do
+        // not emit a cargo warning — it would fire on every build because the
+        // on-disk copy is gofmt'd while `main_src` is not, making a byte equality
+        // check perpetually false and producing persistent build noise.
         let ipc_main = go_dir.join("ipc_main.go");
         let main_src = generate_go_main();
-        if fs::read_to_string(&ipc_main)
-            .map(|old| old != main_src)
-            .unwrap_or(false)
-        {
-            println!(
-                "cargo:warning=rust2go-ipc: overwriting {} with the generated IPC server",
-                ipc_main.display()
-            );
-        }
         fs::write(&ipc_main, main_src).expect("cannot write Go main");
 
         // Keep generated Go sources gofmt-clean when the tool is available.
