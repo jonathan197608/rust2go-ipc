@@ -500,8 +500,12 @@ extern "C" fn cleanup_on_exit() {
             // server spawned. Use an absolute System32 path so a same-named
             // executable in the (possibly user-writable) CWD cannot hijack the
             // call, and null stdio so a full inherited pipe cannot block exit.
-            // Ignore errors (process may have already exited). This runs while
-            // CHILD_MGMT is held, so keep it non-blocking.
+            // Ignore errors (process may have already exited). `.status()`
+            // deliberately waits for taskkill to finish: in the atexit path we
+            // must not leave a live Go process tree behind. null stdio is what
+            // keeps this safe here — a full inherited pipe cannot block exit.
+            // CHILD_MGMT is already poisoned/irrelevant during process exit, so
+            // the wait has no request path to stall.
             let taskkill = std::env::var_os("SystemRoot")
                 .map(|root| {
                     std::path::Path::new(&root)
@@ -825,7 +829,11 @@ pub unsafe fn dispatch(
     // the slot leaks permanently (no pending entry means no sweep/cleanup).
     if payload.len() > MAX_PAYLOAD {
         if let Some(cleanup) = handler.cleanup {
-            unsafe { cleanup(slot) };
+            // Keep the original "too large" panic as the root cause: a panic
+            // from generated cleanup must not replace it. Every other cleanup
+            // call site goes through cleanup_pending / catch_unwind; match that
+            // here instead of invoking the raw pointer unguarded.
+            let _ = catch_unwind(AssertUnwindSafe(|| unsafe { cleanup(slot) }));
         }
         panic!("rust2go-ipc: request payload too large ({})", payload.len());
     }

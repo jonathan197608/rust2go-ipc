@@ -548,6 +548,51 @@ pub trait T {
 }
 
 #[test]
+#[should_panic(expected = "#[cfg] on field")]
+fn cfg_gated_r2g_field_is_rejected() {
+    // A cfg-gated field is silently stripped by rustc before derive expansion
+    // but would still be emitted into the Go side by the builder (which does
+    // not evaluate cfg). That Ref layout mismatch reads stale bytes, so reject.
+    let _ = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Foo {
+    pub keep: i32,
+    #[cfg(feature = "x")]
+    pub drop: i32,
+}
+"#,
+    );
+}
+
+#[test]
+#[should_panic(expected = "external module `types` is not supported")]
+fn external_schema_module_is_rejected_clearly() {
+    // `mod types;` cannot be parsed from the single schema source file. Silently
+    // skipping it would drop R2G types inside it; fail at build time instead.
+    let _ = parse_schema(
+        r#"
+mod types;
+#[derive(R2G, Default)]
+pub struct Foo { pub v: i32 }
+"#,
+    );
+}
+
+#[test]
+#[should_panic(expected = "name `gen` is a reserved identifier")]
+fn rust_2024_gen_keyword_is_rejected() {
+    // `gen` is reserved in edition 2024; generated bare idents would not
+    // compile in a 2024 consumer. Fail fast with an actionable message.
+    let _ = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Foo { pub gen: i32 }
+"#,
+    );
+}
+
+#[test]
 #[should_panic(expected = "generic struct `Foo` is not wire-encodable")]
 fn generic_r2g_struct_is_rejected_clearly() {
     let src = r#"

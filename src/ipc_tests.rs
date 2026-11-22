@@ -1,6 +1,12 @@
 use super::*;
 use std::mem::align_of;
 
+// ENV_ENDPOINT_OVERRIDE is process-global. cargo test runs tests in parallel
+// threads, so the tests that set/remove it must serialize or one can observe
+// another's override and fail spuriously. Only unix tests touch this env var.
+#[cfg(unix)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn child_pid_keeps_full_u32_range() {
     // Windows pids can exceed i32::MAX. The atexit hook must see the exact u32
@@ -120,6 +126,7 @@ fn empty_lists_use_null_pointer() {
 fn unix_transport_is_forced_to_uds_even_with_tcp_endpoint() {
     // Unix builds pin transport to UDS; no environment variable may switch it
     // to TCP. An endpoint override is still honoured, but only as a UDS path.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var(ENV_ENDPOINT_OVERRIDE, "127.0.0.1:9999");
     let ep = resolve_endpoint(1234);
     assert_eq!(ep.transport, Transport::Unix);
@@ -130,6 +137,7 @@ fn unix_transport_is_forced_to_uds_even_with_tcp_endpoint() {
 #[cfg(unix)]
 #[test]
 fn unix_default_endpoint_is_a_uds_path() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
     let ep = resolve_endpoint(4321);
     assert_eq!(ep.transport, Transport::Unix);
@@ -153,6 +161,7 @@ fn unix_umask_regression_does_not_need_process_wide_restriction() {
     // Guard the reason the socket is in a private dir: a pre_exec umask would
     // leak into the Go business handlers. This test just asserts the endpoint
     // carries a directory component (so isolation is directory-based).
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
     let ep = resolve_endpoint(4322);
     let p = std::path::Path::new(&ep.addr);

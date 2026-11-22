@@ -232,6 +232,16 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         println!("cargo:rerun-if-env-changed=RUST2GO_GOFLAGS");
         // go version is discovered via PATH; a toolchain switch must re-run us.
         println!("cargo:rerun-if-env-changed=PATH");
+        // Go module/workspace files change the server build even though they
+        // are not `.go` sources: a new dependency version or a rewritten sum
+        // must re-run this script, otherwise Cargo keeps serving the stale
+        // go-ipc-server binary built from the previous dependency graph.
+        println!("cargo:rerun-if-changed={}", go_dir.join("go.mod").display());
+        println!("cargo:rerun-if-changed={}", go_dir.join("go.sum").display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            go_dir.join("go.work").display()
+        );
         // Fail fast: the generated server's sem-wait timer reuse relies on Go
         // >= 1.23 synchronous timer channels. On 1.20–1.22 a stale timer value
         // can survive Stop+drain and prematurely close connections. A hidden
@@ -523,10 +533,22 @@ fn collect_items<'a>(
     for item in items {
         out.push((item, mod_path.clone()));
         if let Item::Mod(m) = item {
+            reject_schema_cfg(&m.attrs, &format!("module `{}`", bare_ident(&m.ident)));
             if let Some((_, inner)) = &m.content {
                 mod_path.push(m.ident.to_string());
                 collect_items(inner, mod_path, depth + 1, out);
                 mod_path.pop();
+            } else {
+                // Only the single source path is read; a `mod foo;` whose body
+                // lives in foo.rs cannot be parsed here. Silently skipping it
+                // would drop any R2G types inside and surface a misleading
+                // "missing derive" error at use sites. Fail at build time.
+                panic!(
+                    "rust2go-ipc: external module `{}` is not supported in schema sources; \
+                     inline it (`mod {} {{ ... }}`) so R2G types are visible",
+                    bare_ident(&m.ident),
+                    bare_ident(&m.ident)
+                );
             }
         }
     }
@@ -764,6 +786,14 @@ fn parse_struct(s: &ItemStruct, module_path: Vec<String>) -> StructDef {
             .iter()
             .map(|f| {
                 let fname = bare_ident(f.ident.as_ref().expect("named field"));
+                // cfg is not evaluated when parsing source. A cfg-gated field
+                // would be emitted into Go unconditionally while rustc strips
+                // it before derive expansion, producing a Ref layout mismatch
+                // and silent field misreads. Fail fast like struct/trait/method.
+                reject_schema_cfg(
+                    &f.attrs,
+                    &format!("field `{name}.{fname}`"),
+                );
                 FieldDef {
                     name: fname,
                     ty: strip_reference(&f.ty).0,
@@ -867,6 +897,11 @@ fn validate_ident(name: &str, what: &str) {
         "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
         "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
         "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+        // `gen` became a reserved keyword in edition 2024 (gen blocks). The
+        // generated bindings are compiled in the consumer's edition, so a
+        // schema name of `gen`/`r#gen` would emit a bare `gen` ident that fails
+        // to compile there. Reject up front with an actionable message.
+        "gen",
     ];
     const GO: &[&str] = &[
         "break",
