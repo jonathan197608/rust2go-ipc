@@ -5,8 +5,12 @@
 //! unchanged. Switch a dependency with a Cargo alias:
 //!
 //! ```toml
-//! rust2go = { package = "rust2go-ipc", version = "0.1" }
+//! rust2go = { package = "rust2go-ipc", version = "0.2" }
 //! ```
+//!
+//! For async calls that must not hang on a wedged Go handler, the companion
+//! `rust2go-ipc-result` crate adds `#[r2g_result]`, which generates parallel
+//! wrappers returning `Result<Resp, IpcError>` with a timeout.
 //!
 //! Runtime (non-build) symbols are re-exported from upstream `rust2go` because
 //! proc-macro expansions from `rust2go-macro` reference `::rust2go::*` paths,
@@ -19,6 +23,11 @@ pub use rust2go::{
 };
 
 pub const DEFAULT_BINDING_FILE: &str = "_go_bindings.rs";
+
+/// Transport-level error and timeout config for the optional `#[r2g_result]`
+/// wrapper (companion crate `rust2go-ipc-result`). Dependency-free by design.
+pub mod result;
+pub use result::{async_timeout, async_timeout_secs, IpcError, DEFAULT_ASYNC_TIMEOUT};
 
 #[cfg(feature = "build")]
 mod builder;
