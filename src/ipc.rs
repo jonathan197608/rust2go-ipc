@@ -905,6 +905,17 @@ pub unsafe fn dispatch_sync(
     cb: *const (),
     handler: ResponseHandler,
 ) {
+    // Mirror dispatch/dispatch_oneway: reject oversized payloads BEFORE any
+    // side effect. Otherwise build_frame's assert fires only after runtime()
+    // has spawned the Go server + reactor, consumed a req_id and opened a
+    // connection — and if first-time startup itself fails, the 30s readiness
+    // error masks the real "payload too large" cause. Sync has no cleanup
+    // (stack Option<T>), so there is no slot bookkeeping to undo here.
+    assert!(
+        payload.len() <= MAX_PAYLOAD,
+        "rust2go-ipc: request payload too large ({})",
+        payload.len()
+    );
     let rt = runtime(_server, port);
     let req_id = next_req_id(rt);
     // Dedicated connection to the resolved endpoint: overrides may differ

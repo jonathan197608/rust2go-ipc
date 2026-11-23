@@ -198,6 +198,31 @@ impl GoCompilerArgs for CustomArgGoCompiler {
     }
 }
 
+/// Write a generated file atomically: truncate-in-place (fs::write) can leave
+/// a half-written .go file if the build is killed mid-write (OOM/signal/disk
+/// full). Since generated outputs are excluded from rerun-if-changed, a stale
+/// truncated file would be fed straight to `go build` with a confusing syntax
+/// error. A same-directory temp file + rename is atomic on all targets, so the
+/// destination is always either the old complete file or the new complete one.
+fn write_generated(dst: &std::path::Path, bytes: &[u8]) {
+    let tmp = dst.with_extension(format!(
+        "{}.tmp",
+        dst.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    fs::write(&tmp, bytes)
+        .unwrap_or_else(|e| panic!("rust2go-ipc: cannot write temp {}: {e}", tmp.display()));
+    // Windows cannot rename over an existing file; remove it first. There is a
+    // tiny window where dst is absent, but a build already failed if we got
+    // here with a being-rewritten source set, so no concurrent consumer reads it.
+    #[cfg(windows)]
+    if dst.exists() {
+        fs::remove_file(dst)
+            .unwrap_or_else(|e| panic!("rust2go-ipc: cannot replace {}: {e}", dst.display()));
+    }
+    fs::rename(&tmp, dst)
+        .unwrap_or_else(|e| panic!("rust2go-ipc: cannot install {}: {e}", dst.display()));
+}
+
 impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
     /// Generate pure-Go sources and Rust binding mirrors, then compile the
     /// Go IPC server.
@@ -217,9 +242,27 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
             PathBuf::from(&self.regen_dst)
         };
         // `go build .` always runs in `go_dir`; writing gen.go elsewhere would
-        // silently compile a stale file. Fail loudly instead.
-        assert!(
-            regen_dst.parent() == Some(go_dir.as_path()),
+        // silently compile a stale file. Fail loudly instead. Compare the
+        // canonicalized parents so an equivalent path spelled with `.`/`..`
+        // (e.g. `./golang/gen.go`) is not rejected, while a genuinely different
+        // directory still fails. Canonicalize the parent, not the file: the
+        // generated file may not exist yet on a fresh build.
+        let regen_parent = regen_dst.parent().unwrap_or(std::path::Path::new(""));
+        let canon_go_dir = fs::canonicalize(&go_dir).unwrap_or_else(|e| {
+            panic!(
+                "rust2go-ipc: cannot resolve go_src {}: {e}",
+                go_dir.display()
+            )
+        });
+        let canon_regen_parent = fs::canonicalize(regen_parent).unwrap_or_else(|e| {
+            panic!(
+                "rust2go-ipc: cannot resolve regen dst parent {}: {e}",
+                regen_parent.display()
+            )
+        });
+        assert_eq!(
+            canon_regen_parent,
+            canon_go_dir,
             "rust2go-ipc: regen dst must be inside go_src ({} vs {})",
             regen_dst.display(),
             go_dir.display()
@@ -268,10 +311,10 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         let port = crate::ipc::free_port();
 
         let rust = generate_rust_bindings(&schema, port);
-        fs::write(out_dir.join(binding_name), rust.to_string()).expect("cannot write bindings");
+        write_generated(&out_dir.join(binding_name), rust.to_string().as_bytes());
 
         let go_gen = generate_go_sources(&schema);
-        fs::write(&regen_dst, &go_gen).expect("cannot write Go sources");
+        write_generated(&regen_dst, go_gen.as_bytes());
 
         // ipc_main.go is a generated artifact, rewritten on every build. This
         // is expected (the project deliberately does not hand-edit it), so do
@@ -280,7 +323,7 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         // check perpetually false and producing persistent build noise.
         let ipc_main = go_dir.join("ipc_main.go");
         let main_src = generate_go_main();
-        fs::write(&ipc_main, main_src).expect("cannot write Go main");
+        write_generated(&ipc_main, main_src.as_bytes());
 
         // Keep generated Go sources gofmt-clean when the tool is available.
         let gofmt = find_gofmt();
@@ -965,7 +1008,12 @@ const GO_FIXED_SYMBOLS: &[&str] = &[
     "main",
     "serve",
     "init",
-    // Go predeclared identifiers that a same-named type would shadow
+    // Go predeclared identifiers that a same-named type would shadow.
+    // Note: `comparable`, `min`, `max`, `clear` (added in Go 1.18/1.21) are
+    // deliberately NOT rejected — Go permits shadowing predeclared names and
+    // the generated code never calls them, so a user type named `max` is legal
+    // and must keep working. Only names the generator itself relies on belong
+    // in this list.
     "string",
     "error",
     "any",
