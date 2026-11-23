@@ -38,10 +38,16 @@ const MAGIC: [u8; 4] = *b"R2GI";
 const VERSION: u16 = 1;
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const DEFAULT_PENDING_TTL: u64 = 600;
+/// Upper bound for `RUST2GO_IPC_PENDING_TTL_SECS` (24 h). Beyond this a stuck
+/// request would pin its slot/writer essentially forever.
+const MAX_PENDING_TTL: u64 = 86_400;
 const SWEEP_INTERVAL: u64 = 30;
 /// A hung Go handler must not block a synchronous business thread for the
 /// async-scale TTL; sync calls get a shorter, independent timeout.
 const DEFAULT_SYNC_TIMEOUT: u64 = 30;
+/// Upper bound for `RUST2GO_IPC_SYNC_TIMEOUT_SECS` (24 h). Guards against a
+/// syntactically valid but absurd `u64::MAX` disabling the deadline entirely.
+const MAX_SYNC_TIMEOUT: u64 = 86_400;
 /// A self-referential struct (e.g. `Node { children: Vec<Node> }`) is legal Rust
 /// but produces unbounded mutual recursion in the generated restore helpers.
 /// A corrupt/hostile 64MB frame could otherwise drive millions of nested calls
@@ -94,13 +100,32 @@ fn env_nonempty(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// Read the synchronous-call timeout, rejecting 0 so a misconfiguration cannot
-/// disable the deadline entirely.
+/// Read a positive seconds value from `key`, clamped to `1..=max`.
+///
+/// Both bounds matter: 0 would disable the deadline entirely, while a huge but
+/// syntactically valid u64 (e.g. `u64::MAX`) turns "30 s timeout" into an
+/// effectively infinite wait, so a wedged Go handler blocks the caller forever
+/// with no diagnostic. Out-of-range values warn on stderr and fall back rather
+/// than panic — env parsing happens on business call paths and in the runtime
+/// init closure, and a panic there would either crash the process or poison the
+/// one-shot runtime for the entire process lifetime.
+fn bounded_env_secs(key: &str, max: u64, default: u64) -> u64 {
+    match env_nonempty(key) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if (1..=max).contains(&n) => n,
+            _ => {
+                eprintln!("rust2go-ipc: invalid {key}={v:?} (expected 1..={max}); using {default}");
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Read the synchronous-call timeout, rejecting 0 and absurdly large values so
+/// a misconfiguration cannot disable the deadline entirely.
 fn sync_timeout_secs() -> u64 {
-    env_nonempty(ENV_SYNC_TIMEOUT)
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_SYNC_TIMEOUT)
+    bounded_env_secs(ENV_SYNC_TIMEOUT, MAX_SYNC_TIMEOUT, DEFAULT_SYNC_TIMEOUT)
 }
 
 /// Resolve the endpoint shared by the Rust client and the Go server.
@@ -221,6 +246,18 @@ impl IpcStream {
             IpcStream::Tcp(s) => s.set_write_timeout(Some(timeout)),
             #[cfg(unix)]
             IpcStream::Unix(s) => s.set_write_timeout(Some(timeout)),
+        }
+    }
+
+    /// Disable Nagle on the TCP (Windows) transport. Every IPC frame is a small
+    /// header + payload followed immediately by the peer's response; with
+    /// Nagle + delayed ACK this interaction can add ~40 ms of latency per call.
+    /// Unix uses UDS, which has no Nagle semantics, so this is a no-op there.
+    fn disable_nagle(&self) -> io::Result<()> {
+        match self {
+            IpcStream::Tcp(s) => s.set_nodelay(true),
+            #[cfg(unix)]
+            IpcStream::Unix(_) => Ok(()),
         }
     }
 
@@ -698,10 +735,11 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
             kill_and_reap(&mut child);
             panic!("rust2go-ipc: cannot configure IPC stream timeouts: {e}");
         }
-        let ttl = env_nonempty("RUST2GO_IPC_PENDING_TTL_SECS")
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_PENDING_TTL);
+        let ttl = bounded_env_secs(
+            "RUST2GO_IPC_PENDING_TTL_SECS",
+            MAX_PENDING_TTL,
+            DEFAULT_PENDING_TTL,
+        );
 
         // Box::leak gives the reactor a `&'static Runtime` up front, removing
         // the startup spin-wait on OnceLock and letting a spawn failure below
@@ -788,7 +826,12 @@ fn connect_with_retry(endpoint: &Endpoint, timeout: Duration) -> Option<IpcStrea
             Transport::Unix => UnixStream::connect(&endpoint.addr).map(IpcStream::Unix),
         };
         match result {
-            Ok(s) => return Some(s),
+            Ok(s) => {
+                // Best-effort: older/unusual stacks may reject TCP_NODELAY; the
+                // transport still works, only with higher small-frame latency.
+                let _ = s.disable_nagle();
+                return Some(s);
+            }
             Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(10)),
             Err(_) => return None,
         }
@@ -1279,7 +1322,14 @@ fn reactor_loop(mut reader: IpcStream, rt: &'static Runtime) {
                 }
                 drop_all_pending(rt);
                 // The only recovery thread must survive a panic in reconnect.
+                // Exit the retry loop on shutdown: reconnect() returns false
+                // immediately once SHUTTING_DOWN is set, and without this check
+                // the thread would spin forever printing "retrying" at process
+                // exit (including during atexit's blocking taskkill wait).
                 loop {
+                    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                        return;
+                    }
                     match catch_unwind(AssertUnwindSafe(|| reconnect(rt, &mut reader))) {
                         Ok(true) => break,
                         Ok(false) => eprintln!("rust2go-ipc: reconnect failed; retrying"),

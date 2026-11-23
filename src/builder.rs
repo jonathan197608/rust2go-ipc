@@ -205,22 +205,31 @@ impl GoCompilerArgs for CustomArgGoCompiler {
 /// error. A same-directory temp file + rename is atomic on all targets, so the
 /// destination is always either the old complete file or the new complete one.
 fn write_generated(dst: &std::path::Path, bytes: &[u8]) {
-    let tmp = dst.with_extension(format!(
-        "{}.tmp",
-        dst.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
+    let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let tmp = dst.with_extension(format!("{ext}.tmp"));
     fs::write(&tmp, bytes)
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot write temp {}: {e}", tmp.display()));
-    // Windows cannot rename over an existing file; remove it first. There is a
-    // tiny window where dst is absent, but a build already failed if we got
-    // here with a being-rewritten source set, so no concurrent consumer reads it.
+    // Unix rename() atomically replaces dst. Windows rename may refuse to
+    // overwrite a dst that is momentarily locked by an editor/AV, so first move
+    // the old complete file aside; if installing the new file then fails we
+    // restore the backup instead of leaving dst missing (which would make the
+    // subsequent `go build` fail on a file that used to be perfectly valid).
+    #[cfg(windows)]
+    let bak = dst.with_extension(format!("{ext}.bak"));
     #[cfg(windows)]
     if dst.exists() {
-        fs::remove_file(dst)
-            .unwrap_or_else(|e| panic!("rust2go-ipc: cannot replace {}: {e}", dst.display()));
+        let _ = fs::remove_file(&bak); // drop a stale backup from a prior failed run
+        fs::rename(dst, &bak)
+            .unwrap_or_else(|e| panic!("rust2go-ipc: cannot back up {}: {e}", dst.display()));
     }
-    fs::rename(&tmp, dst)
-        .unwrap_or_else(|e| panic!("rust2go-ipc: cannot install {}: {e}", dst.display()));
+    let installed = fs::rename(&tmp, dst);
+    #[cfg(windows)]
+    if installed.is_err() && bak.exists() {
+        let _ = fs::rename(&bak, dst); // best-effort rollback to the previous file
+    }
+    installed.unwrap_or_else(|e| panic!("rust2go-ipc: cannot install {}: {e}", dst.display()));
+    #[cfg(windows)]
+    let _ = fs::remove_file(&bak); // new file is in place; drop the backup
 }
 
 impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
@@ -380,7 +389,14 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
             }
         }
 
+        // On Windows the path's backslashes must become '/' because env!()
+        // inlines it as a Rust string literal where '\' starts an escape, and
+        // Command::new accepts '/' on Windows. On Unix '\' is a legal filename
+        // byte, so converting it would point at a different (nonexistent) path.
+        #[cfg(windows)]
         let server_lit = server_out.to_string_lossy().replace('\\', "/");
+        #[cfg(not(windows))]
+        let server_lit = server_out.to_string_lossy().into_owned();
         println!("cargo:rustc-env=RUST2GO_IPC_SERVER={server_lit}");
         println!("cargo:rustc-env=RUST2GO_IPC_PORT={port}");
     }

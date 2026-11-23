@@ -1,10 +1,9 @@
 use super::*;
 use std::mem::align_of;
 
-// ENV_ENDPOINT_OVERRIDE is process-global. cargo test runs tests in parallel
-// threads, so the tests that set/remove it must serialize or one can observe
-// another's override and fail spuriously. Only unix tests touch this env var.
-#[cfg(unix)]
+// Env vars are process-global. cargo test runs tests in parallel threads, so
+// tests that set/remove any RUST2GO_IPC_* env var must serialize or one can
+// observe another's value and fail spuriously.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
@@ -333,4 +332,42 @@ fn sync_oversized_payload_panics_before_initializing_runtime() {
             handler,
         );
     }
+}
+
+#[test]
+fn bounded_env_secs_accepts_valid_range() {
+    let key = "RUST2GO_IPC_TEST_BOUNDED_SECS";
+    let _g = ENV_LOCK.lock().unwrap();
+    for (raw, expected) in [("1", 1), ("30", 30), ("86400", 86400)] {
+        std::env::set_var(key, raw);
+        assert_eq!(bounded_env_secs(key, 86400, 30), expected, "raw={raw}");
+    }
+    std::env::remove_var(key);
+}
+
+#[test]
+fn bounded_env_secs_rejects_zero_overflow_and_garbage() {
+    let key = "RUST2GO_IPC_TEST_BOUNDED_SECS";
+    let _g = ENV_LOCK.lock().unwrap();
+    // 0, negatives, float, leading whitespace, above-max, overflow and
+    // absurd-but-valid u64 all fall back to the default.
+    for raw in [
+        "0",
+        "-1",
+        "1.5",
+        " 5",
+        "86401",
+        "18446744073709551615",
+        "abc",
+    ] {
+        std::env::set_var(key, raw);
+        assert_eq!(bounded_env_secs(key, 86400, 30), 30, "raw={raw}");
+    }
+    // A leading '+' is a valid integer literal for both Rust's u64::from_str
+    // and Go's strconv.ParseInt, so both transports agree on the same value.
+    std::env::set_var(key, "+5");
+    assert_eq!(bounded_env_secs(key, 86400, 30), 5);
+    // Unset also yields the default.
+    std::env::remove_var(key);
+    assert_eq!(bounded_env_secs(key, 86400, 30), 30);
 }

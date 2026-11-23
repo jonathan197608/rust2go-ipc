@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -34,7 +35,21 @@ const maxAcceptErrs = 10
 // or overwhelm downstream services. Set RUST2GO_IPC_MAX_CONCURRENCY to tune.
 var sem chan struct{}
 
+// How long serve waits for a semaphore slot before tearing down the connection.
+// It must outlast the Rust caller's sync deadline, else a configured long
+// RUST2GO_IPC_SYNC_TIMEOUT_SECS is silently cut short by a 60 s teardown. Defaults
+// to 60 s; mirrors the Rust-side clamp (1..=86400) so invalid values agree.
+var semWaitTimeout time.Duration
+
 func init() {
+	semWaitTimeout = 60 * time.Second
+	if v := os.Getenv("RUST2GO_IPC_SYNC_TIMEOUT_SECS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 1 && n <= 86400 {
+			if d := time.Duration(n)*time.Second + 30*time.Second; d > semWaitTimeout {
+				semWaitTimeout = d
+			}
+		}
+	}
 	n := runtime.NumCPU() * 4
 	if n < 16 {
 		n = 16
@@ -131,6 +146,12 @@ func main() {
 }
 
 func serve(conn net.Conn) {
+	// Mirror the Rust client's TCP_NODELAY: IPC frames are small and followed
+	// immediately by a response, so Nagle + delayed ACK would add ~40 ms/call.
+	// Unix uses UDS; this type assertion simply fails there and is a no-op.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
 	var writeMu sync.Mutex
 	var wg sync.WaitGroup
 	done := make(chan struct{})
@@ -183,9 +204,11 @@ func serve(conn net.Conn) {
 			return
 		}
 		if string(hdr[0:4]) != magic {
+			fmt.Fprintf(os.Stderr, "rust2go-ipc: bad request magic %q (expected %q); closing connection\n", hdr[0:4], magic)
 			return
 		}
-		if binary.LittleEndian.Uint16(hdr[4:6]) != version {
+		if got := binary.LittleEndian.Uint16(hdr[4:6]); got != version {
+			fmt.Fprintf(os.Stderr, "rust2go-ipc: unsupported request version %d (expected %d); check for a stale go-ipc-server binary\n", got, version)
 			return
 		}
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
@@ -208,9 +231,10 @@ func serve(conn net.Conn) {
 		// hung handler the timeout fires. Without the timeout the Rust caller
 		// times out and closes its side, but this serve goroutine would block
 		// forever on the channel (a read deadline does not cover channel ops),
-		// leaking a goroutine. Both paths are bounded. The wait exceeds the
-		// Rust sync timeout (30 s) so normal queuing is not cut short.
-		semWait.Reset(60 * time.Second)
+		// leaking a goroutine. Both paths are bounded. The wait is derived from
+		// the Rust sync timeout so normal queuing is not cut short even when a
+		// caller configures a longer deadline.
+		semWait.Reset(semWaitTimeout)
 		select {
 		case sem <- struct{}{}:
 			if !semWait.Stop() {
