@@ -11,9 +11,9 @@ use std::{env, fmt, time::Duration};
 /// Timeout applied by generated `#[r2g_result]` async wrappers (seconds).
 pub const ENV_ASYNC_TIMEOUT: &str = "RUST2GO_IPC_ASYNC_TIMEOUT_SECS";
 
-/// Default async-call timeout: long enough for heavy reports, short enough to
-/// bound a wedged Go handler's blast radius.
-pub const DEFAULT_ASYNC_TIMEOUT: u64 = 60;
+/// Default async-call timeout: long enough for heavy reports (10 minutes),
+/// still bounded so a wedged Go handler cannot pin a slot forever.
+pub const DEFAULT_ASYNC_TIMEOUT: u64 = 600;
 
 /// Upper bound, consistent with the IPC sync/TTL knobs (24 h).
 pub const MAX_ASYNC_TIMEOUT: u64 = 86_400;
@@ -25,7 +25,7 @@ pub const MAX_ASYNC_TIMEOUT: u64 = 86_400;
 /// business layer keeps its existing error handling untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcError {
-    /// The call did not return a response within the configured deadline.
+    /// The async call did not return a response within the configured deadline.
     ///
     /// Dropping the inner future releases the slot, so this error is a clean
     /// convergence point instead of a permanently pending future.
@@ -35,6 +35,60 @@ pub enum IpcError {
         /// Deadline that elapsed, in seconds.
         secs: u64,
     },
+    /// A synchronous call did not receive a response before its read deadline.
+    SyncTimeout {
+        /// Method name, for diagnostics.
+        method: String,
+        /// Deadline that elapsed, in seconds.
+        secs: u64,
+        /// Where the deadline expired (`connect`, `read`, ...).
+        stage: String,
+    },
+    /// The Go server could not be reached.
+    Connect {
+        /// Method name, for diagnostics.
+        method: String,
+    },
+    /// Socket setup or request write failed.
+    Write {
+        /// Method name, for diagnostics.
+        method: String,
+        /// Underlying OS error text.
+        detail: String,
+    },
+    /// Reading the response failed (including the sync read deadline).
+    Read {
+        /// Method name, for diagnostics.
+        method: String,
+        /// Underlying OS error text.
+        detail: String,
+    },
+    /// Response was malformed or did not match the request.
+    Protocol {
+        /// Method name, for diagnostics.
+        method: String,
+        /// Human-readable mismatch description.
+        detail: String,
+    },
+    /// Response decode panicked. Only recoverable under `panic = "unwind"`.
+    Decode {
+        /// Method name, for diagnostics.
+        method: String,
+        /// Panic payload text.
+        detail: String,
+    },
+    /// The server replied but no value reached the slot.
+    NoResponse {
+        /// Method name, for diagnostics.
+        method: String,
+    },
+    /// Request exceeded the protocol payload limit.
+    PayloadTooLarge {
+        /// Method name, for diagnostics.
+        method: String,
+        /// Actual payload length.
+        len: usize,
+    },
 }
 
 impl fmt::Display for IpcError {
@@ -42,6 +96,35 @@ impl fmt::Display for IpcError {
         match self {
             IpcError::Timeout { method, secs } => {
                 write!(f, "async call `{method}` timed out after {secs}s")
+            }
+            IpcError::SyncTimeout {
+                method,
+                secs,
+                stage,
+            } => write!(
+                f,
+                "sync call `{method}` timed out after {secs}s while {stage}"
+            ),
+            IpcError::Connect { method } => {
+                write!(f, "sync call `{method}` cannot connect to Go server")
+            }
+            IpcError::Write { method, detail } => {
+                write!(f, "sync call `{method}` write failed: {detail}")
+            }
+            IpcError::Read { method, detail } => {
+                write!(f, "sync call `{method}` read failed: {detail}")
+            }
+            IpcError::Protocol { method, detail } => {
+                write!(f, "sync call `{method}` protocol error: {detail}")
+            }
+            IpcError::Decode { method, detail } => {
+                write!(f, "sync call `{method}` response decode panicked: {detail}")
+            }
+            IpcError::NoResponse { method } => {
+                write!(f, "sync call `{method}` returned no response")
+            }
+            IpcError::PayloadTooLarge { method, len } => {
+                write!(f, "sync call `{method}` request payload too large ({len})")
             }
         }
     }
@@ -92,5 +175,30 @@ mod tests {
         let secs = async_timeout_secs();
         assert!((1..=MAX_ASYNC_TIMEOUT).contains(&secs));
         assert_eq!(async_timeout(), Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn default_async_timeout_is_ten_minutes() {
+        assert_eq!(DEFAULT_ASYNC_TIMEOUT, 600);
+    }
+
+    #[test]
+    fn sync_error_display_includes_method_and_stage() {
+        let e = IpcError::SyncTimeout {
+            method: "newID".to_string(),
+            secs: 30,
+            stage: "read".to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "sync call `newID` timed out after 30s while read"
+        );
+        assert_eq!(
+            IpcError::NoResponse {
+                method: "newID".to_string()
+            }
+            .to_string(),
+            "sync call `newID` returned no response"
+        );
     }
 }

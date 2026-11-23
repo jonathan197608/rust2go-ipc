@@ -1491,6 +1491,39 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 flatten_expr(&p.ty, quote! { #id })
             })
             .collect();
+        // Result wrappers receive owned values (the trait signature) but the
+        // binding stub/flatten helpers consume Refs. Mirror upstream's
+        // `ToRef::calc_ref` conversion so the wrapper keeps the public API.
+        let owned_param_decls: Vec<TokenStream> = m
+            .params
+            .iter()
+            .map(|p| {
+                let id = format_ident!("{}", p.name);
+                let ty = rust_owned_path(&p.ty, schema);
+                quote! { #id: #ty }
+            })
+            .collect();
+        let to_ref_stmts: Vec<TokenStream> = m
+            .params
+            .iter()
+            .map(|p| {
+                let id = format_ident!("{}", p.name);
+                let buf = format_ident!("__r2g_buf_{}", p.name);
+                let tmp = format_ident!("__r2g_ref_{}", p.name);
+                let ref_ty = rust_ref_type(&p.ty);
+                if m.go_ptr {
+                    quote! {
+                        let (#buf, #tmp) = ::rust2go::ToRef::calc_ref(&#id);
+                        let #id: #ref_ty = ::std::mem::transmute(#tmp);
+                    }
+                } else {
+                    quote! {
+                        let (#buf, #tmp) = ::rust2go::ToRef::calc_ref(#id);
+                        let #id: #ref_ty = ::std::mem::transmute(#tmp);
+                    }
+                }
+            })
+            .collect();
 
         match (&m.resp, m.is_async) {
             (Some(resp), is_async) => {
@@ -1531,6 +1564,44 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                         );
                     }
                 });
+
+                if !is_async {
+                    let try_stub = format_ident!("__r2g_try_{}", stub);
+                    let flatten_for_try = flatten_stmts.clone();
+                    let to_ref_for_try = to_ref_stmts.clone();
+                    out.extend(quote! {
+                        #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref)]
+                        pub unsafe fn #try_stub(#(#owned_param_decls,)*)
+                            -> ::core::result::Result<#resp_owned, ::rust2go::IpcError>
+                        {
+                            let mut enc = ::rust2go::ipc::Encoder::new();
+                            {
+                                let enc = &mut enc;
+                                #(#to_ref_for_try)*
+                                #(#flatten_for_try)*
+                            }
+                            let mut slot: ::core::option::Option<#resp_owned> =
+                                ::core::option::Option::None;
+                            let handler = ::rust2go::ipc::ResponseHandler::new(
+                                #tramp,
+                                ::core::option::Option::None,
+                            );
+                            ::rust2go::ipc::dispatch_sync_result(
+                                env!("RUST2GO_IPC_SERVER"),
+                                #port,
+                                #method_id,
+                                #method_name_str,
+                                &enc.take(),
+                                &slot as *const _ as *const (),
+                                ::core::ptr::null(),
+                                handler,
+                            )?;
+                            slot.take().ok_or(::rust2go::IpcError::NoResponse {
+                                method: #method_name_str.to_string(),
+                            })
+                        }
+                    });
+                }
 
                 let owned_types: Vec<TokenStream> = m
                     .params
@@ -1608,6 +1679,9 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 }
             }
             (None, _) => {
+                let try_stub = format_ident!("__r2g_try_{}", stub);
+                let flatten_for_try = flatten_stmts.clone();
+                let to_ref_for_try = to_ref_stmts.clone();
                 out.extend(quote! {
                     #[allow(non_snake_case, clippy::missing_safety_doc)]
                     pub unsafe fn #stub(#(#param_decls,)*) {
@@ -1622,6 +1696,25 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                             #method_id,
                             &enc.take(),
                         );
+                    }
+
+                    #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref)]
+                    pub unsafe fn #try_stub(#(#owned_param_decls,)*)
+                        -> ::core::result::Result<(), ::rust2go::IpcError>
+                    {
+                        let mut enc = ::rust2go::ipc::Encoder::new();
+                        {
+                            let enc = &mut enc;
+                            #(#to_ref_for_try)*
+                            #(#flatten_for_try)*
+                        }
+                        ::rust2go::ipc::dispatch_oneway_result(
+                            env!("RUST2GO_IPC_SERVER"),
+                            #port,
+                            #method_id,
+                            #method_name_str,
+                            &enc.take(),
+                        )
                     }
                 });
             }

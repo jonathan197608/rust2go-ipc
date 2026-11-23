@@ -6,6 +6,7 @@
 //! the original rust2go `*_cb` function, which writes into the atomic slot and
 //! wakes the awaiting future.
 
+use crate::result::IpcError;
 use std::{
     any::Any,
     collections::HashMap,
@@ -124,7 +125,7 @@ fn bounded_env_secs(key: &str, max: u64, default: u64) -> u64 {
 
 /// Read the synchronous-call timeout, rejecting 0 and absurdly large values so
 /// a misconfiguration cannot disable the deadline entirely.
-fn sync_timeout_secs() -> u64 {
+pub fn sync_timeout_secs() -> u64 {
     bounded_env_secs(ENV_SYNC_TIMEOUT, MAX_SYNC_TIMEOUT, DEFAULT_SYNC_TIMEOUT)
 }
 
@@ -995,7 +996,7 @@ fn next_req_id(rt: &Runtime) -> u64 {
 /// `slot` points at a stack `Option<T>` owned by the caller; `cb` and
 /// `trampoline` are generated functions.
 pub unsafe fn dispatch_sync(
-    _server: &str,
+    server: &str,
     port: u16,
     method_id: u32,
     payload: &[u8],
@@ -1003,62 +1004,116 @@ pub unsafe fn dispatch_sync(
     cb: *const (),
     handler: ResponseHandler,
 ) {
+    let method = method_id.to_string();
+    if let Err(err) =
+        dispatch_sync_inner(server, port, method_id, &method, payload, slot, cb, handler)
+    {
+        panic!("rust2go-ipc: sync call to method {method_id} failed: {err}");
+    }
+}
+
+/// Non-panicking sync dispatch, used by `#[r2g_result]` generated wrappers.
+///
+/// The original `dispatch_sync` keeps its panic-on-error contract for old
+/// call sites; this variant surfaces every transport/protocol failure as an
+/// `IpcError` so `panic = "abort"` binaries can converge with `Result`.
+///
+/// # Safety
+/// `slot` points at a live stack `Option<T>` owned by the generated wrapper;
+/// `cb` and `handler.trampoline` are generated functions.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_sync_result(
+    server: &str,
+    port: u16,
+    method_id: u32,
+    method: &'static str,
+    payload: &[u8],
+    slot: *const (),
+    cb: *const (),
+    handler: ResponseHandler,
+) -> Result<(), IpcError> {
+    dispatch_sync_inner(server, port, method_id, method, payload, slot, cb, handler)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn dispatch_sync_inner(
+    server: &str,
+    port: u16,
+    method_id: u32,
+    method: &str,
+    payload: &[u8],
+    slot: *const (),
+    cb: *const (),
+    handler: ResponseHandler,
+) -> Result<(), IpcError> {
     // Mirror dispatch/dispatch_oneway: reject oversized payloads BEFORE any
     // side effect. Otherwise build_frame's assert fires only after runtime()
     // has spawned the Go server + reactor, consumed a req_id and opened a
-    // connection — and if first-time startup itself fails, the 30s readiness
-    // error masks the real "payload too large" cause. Sync has no cleanup
-    // (stack Option<T>), so there is no slot bookkeeping to undo here.
-    assert!(
-        payload.len() <= MAX_PAYLOAD,
-        "rust2go-ipc: request payload too large ({})",
-        payload.len()
-    );
-    let rt = runtime(_server, port);
+    // connection — and if first-time startup itself fails, the readiness
+    // error masks the real cause. Sync has no cleanup (stack Option<T>).
+    if payload.len() > MAX_PAYLOAD {
+        return Err(IpcError::PayloadTooLarge {
+            method: method.to_string(),
+            len: payload.len(),
+        });
+    }
+    let rt = runtime(server, port);
     let req_id = next_req_id(rt);
     // Dedicated connection to the resolved endpoint: overrides may differ
     // from the build-time constant passed in `port`.
-    // A synchronous rust2go stub always does `slot.take().unwrap()` after this
-    // call. Returning with the slot unset (and sync handlers have no cleanup)
-    // would panic in the macro with a useless "None" message. There is no error
-    // channel in the sync signature, so surface a descriptive panic here with
-    // the method id and cause; the generated stub is a plain Rust `unsafe fn`,
-    // so unwinding reaches the caller safely.
     let Some(mut stream) = connect_with_retry(&rt.endpoint, Duration::from_secs(10)) else {
-        panic!("rust2go-ipc: sync call to method {method_id} failed: cannot connect to Go server");
+        return Err(IpcError::Connect {
+            method: method.to_string(),
+        });
     };
-    // A silent timeout failure would leave this blocking read unbounded: the
-    // sync stub has no error channel, so a wedged server would hang the caller
-    // forever. Fail fast with the same descriptive panic used for the rest of
-    // the sync path (startup/reconnect already treat this as fatal).
-    if let Err(e) = stream.set_read_timeout(Duration::from_secs(sync_timeout_secs())) {
-        panic!("rust2go-ipc: sync call to method {method_id} failed: cannot set read timeout: {e}");
+    let secs = sync_timeout_secs();
+    if let Err(e) = stream.set_read_timeout(Duration::from_secs(secs)) {
+        return Err(IpcError::Write {
+            method: method.to_string(),
+            detail: format!("cannot set read timeout: {e}"),
+        });
     }
     if let Err(e) = stream.set_write_timeout(Duration::from_secs(30)) {
-        panic!(
-            "rust2go-ipc: sync call to method {method_id} failed: cannot set write timeout: {e}"
-        );
+        return Err(IpcError::Write {
+            method: method.to_string(),
+            detail: format!("cannot set write timeout: {e}"),
+        });
     }
     let frame = build_frame(req_id, method_id, payload);
     if let Err(e) = stream.write_all(&frame).and_then(|_| stream.flush()) {
-        panic!("rust2go-ipc: sync call to method {method_id} failed: cannot write request: {e}");
+        return Err(IpcError::Write {
+            method: method.to_string(),
+            detail: format!("cannot write request: {e}"),
+        });
     }
 
     let (resp_id, status, resp) = match read_response(&mut stream) {
         Ok(v) => v,
+        Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
+            return Err(IpcError::SyncTimeout {
+                method: method.to_string(),
+                secs,
+                stage: "read".to_string(),
+            })
+        }
         Err(e) => {
-            panic!(
-                "rust2go-ipc: sync call to method {method_id} failed: cannot read response: {e}"
-            );
+            return Err(IpcError::Read {
+                method: method.to_string(),
+                detail: e.to_string(),
+            })
         }
     };
     if resp_id != req_id {
-        panic!(
-            "rust2go-ipc: sync call to method {method_id} failed: response id mismatch ({resp_id} != {req_id})"
-        );
+        return Err(IpcError::Protocol {
+            method: method.to_string(),
+            detail: format!("response id mismatch ({resp_id} != {req_id})"),
+        });
     }
     if status != 0 {
-        panic!("rust2go-ipc: sync call to method {method_id} failed: Go returned error status");
+        return Err(IpcError::Protocol {
+            method: method.to_string(),
+            detail: "Go returned error status".to_string(),
+        });
     }
     // SAFETY: `slot`/`cb`/`trampoline` come from the generated stub's safety
     // contract; `resp` is a live owned buffer for the duration of this call.
@@ -1069,10 +1124,6 @@ pub unsafe fn dispatch_sync(
         if let Some(f) = handler.cleanup {
             unsafe { f(slot) };
         }
-        // Sync has no error channel: returning with the slot unset would make
-        // the macro's `slot.take().unwrap()` panic with a useless "None" message.
-        // Surface a descriptive panic with the method id, keeping the original
-        // decode panic text as detail when it is a string payload.
         let detail = if let Some(s) = panic.downcast_ref::<&str>() {
             (*s).to_string()
         } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -1080,10 +1131,12 @@ pub unsafe fn dispatch_sync(
         } else {
             "<non-string panic payload>".to_string()
         };
-        panic!(
-            "rust2go-ipc: sync call to method {method_id} (req {req_id}) failed: response decode panicked: {detail}"
-        );
+        return Err(IpcError::Decode {
+            method: method.to_string(),
+            detail,
+        });
     }
+    Ok(())
 }
 
 /// Read exactly `buf.len()` bytes, preserving the reactor's idle-timeout
@@ -1176,6 +1229,33 @@ pub fn dispatch_oneway(server: &str, port: u16, method_id: u32, payload: &[u8]) 
     );
     let rt = runtime(server, port);
     let _ = write_frame(rt, 0, method_id, payload);
+}
+
+/// Non-panicking oneway dispatch for `#[r2g_result]` generated wrappers.
+///
+/// A failed frame write is reported instead of silently discarded; a failure
+/// to start the Go child is still fatal (startup is a process-level event).
+pub fn dispatch_oneway_result(
+    server: &str,
+    port: u16,
+    method_id: u32,
+    method: &'static str,
+    payload: &[u8],
+) -> Result<(), IpcError> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(IpcError::PayloadTooLarge {
+            method: method.to_string(),
+            len: payload.len(),
+        });
+    }
+    let rt = runtime(server, port);
+    if !write_frame(rt, 0, method_id, payload) {
+        return Err(IpcError::Write {
+            method: method.to_string(),
+            detail: "cannot write oneway request frame".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn build_frame(req_id: u64, method_id: u32, payload: &[u8]) -> Vec<u8> {

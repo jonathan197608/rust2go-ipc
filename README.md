@@ -56,13 +56,14 @@ Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives 
 | `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint: socket path on Unix, `host:port` elsewhere. Both sides must agree. |
 | `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. `0` is rejected. |
 | `RUST2GO_IPC_SYNC_TIMEOUT_SECS` | Response deadline for synchronous calls, in seconds. Default `30`, independent of the async pending TTL. `0` is rejected. |
+| `RUST2GO_IPC_ASYNC_TIMEOUT_SECS` | Deadline applied by `#[r2g_result]` async wrappers. Default `600` (10 minutes). `0` is rejected. |
 | `RUST2GO_IPC_MAX_CONCURRENCY` | Max in-flight Go handlers per server. Default `NumCPU*4` (min 16). Lower it to bound downstream load; the read loop applies back-pressure when full. |
 
 ## Failure semantics
 
 The generated Go dispatcher recovers handler panics and returns an error status. The Rust side logs it and drops the pending entry; the awaiting future is resolved by the caller's own timeout, since the rust2go callback signature has no error channel.
 
-**Synchronous calls have no error channel either**: connect/write/read failures, a bad response id, an error status, or the sync timeout make `dispatch_sync` panic with a descriptive message (method id and cause) instead of returning with the slot unset — otherwise the macro's `slot.take().unwrap()` would panic with a useless "None" message. The generated stub is a plain Rust `unsafe fn`, so this panic unwinds normally to the caller. If you cannot tolerate a panic, wrap the call in `catch_unwind`.
+**Raw synchronous calls have no error channel**: connect/write/read failures, a bad response id, an error status, or the sync timeout make `dispatch_sync` panic with a descriptive message instead of returning with the slot unset — otherwise upstream `slot.take().unwrap()` would panic with a useless "None" message. That path is retained for drop-in compatibility. For non-panicking callers, add `#[r2g_result]` and call `GolangCallResult::{method}(...)`: the generated wrapper uses `dispatch_sync_result` / `dispatch_oneway_result` and returns `Result<Resp, IpcError>` (or `Result<(), IpcError>` for oneway), which is safe even under `panic = "abort"`. Do not rely on `catch_unwind` in `panic = "abort"` binaries.
 
 If the connection drops, the reactor clears pending entries and rebuilds the socket pair. It restarts the Go child **only if the process has actually exited** (`try_wait` under the child-management lock); a healthy child that merely had an idle connection closed is reused, so in-process state (a one-way `Init`, caches, pools) survives reconnects. In-flight futures rely on caller timeouts. Rust atomic slots remain memory-safe when a late callback observes a dropped reader. A failed request write shuts the connection down immediately so the reactor rebuilds both ends rather than keeping a frame-desynchronised stream.
 

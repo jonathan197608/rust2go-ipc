@@ -8,9 +8,10 @@
 //! rust2go = { package = "rust2go-ipc", version = "0.2" }
 //! ```
 //!
-//! For async calls that must not hang on a wedged Go handler, the companion
+//! For calls that must not hang or panic on a wedged Go handler, the companion
 //! `rust2go-ipc-result` crate adds `#[r2g_result]`, which generates parallel
-//! wrappers returning `Result<Resp, IpcError>` with a timeout.
+//! wrappers returning `Result<Resp, IpcError>` (also for sync/oneway methods)
+//! with timeouts.
 //!
 //! Runtime (non-build) symbols are re-exported from upstream `rust2go` because
 //! proc-macro expansions from `rust2go-macro` reference `::rust2go::*` paths,

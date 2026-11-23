@@ -335,6 +335,30 @@ fn sync_oversized_payload_panics_before_initializing_runtime() {
 }
 
 #[test]
+fn sync_result_oversized_payload_returns_err_without_panicking() {
+    // The Result path must mirror the old guard but surface it as data so
+    // panic=abort callers can converge without unwinding.
+    unsafe extern "C-unwind" fn noop(_p: *const u8, _n: usize, _s: *const (), _c: *const ()) {}
+    let handler = ResponseHandler::new(noop, None);
+    let huge = vec![0u8; MAX_PAYLOAD + 1];
+    let err = unsafe {
+        dispatch_sync_result(
+            "/nonexistent/rust2go-ipc-test.sock",
+            0,
+            1,
+            "huge",
+            &huge,
+            std::ptr::null(),
+            std::ptr::null(),
+            handler,
+        )
+        .unwrap_err()
+    };
+    assert!(matches!(err, IpcError::PayloadTooLarge { .. }));
+    assert!(err.to_string().contains("payload too large"));
+}
+
+#[test]
 fn bounded_env_secs_accepts_valid_range() {
     let key = "RUST2GO_IPC_TEST_BOUNDED_SECS";
     let _g = ENV_LOCK.lock().unwrap();

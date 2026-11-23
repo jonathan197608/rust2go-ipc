@@ -55,6 +55,10 @@ fn edge_schema_generates_valid_rust_and_go() {
     assert!(rust.contains("CFirst_zero"));
     assert!(rust.contains("CSecond_other"));
     assert!(rust.contains("SlotWriter"));
+    assert!(rust.contains("__r2g_try_CFirst_zero"));
+    assert!(rust.contains("__r2g_try_CFirst_byval"));
+    assert!(rust.contains("dispatch_sync_result"));
+    assert!(rust.contains("dispatch_oneway_result"));
 
     let go = generate_go_sources(&schema);
     assert!(go.contains("var FirstImpl First"));
