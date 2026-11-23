@@ -1472,6 +1472,8 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
         let tramp = format_ident!("__r2g_trampoline_{}_{}", m.trait_name, m.name);
         let cleanup = format_ident!("__r2g_cleanup_{}_{}", m.trait_name, m.name);
         let method_id = m.index;
+        let trait_name_str = m.trait_name.clone();
+        let method_name_str = m.name.clone();
         let param_decls: Vec<TokenStream> = m
             .params
             .iter()
@@ -1536,10 +1538,38 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     .map(|p| rust_owned_path(&p.ty, schema))
                     .collect();
                 let write_back = if is_async {
+                    // The slot writer's "drop exactly once" invariant must not
+                    // depend on the write tail never panicking. Split into two
+                    // phases:
+                    //   1. restore (above) + convert to owned happen BEFORE
+                    //      touching the slot. A panic here leaves the writer
+                    //      unconsumed, so the reactor's cleanup is the sole,
+                    //      correct drop.
+                    //   2. from_ptr + write are wrapped in catch_unwind. From
+                    //      the instant from_ptr runs, the writer is owned by
+                    //      this frame and Rust unwind drops it exactly once;
+                    //      swallowing the panic makes the trampoline return
+                    //      Ok, so the reactor never runs cleanup a second time.
+                    //      (A second drop after the reader was cancelled would
+                    //      double-free the SlotInner.)
                     quote! {
-                        ::rust2go::SlotWriter::<#resp_owned, ((#(#owned_types,)*), Vec<u8>)>
-                            ::from_ptr(slot)
-                            .write(::rust2go::FromRef::from_ref(::std::mem::transmute(&resp)));
+                        let __r2g_owned: #resp_owned =
+                            ::rust2go::FromRef::from_ref(::std::mem::transmute(&resp));
+                        let __r2g_write = ::std::panic::catch_unwind(
+                            ::std::panic::AssertUnwindSafe(|| {
+                                ::rust2go::SlotWriter::<
+                                    #resp_owned,
+                                    ((#(#owned_types,)*), Vec<u8>),
+                                >::from_ptr(slot).write(__r2g_owned);
+                            }),
+                        );
+                        if __r2g_write.is_err() {
+                            eprintln!(concat!(
+                                "rust2go-ipc: response write panicked for ",
+                                #trait_name_str, ".", #method_name_str,
+                                " (slot released once; panic swallowed to avoid double drop)"
+                            ));
+                        }
                     }
                 } else {
                     quote! {

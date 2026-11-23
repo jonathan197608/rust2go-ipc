@@ -3110,6 +3110,7 @@ func dispatch(methodID uint32, payload []byte) (out []byte, ok bool) {
 		}
 	}()
 	d := &dec{b: payload}
+	_ = d
 	switch methodID {
 	case 0:
 		_r0 := restoreEmptyRequestRef(d)

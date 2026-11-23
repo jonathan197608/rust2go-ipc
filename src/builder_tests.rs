@@ -871,3 +871,61 @@ fn include_macro_in_schema_is_rejected() {
     // dropping included R2G types would produce undefined symbols at use sites.
     parse_schema("include!(\"types.rs\");\n");
 }
+
+#[test]
+fn async_write_is_guarded_by_catch_unwind_after_owned_conversion() {
+    // The slot writer must be dropped exactly once. Conversion to the owned
+    // response happens first (a panic there leaves the slot untouched so the
+    // reactor's cleanup is the sole drop); from_ptr + write are then inside a
+    // catch_unwind so a panicking waker cannot reach the reactor and trigger a
+    // second cleanup drop.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct R { pub v: i64 }
+#[r2g]
+pub trait T {
+    async fn get() -> R;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    let owned = rust
+        .find("__r2g_owned")
+        .expect("owned conversion must be emitted");
+    let guard = rust
+        .find("catch_unwind")
+        .expect("async write must be panic-guarded");
+    let from_ptr = rust
+        .find("from_ptr")
+        .expect("slot writer must be reconstructed");
+    assert!(
+        owned < guard,
+        "owned conversion must precede the panic boundary"
+    );
+    assert!(
+        guard < from_ptr,
+        "from_ptr(slot) must be inside catch_unwind"
+    );
+}
+
+#[test]
+fn sync_trampoline_has_no_catch_unwind_guard() {
+    // Sync handlers write straight into a stack Option<T> and carry no cleanup,
+    // so they must not pay for a panic boundary.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct R { pub v: i64 }
+#[r2g]
+pub trait T {
+    fn get() -> R;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    assert!(
+        !rust.contains("catch_unwind"),
+        "sync writes have no cleanup, so no panic guard is needed"
+    );
+}
