@@ -232,6 +232,28 @@ fn write_generated(dst: &std::path::Path, bytes: &[u8]) {
     let _ = fs::remove_file(&bak); // new file is in place; drop the backup
 }
 
+/// Recursively collect every `.go` source under `dir`. `go build .` compiles
+/// imported sub-packages too, so watching only the top level would let edits
+/// to `go_dir/internal/*.go` leave a stale server binary in the Cargo cache.
+/// Symlinked directories are not followed (avoids cycles); depth is capped so
+/// a pathological tree cannot stall a build.
+fn collect_go_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_go_sources(&p, out, depth + 1);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("go") {
+            out.push(p);
+        }
+    }
+}
+
 impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
     /// Generate pure-Go sources and Rust binding mirrors, then compile the
     /// Go IPC server.
@@ -300,22 +322,33 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         // runtime bug is worse than a clear build-time error, so gate here.
         require_go_1_23(&self.go_comp, &go_dir);
         let ipc_main_path = go_dir.join("ipc_main.go");
-        if let Ok(entries) = fs::read_dir(&go_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                // Do not watch our own generated outputs: Cargo would see the
-                // mtime bump on every run and rebuild forever. Hand-written Go
-                // sources (impl.go, function.go, ...) remain watched.
-                if p.extension().and_then(|e| e.to_str()) == Some("go")
-                    && p != regen_dst
-                    && p != ipc_main_path
-                {
-                    println!("cargo:rerun-if-changed={}", p.display());
-                }
+        // Canonicalize the two generated outputs once so equivalent spellings
+        // (`./golang/gen.go` via with_regen vs `golang/gen.go` from read_dir)
+        // compare equal. Otherwise regen_dst would be watched as an input while
+        // also being rewritten as an output -> Cargo rebuilds forever.
+        let canon_regen_dst = fs::canonicalize(&regen_dst).unwrap_or_else(|_| regen_dst.clone());
+        let canon_ipc_main =
+            fs::canonicalize(&ipc_main_path).unwrap_or_else(|_| ipc_main_path.clone());
+        let mut go_sources = Vec::new();
+        collect_go_sources(&go_dir, &mut go_sources, 0);
+        for p in go_sources {
+            // Do not watch our own generated outputs: Cargo would see the
+            // mtime bump on every run and rebuild forever. Hand-written Go
+            // sources (impl.go, internal/*.go, ...) remain watched, including
+            // imported sub-packages that feed `go build .`.
+            let canon_p = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if canon_p != canon_regen_dst && canon_p != canon_ipc_main {
+                println!("cargo:rerun-if-changed={}", p.display());
             }
         }
 
-        let schema = parse_schema(&fs::read_to_string(&src_rs).expect("cannot read schema source"));
+        let schema_src = fs::read_to_string(&src_rs).unwrap_or_else(|e| {
+            panic!(
+                "rust2go-ipc: cannot read schema source {}: {e}",
+                src_rs.display()
+            )
+        });
+        let schema = parse_schema(&schema_src);
         let binding_name = self.binding_name.as_deref().unwrap_or("_go_bindings.rs");
         let port = crate::ipc::free_port();
 
@@ -590,6 +623,19 @@ fn collect_items<'a>(
         "rust2go-ipc: schema module nesting exceeds 64 levels"
     );
     for item in items {
+        // The builder reads a single source file and does not expand macros.
+        // `include!("types.rs")` could hide R2G structs from us while the proc
+        // macro (which does get expanded by rustc) still emits references to
+        // them, producing a confusing "missing derive"/undefined-symbol error.
+        // Fail at build time with an actionable message, same as external mods.
+        if let Item::Macro(m) = item {
+            if m.mac.path.is_ident("include") {
+                panic!(
+                    "rust2go-ipc: include!() is not supported in schema sources; \
+                     inline the R2G types into the schema file instead"
+                );
+            }
+        }
         out.push((item, mod_path.clone()));
         if let Item::Mod(m) = item {
             reject_schema_cfg(&m.attrs, &format!("module `{}`", bare_ident(&m.ident)));
@@ -1841,7 +1887,12 @@ fn generate_go_sources(schema: &Schema) -> String {
     s.push_str("\tdefer func() {\n\t\tif r := recover(); r != nil {\n");
     s.push_str("\t\t\tfmt.Fprintf(os.Stderr, \"rust2go-ipc: Go handler panic: %v\\n\", r)\n");
     s.push_str("\t\t\tout, ok = nil, false\n\t\t}\n\t}()\n");
-    s.push_str("\td := &dec{b: payload}\n\tswitch methodID {\n");
+    s.push_str("\td := &dec{b: payload}\n");
+    // With an empty schema (no methods), zero-parameter methods, or methods
+    // whose params need no decoder, `d` is never read and Go fails to compile
+    // with the misleading "d declared and not used". A blank assignment keeps
+    // it referenced in every case without changing any generated decoder call.
+    s.push_str("\t_ = d\n\tswitch methodID {\n");
     for m in &schema.methods {
         let mut decls = String::new();
         let mut args = String::new();

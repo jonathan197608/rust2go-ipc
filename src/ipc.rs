@@ -487,6 +487,13 @@ static RUNTIME: OnceLock<&'static Runtime> = OnceLock::new();
 #[cfg(unix)]
 static SOCKET_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 static ATEXIT: Once = Once::new();
+/// PID that registered the atexit hook. `fork()` without `exec()` duplicates
+/// the registration into the child; on exit that child must NOT reap/kill the
+/// parent's Go server (or delete its socket dir), so cleanup is skipped when
+/// the running PID differs. IPC is not fork-safe in general (shared fd, copied
+/// req_id counter), but this at least prevents cross-process interference.
+#[cfg(unix)]
+static INIT_PID: AtomicU32 = AtomicU32::new(0);
 /// Set by the atexit hook before reaping the child. `reconnect` checks it so a
 /// concurrent reactor restart cannot spawn a fresh child that outlives exit.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
@@ -510,6 +517,15 @@ fn reap_child(rt: &Runtime) {
 /// Rust does not drop `static` values at process exit. Without this hook the
 /// Go server survives as an orphan, keeping the port/socket occupied.
 extern "C" fn cleanup_on_exit() {
+    // A forked child inherits this atexit registration but not the parent's
+    // Go server. Killing by the inherited pid/Child handle would terminate the
+    // PARENT's server. Skip all cleanup in the child; the parent still runs its
+    // own hook on exit. (IPC itself is not fork-safe — shared fd + copied
+    // req_id — so a forked child should not be issuing new calls either.)
+    #[cfg(unix)]
+    if INIT_PID.load(Ordering::SeqCst) != process_id() {
+        return;
+    }
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     let _mgmt = lock_or_recover(&CHILD_MGMT);
     if let Some(rt) = RUNTIME.get() {
@@ -646,8 +662,19 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         .and_then(|v| v.parse::<u16>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(port);
-    ATEXIT.call_once(|| unsafe {
-        let _ = libc::atexit(cleanup_on_exit);
+    ATEXIT.call_once(|| {
+        #[cfg(unix)]
+        INIT_PID.store(process_id(), Ordering::SeqCst);
+        // A non-zero return means the atexit table is full; warn instead of
+        // silently losing the "no orphan Go server" guarantee. There is no
+        // safe fallback here (a watchdog thread cannot detect normal exit
+        // reliably), but at least the failure is diagnosable.
+        let rc = unsafe { libc::atexit(cleanup_on_exit) };
+        if rc != 0 {
+            eprintln!(
+                "rust2go-ipc: atexit registration failed ({rc}); Go server may be orphaned on exit"
+            );
+        }
     });
     RUNTIME.get_or_init(move || {
         // Mitigate the build-time port reservation TOCTOU: another process may
@@ -680,9 +707,15 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         // A total deadline bounds startup so a permanently broken server fails
         // fast instead of hanging the very first dispatch call forever.
         let start_deadline = Instant::now() + Duration::from_secs(30);
+        let mut respawns: u32 = 0;
         let mut stream = loop {
             if Instant::now() >= start_deadline {
                 kill_and_reap(&mut child);
+                if respawns > 0 {
+                    panic!(
+                        "rust2go-ipc: Go server never became ready within 30s ({respawns} respawns; likely a crashing/bad binary)"
+                    );
+                }
                 panic!("rust2go-ipc: Go server never became ready within 30s");
             }
             // Probe, reap and respawn under ONE CHILD_MGMT critical section.
@@ -699,9 +732,16 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
                     }
                 };
                 if let Some(status) = status {
-                    eprintln!(
-                        "rust2go-ipc: Go server exited during startup ({status}); respawning"
-                    );
+                    // A crashing binary can respawn every ~500 ms for the whole
+                    // 30 s window (~60 times). Throttle the log to the first few
+                    // so a broken deployment does not flood stderr; the final
+                    // timeout panic reports the total respawn count.
+                    respawns += 1;
+                    if respawns <= 3 {
+                        eprintln!(
+                            "rust2go-ipc: Go server exited during startup ({status}); respawning"
+                        );
+                    }
                     // atexit may have run while we were starting up (RUNTIME not
                     // yet published, so its hook could only kill by pid). Do not
                     // spawn a replacement that would outlive the exiting process.
@@ -880,7 +920,22 @@ pub unsafe fn dispatch(
         }
         panic!("rust2go-ipc: request payload too large ({})", payload.len());
     }
-    let rt = runtime(server, port);
+    // runtime() can panic during first-time startup (spawn failure, 30s
+    // readiness timeout, stream setup, reactor spawn). The upstream stub has
+    // already handed us SlotWriter ownership, but no pending entry exists yet,
+    // so neither the response path nor the TTL sweep can ever release it — the
+    // slot leaks permanently. Match the oversize branch: release the slot on
+    // this early panic, then propagate the original panic unchanged. Repeated
+    // calls during a poisoned runtime each release their own slot via this path.
+    let rt = match catch_unwind(AssertUnwindSafe(|| runtime(server, port))) {
+        Ok(rt) => rt,
+        Err(payload) => {
+            if let Some(cleanup) = handler.cleanup {
+                let _ = catch_unwind(AssertUnwindSafe(|| unsafe { cleanup(slot) }));
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
     sweep_pending(rt);
     let req_id = next_req_id(rt);
 
@@ -1550,9 +1605,10 @@ impl<'a> Decoder<'a> {
         // would otherwise wrap to a small value and desynchronise every
         // subsequent field (checked take() prevents OOB but not wrong data).
         let len64 = self.prim::<u64>();
+        let remaining = self.buf.len().saturating_sub(self.pos) as u64;
         assert!(
-            len64 <= self.buf.len() as u64,
-            "rust2go-ipc: string length {len64} exceeds remaining bytes"
+            len64 <= remaining,
+            "rust2go-ipc: string length {len64} exceeds remaining bytes ({remaining})"
         );
         let len = len64 as usize;
         if len == 0 {

@@ -371,3 +371,17 @@ fn bounded_env_secs_rejects_zero_overflow_and_garbage() {
     std::env::remove_var(key);
     assert_eq!(bounded_env_secs(key, 86400, 30), 30);
 }
+
+#[test]
+#[should_panic(expected = "exceeds remaining bytes")]
+fn decoder_string_rejects_len_above_actual_remaining() {
+    // Header declares 5 bytes but only 2 follow. Total buffer (10 bytes) is
+    // larger than 5, so the old `len <= buf.len()` check passed and the failure
+    // came from take() with a misleading "out of bounds" message. The guard now
+    // compares against bytes remaining after the length field.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u64.to_le_bytes());
+    buf.extend_from_slice(&[0x41, 0x42]);
+    let mut dec = Decoder::new(&buf);
+    let _ = dec.string();
+}

@@ -828,3 +828,46 @@ trait T {
         "Option<String> must use the minimal-width string list decoder"
     );
 }
+
+#[test]
+fn empty_schema_generated_go_keeps_decoder_referenced() {
+    // A schema with no R2G methods used to generate `d := &dec{...}` with no
+    // reads, and Go rejects that with "d declared and not used". The generator
+    // now emits a blank assignment so empty/zero-arg-only schemas compile.
+    let schema = parse_schema("// no R2G items\n");
+    assert!(schema.methods.is_empty());
+    let go = generate_go_sources(&schema);
+    assert!(
+        go.contains("\t_ = d\n"),
+        "dispatch must keep the decoder referenced when there are no methods"
+    );
+    assert!(go.contains("func dispatch("));
+}
+
+#[test]
+fn zero_arg_only_schema_generated_go_keeps_decoder_referenced() {
+    // Even with methods present, a method with no parameters never reads `d`.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct R {}
+#[r2g]
+pub trait T {
+    fn ping() -> R;
+}
+"#,
+    );
+    let go = generate_go_sources(&schema);
+    assert!(
+        go.contains("\t_ = d\n"),
+        "dispatch must keep the decoder referenced for zero-arg methods"
+    );
+}
+
+#[test]
+#[should_panic(expected = "include!() is not supported")]
+fn include_macro_in_schema_is_rejected() {
+    // The builder reads a single file and cannot expand include!(); silently
+    // dropping included R2G types would produce undefined symbols at use sites.
+    parse_schema("include!(\"types.rs\");\n");
+}
