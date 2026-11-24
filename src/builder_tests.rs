@@ -23,6 +23,7 @@ pub trait First {
     fn scalar(name: String) -> String;
     #[go_pass_struct]
     fn byval(req: Req);
+    fn byref(req: &Req) -> Resp;
 }
 
 #[r2g]
@@ -41,13 +42,13 @@ fn edge_schema_generates_valid_rust_and_go() {
         "qualified #[derive(r2g::R2G)] must be recognized, got structs: {:?}",
         schema.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
-    assert_eq!(schema.methods.len(), 6);
+    assert_eq!(schema.methods.len(), 7);
     assert_eq!(
         schema.traits,
         vec!["First".to_string(), "Second".to_string()]
     );
     let ids: Vec<u32> = schema.methods.iter().map(|m| m.index).collect();
-    assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+    assert_eq!(ids, vec![0, 1, 2, 3, 4, 5, 6]);
     assert!(!schema.methods.iter().any(|m| m.go_ptr && m.name == "byval"));
 
     let rust = generate_rust_bindings(&schema, 1234).to_string();
@@ -57,6 +58,7 @@ fn edge_schema_generates_valid_rust_and_go() {
     assert!(rust.contains("SlotWriter"));
     assert!(rust.contains("__r2g_try_CFirst_zero"));
     assert!(rust.contains("__r2g_try_CFirst_byval"));
+    assert!(rust.contains("__r2g_try_CFirst_byref"));
     assert!(rust.contains("dispatch_sync_result"));
     assert!(rust.contains("dispatch_oneway_result"));
     // Legacy stubs must keep their panic contract after the old public
@@ -947,4 +949,78 @@ pub trait T {
         !rust.contains("catch_unwind"),
         "sync writes have no cleanup, so no panic guard is needed"
     );
+}
+
+#[test]
+fn try_stub_borrows_go_pass_struct_param_by_reference() {
+    // Regression: the Result try-stub declared an owned parameter but called
+    // `ToRef::calc_ref(req)` (no &) because it keyed off `go_ptr`, producing
+    // E0308 for every #[go_pass_struct] method. go_ptr controls the Go-side
+    // pointer star, NOT the Rust-side borrowing of an owned parameter.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Req { pub v: i64 }
+#[derive(R2G, Default)]
+pub struct Resp { pub ok: bool }
+#[r2g]
+pub trait T {
+    #[go_pass_struct]
+    fn byval(req: Req) -> Resp;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    assert!(
+        rust.contains("calc_ref (& req)"),
+        "owned #[go_pass_struct] param must be borrowed for calc_ref"
+    );
+    assert!(
+        !rust.contains("calc_ref (req)"),
+        "calc_ref must not receive an owned value (E0308)"
+    );
+}
+
+#[test]
+fn try_stub_keeps_reference_param_and_calc_ref_without_amp() {
+    // A reference parameter must keep `&Req` in the try-stub signature (the
+    // Result wrapper forwards the trait's original argument), and calc_ref
+    // receives `req` directly (upstream ref_marks semantics).
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Req { pub v: i64 }
+#[derive(R2G, Default)]
+pub struct Resp { pub ok: bool }
+#[r2g]
+pub trait T {
+    fn byref(req: &Req) -> Resp;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    assert!(
+        rust.contains("req : & super :: Req") || rust.contains("req : & Req"),
+        "reference parameter must keep & in try-stub signature"
+    );
+    assert!(
+        rust.contains("calc_ref (req)"),
+        "reference parameter passes straight to calc_ref"
+    );
+}
+
+#[test]
+fn cfg_gated_parameter_is_rejected() {
+    // A #[cfg] on a parameter is not evaluated by syn; emitting it
+    // unconditionally causes an argument-count mismatch at call sites.
+    let schema = r#"
+#[derive(R2G, Default)]
+pub struct R { pub v: i64 }
+#[r2g]
+pub trait T {
+    fn get(#[cfg(feature = "x")] a: R, b: i64) -> R;
+}
+"#;
+    let result = std::panic::catch_unwind(|| parse_schema(schema));
+    assert!(result.is_err(), "cfg-gated parameter must fail fast");
 }

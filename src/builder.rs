@@ -578,6 +578,12 @@ struct StructDef {
 struct ParamDef {
     name: String,
     ty: Type,
+    /// Whether the trait declared this parameter by reference (`&T`). The
+    /// `ty` field is the stripped owned type used by the wire/flatten path,
+    /// but the `#[r2g_result]` wrapper forwards the trait's original argument,
+    /// so the Result try-stub must keep the reference in its signature and use
+    /// `ToRef::calc_ref(id)` (not `&id`) for such parameters.
+    is_reference: bool,
 }
 
 #[derive(Clone)]
@@ -727,6 +733,12 @@ fn parse_schema(src: &str) -> Schema {
                 let FnArg::Typed(p) = arg else {
                     panic!("rust2go-ipc: receiver is not supported in #[r2g] trait methods");
                 };
+                // cfg is not evaluated at schema-parse time. A cfg-gated
+                // parameter would be emitted into Go/Rust bindings
+                // unconditionally while rustc strips it before macro
+                // expansion, producing an argument-count mismatch that is hard
+                // to diagnose. Fail fast like struct/trait/method/field.
+                reject_schema_cfg(&p.attrs, &format!("parameter in method `{name}`"));
                 let pname = match &*p.pat {
                     Pat::Ident(i) => bare_ident(&i.ident),
                     _ => panic!("rust2go-ipc: only simple parameter patterns are supported"),
@@ -743,8 +755,11 @@ fn parse_schema(src: &str) -> Schema {
                     "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier; rename it"
                 );
                 let (ty, is_reference) = strip_reference(&p.ty);
-                let _ = is_reference;
-                params.push(ParamDef { name: pname, ty });
+                params.push(ParamDef {
+                    name: pname,
+                    ty,
+                    is_reference,
+                });
             }
             let go_ptr = !f
                 .attrs
@@ -1491,16 +1506,25 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 flatten_expr(&p.ty, quote! { #id })
             })
             .collect();
-        // Result wrappers receive owned values (the trait signature) but the
-        // binding stub/flatten helpers consume Refs. Mirror upstream's
-        // `ToRef::calc_ref` conversion so the wrapper keeps the public API.
+        // Result wrappers forward the trait's original argument types, which
+        // may be references (`&T`). The try-stub signature must mirror that so
+        // the call site type-checks; only the wire/flatten path uses the
+        // stripped owned type. Mirror upstream's `ToRef::calc_ref` conversion:
+        // owned params use `calc_ref(&id)`, reference params use `calc_ref(id)`
+        // (upstream r2g.rs ref_marks). Whether Go treats the field as a pointer
+        // (`go_ptr`) is a separate concern handled in the Go template's `star`
+        // emission and must NOT drive this Rust-side borrow decision.
         let owned_param_decls: Vec<TokenStream> = m
             .params
             .iter()
             .map(|p| {
                 let id = format_ident!("{}", p.name);
                 let ty = rust_owned_path(&p.ty, schema);
-                quote! { #id: #ty }
+                if p.is_reference {
+                    quote! { #id: &#ty }
+                } else {
+                    quote! { #id: #ty }
+                }
             })
             .collect();
         let to_ref_stmts: Vec<TokenStream> = m
@@ -1511,16 +1535,14 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 let buf = format_ident!("__r2g_buf_{}", p.name);
                 let tmp = format_ident!("__r2g_ref_{}", p.name);
                 let ref_ty = rust_ref_type(&p.ty);
-                if m.go_ptr {
-                    quote! {
-                        let (#buf, #tmp) = ::rust2go::ToRef::calc_ref(&#id);
-                        let #id: #ref_ty = ::std::mem::transmute(#tmp);
-                    }
+                let calc_arg = if p.is_reference {
+                    quote! { #id }
                 } else {
-                    quote! {
-                        let (#buf, #tmp) = ::rust2go::ToRef::calc_ref(#id);
-                        let #id: #ref_ty = ::std::mem::transmute(#tmp);
-                    }
+                    quote! { &#id }
+                };
+                quote! {
+                    let (#buf, #tmp) = ::rust2go::ToRef::calc_ref(#calc_arg);
+                    let #id: #ref_ty = ::std::mem::transmute(#tmp);
                 }
             })
             .collect();
@@ -1611,7 +1633,12 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                                 #method_id,
                                 #method_name_str,
                                 &enc.take(),
-                                &slot as *const _ as *const (),
+                                // Derive the writable pointer from an exclusive
+                                // borrow (`&mut`) so the write through the
+                                // trampoline has a valid provenance under the
+                                // aliasing model; `&slot as *const _` written
+                                // through as *mut is technically UB.
+                                &mut slot as *mut _ as *const (),
                                 ::core::ptr::null(),
                                 handler,
                             )?;
