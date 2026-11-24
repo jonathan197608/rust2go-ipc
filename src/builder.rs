@@ -1081,6 +1081,7 @@ const GO_FIXED_SYMBOLS: &[&str] = &[
     "maxRestoreDepth",
     "maxAcceptErrs",
     "sem",
+    "semWaitTimeout",
     "acceptBackoff",
     "main",
     "serve",
@@ -1605,6 +1606,57 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                         #legacy_body
                     }
                 });
+
+                if is_async {
+                    // The upstream future owns the slot and has no error
+                    // channel, so an oversized payload discovered inside
+                    // `dispatch` would panic on poll (fatal under panic=abort).
+                    // Generate a pre-flight length helper so `#[r2g_result]`
+                    // can return IpcError::PayloadTooLarge *before* creating
+                    // the future. It encodes the same way as the stub and
+                    // borrows all arguments, so callers keep ownership.
+                    let payload_len_stub = format_ident!("__r2g_payload_len_{}", stub);
+                    // Every parameter is borrowed as `&OwnedTy`: the wrapper
+                    // must still own the arguments when it later calls Impl.
+                    // For a trait param declared `&T` this is already `&T`;
+                    // for an owned `T` the caller passes `&arg`.
+                    let len_param_decls: Vec<TokenStream> = m
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let id = format_ident!("{}", p.name);
+                            let ty = rust_owned_path(&p.ty, schema);
+                            quote! { #id: &#ty }
+                        })
+                        .collect();
+                    let to_ref_for_len: Vec<TokenStream> = m
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let id = format_ident!("{}", p.name);
+                            let buf = format_ident!("__r2g_buf_{}", p.name);
+                            let tmp = format_ident!("__r2g_ref_{}", p.name);
+                            let ref_ty = rust_ref_type(&p.ty);
+                            quote! {
+                                let (#buf, #tmp) = ::rust2go::ToRef::calc_ref(#id);
+                                let #id: #ref_ty = ::std::mem::transmute(#tmp);
+                            }
+                        })
+                        .collect();
+                    let flatten_for_len = flatten_stmts.clone();
+                    out.extend(quote! {
+                        #[allow(non_snake_case, clippy::all, unused_variables)]
+                        pub unsafe fn #payload_len_stub(#(#len_param_decls,)*) -> usize {
+                            let mut enc = ::rust2go::ipc::Encoder::new();
+                            {
+                                let enc = &mut enc;
+                                #(#to_ref_for_len)*
+                                #(#flatten_for_len)*
+                            }
+                            enc.take().len()
+                        }
+                    });
+                }
 
                 if !is_async {
                     let try_stub = format_ident!("__r2g_try_{}", stub);

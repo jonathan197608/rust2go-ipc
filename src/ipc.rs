@@ -37,7 +37,13 @@ use std::process::id as process_id;
 
 const MAGIC: [u8; 4] = *b"R2GI";
 const VERSION: u16 = 1;
-const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+/// Maximum encoded request/response payload (64 MiB).
+///
+/// Public because generated `#[r2g_result]` async wrappers pre-flight the
+/// encoded payload length before creating the upstream future: the upstream
+/// `SlotWriter` has no error channel, so an oversized async request discovered
+/// inside `dispatch` would panic at poll time (fatal under `panic = "abort"`).
+pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const DEFAULT_PENDING_TTL: u64 = 600;
 /// Upper bound for `RUST2GO_IPC_PENDING_TTL_SECS` (24 h). Beyond this a stuck
 /// request would pin its slot/writer essentially forever.
@@ -110,12 +116,12 @@ fn env_nonempty(key: &str) -> Option<String> {
 /// than panic — env parsing happens on business call paths and in the runtime
 /// init closure, and a panic there would either crash the process or poison the
 /// one-shot runtime for the entire process lifetime.
-fn bounded_env_secs(key: &str, max: u64, default: u64) -> u64 {
+fn bounded_env_secs(key: &'static str, max: u64, default: u64) -> u64 {
     match env_nonempty(key) {
         Some(v) => match v.parse::<u64>() {
             Ok(n) if (1..=max).contains(&n) => n,
             _ => {
-                eprintln!("rust2go-ipc: invalid {key}={v:?} (expected 1..={max}); using {default}");
+                crate::result::warn_invalid_env_once(key, &v, max, default);
                 default
             }
         },

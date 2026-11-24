@@ -59,6 +59,9 @@ fn edge_schema_generates_valid_rust_and_go() {
     assert!(rust.contains("__r2g_try_CFirst_zero"));
     assert!(rust.contains("__r2g_try_CFirst_byval"));
     assert!(rust.contains("__r2g_try_CFirst_byref"));
+    // Async methods need a pre-flight payload length helper so #[r2g_result]
+    // can surface oversized requests as Err instead of a poll-time panic.
+    assert!(rust.contains("__r2g_payload_len_CSecond_async_one"));
     assert!(rust.contains("dispatch_sync_result"));
     assert!(rust.contains("dispatch_oneway_result"));
     // Legacy stubs must keep their panic contract after the old public
@@ -305,6 +308,23 @@ fn trait_name_colliding_with_go_helper_is_rejected() {
         pub struct Req { pub v: i32 }
         #[r2g]
         pub trait dispatch { fn f(x: Req) -> Req; }
+        "#,
+    );
+    let _ = generate_go_sources(&schema);
+}
+
+#[test]
+#[should_panic(expected = "collides with")]
+fn struct_name_colliding_with_sem_wait_timeout_is_rejected() {
+    // semWaitTimeout is a package-level variable in ipc_main.gotpl. It is not
+    // a Go/Rust keyword, so only the fixed-symbol list can catch the collision
+    // before `go build` fails with a redeclaration error.
+    let schema = parse_schema(
+        r#"
+        #[derive(R2G)]
+        pub struct semWaitTimeout { pub v: i32 }
+        #[r2g]
+        pub trait GolangCall { fn f(x: semWaitTimeout) -> semWaitTimeout; }
         "#,
     );
     let _ = generate_go_sources(&schema);
