@@ -1539,10 +1539,37 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 } else {
                     quote! { None }
                 };
-                let call = if is_async {
-                    quote! { ::rust2go::ipc::dispatch }
+                let legacy_body = if is_async {
+                    quote! {
+                        ::rust2go::ipc::dispatch(
+                            env!("RUST2GO_IPC_SERVER"),
+                            #port,
+                            #method_id,
+                            &enc.take(),
+                            slot as *const (),
+                            cb as *const (),
+                            handler,
+                        );
+                    }
                 } else {
-                    quote! { ::rust2go::ipc::dispatch_sync }
+                    // The old public dispatch_sync was removed in 0.2.2. Both
+                    // stub families now share the non-panicking Result dispatch;
+                    // only the legacy #[r2g] stub restores the panic here so its
+                    // signature/behavior stays drop-in compatible.
+                    quote! {
+                        if let Err(err) = ::rust2go::ipc::dispatch_sync_result(
+                            env!("RUST2GO_IPC_SERVER"),
+                            #port,
+                            #method_id,
+                            #method_name_str,
+                            &enc.take(),
+                            slot as *const (),
+                            cb as *const (),
+                            handler,
+                        ) {
+                            panic!("rust2go-ipc: sync call to method {} failed: {}", #method_id, err);
+                        }
+                    }
                 };
                 out.extend(quote! {
                     #[allow(non_snake_case, clippy::missing_safety_doc)]
@@ -1553,15 +1580,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                             #(#flatten_stmts)*
                         }
                         let handler = ::rust2go::ipc::ResponseHandler::new(#tramp, #cleanup_arg);
-                        #call(
-                            env!("RUST2GO_IPC_SERVER"),
-                            #port,
-                            #method_id,
-                            &enc.take(),
-                            slot as *const (),
-                            cb as *const (),
-                            handler,
-                        );
+                        #legacy_body
                     }
                 });
 
@@ -1690,12 +1709,17 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                             let enc = &mut enc;
                             #(#flatten_stmts)*
                         }
-                        ::rust2go::ipc::dispatch_oneway(
+                        // Old dispatch_oneway was removed in 0.2.2; keep the
+                        // legacy panic contract in the generated stub instead.
+                        if let Err(err) = ::rust2go::ipc::dispatch_oneway_result(
                             env!("RUST2GO_IPC_SERVER"),
                             #port,
                             #method_id,
+                            #method_name_str,
                             &enc.take(),
-                        );
+                        ) {
+                            panic!("rust2go-ipc: oneway call to method {} failed: {}", #method_id, err);
+                        }
                     }
 
                     #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref)]

@@ -987,36 +987,12 @@ fn next_req_id(rt: &Runtime) -> u64 {
     id
 }
 
-/// Synchronous call with a return value. The rust2go macro reads the stack
-/// slot immediately after this function returns, so the response must be
-/// decoded and the callback invoked before returning. Uses a dedicated
-/// connection to avoid racing the global reactor.
+/// Sync dispatch used by both generated stub families.
 ///
-/// # Safety
-/// `slot` points at a stack `Option<T>` owned by the caller; `cb` and
-/// `trampoline` are generated functions.
-pub unsafe fn dispatch_sync(
-    server: &str,
-    port: u16,
-    method_id: u32,
-    payload: &[u8],
-    slot: *const (),
-    cb: *const (),
-    handler: ResponseHandler,
-) {
-    let method = method_id.to_string();
-    if let Err(err) =
-        dispatch_sync_inner(server, port, method_id, &method, payload, slot, cb, handler)
-    {
-        panic!("rust2go-ipc: sync call to method {method_id} failed: {err}");
-    }
-}
-
-/// Non-panicking sync dispatch, used by `#[r2g_result]` generated wrappers.
-///
-/// The original `dispatch_sync` keeps its panic-on-error contract for old
-/// call sites; this variant surfaces every transport/protocol failure as an
-/// `IpcError` so `panic = "abort"` binaries can converge with `Result`.
+/// Every transport/protocol failure is surfaced as an `IpcError` so callers can
+/// converge with `Result` even under `panic = "abort"`. The legacy `#[r2g]`
+/// stub (no `#[r2g_result]`) turns this error into a descriptive panic at the
+/// generated call site; the `#[r2g_result]` stub returns it as data.
 ///
 /// # Safety
 /// `slot` points at a live stack `Option<T>` owned by the generated wrapper;
@@ -1046,7 +1022,7 @@ unsafe fn dispatch_sync_inner(
     cb: *const (),
     handler: ResponseHandler,
 ) -> Result<(), IpcError> {
-    // Mirror dispatch/dispatch_oneway: reject oversized payloads BEFORE any
+    // Mirror dispatch: reject oversized payloads BEFORE any
     // side effect. Otherwise build_frame's assert fires only after runtime()
     // has spawned the Go server + reactor, consumed a req_id and opened a
     // connection — and if first-time startup itself fails, the readiness
@@ -1122,7 +1098,9 @@ unsafe fn dispatch_sync_inner(
     }));
     if let Err(panic) = result {
         if let Some(f) = handler.cleanup {
-            unsafe { f(slot) };
+            // A panic in the type-erased cleanup must not replace the decode
+            // error with a second panic (which is fatal under panic=abort).
+            let _ = catch_unwind(AssertUnwindSafe(|| unsafe { f(slot) }));
         }
         let detail = if let Some(s) = panic.downcast_ref::<&str>() {
             (*s).to_string()
@@ -1212,29 +1190,11 @@ fn read_response<R: Read>(reader: &mut R) -> io::Result<(u64, u8, Vec<u8>)> {
     Ok((req_id, status, payload))
 }
 
-/// Fire-and-forget call: no pending entry, no response expected.
-///
-/// Safe: nothing captures caller pointers and no response is decoded. The Go
-/// server must be running for the frame to be delivered, but that is a
-/// liveness concern, not a memory-safety one.
-pub fn dispatch_oneway(server: &str, port: u16, method_id: u32, payload: &[u8]) {
-    // Mirror the oversized-payload guard of `dispatch`/`dispatch_sync`, but run
-    // it BEFORE `runtime()` so the panic cannot happen while holding the global
-    // writer mutex (build_frame's assert would otherwise poison it). oneway has
-    // no slot to clean up, so there is no further bookkeeping to undo.
-    assert!(
-        payload.len() <= MAX_PAYLOAD,
-        "rust2go-ipc: request payload too large ({})",
-        payload.len()
-    );
-    let rt = runtime(server, port);
-    let _ = write_frame(rt, 0, method_id, payload);
-}
-
-/// Non-panicking oneway dispatch for `#[r2g_result]` generated wrappers.
-///
-/// A failed frame write is reported instead of silently discarded; a failure
-/// to start the Go child is still fatal (startup is a process-level event).
+/// One-way dispatch used by both generated stub families: no pending entry,
+/// no response expected. A failed frame write is reported as an `IpcError`;
+/// the legacy `#[r2g]` stub turns it into a panic at the generated call site,
+/// while `#[r2g_result]` returns it as data. A failure to start the Go child
+/// is still fatal (startup is a process-level event).
 pub fn dispatch_oneway_result(
     server: &str,
     port: u16,

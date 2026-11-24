@@ -301,37 +301,15 @@ fn decoder_depth_enter_leave_is_balanced() {
 }
 
 #[test]
-#[should_panic(expected = "payload too large")]
-fn oneway_oversized_payload_panics_before_initializing_runtime() {
+fn oneway_result_oversized_payload_returns_err_without_panicking() {
     // The guard must run before runtime() so an oversized oneway payload cannot
     // panic while holding the global writer mutex (which would poison it).
     // A bogus server path proves runtime() is never reached: if it were, spawn
-    // would fail with a different error instead of our payload message.
+    // would fail with a different error instead of our payload result.
     let huge = vec![0u8; MAX_PAYLOAD + 1];
-    dispatch_oneway("/nonexistent/rust2go-ipc-test.sock", 0, 1, &huge);
-}
-
-#[test]
-#[should_panic(expected = "payload too large")]
-fn sync_oversized_payload_panics_before_initializing_runtime() {
-    // dispatch_sync must reject oversized payloads before runtime() spawns the
-    // Go server/reactor or consumes a req_id (round-23). A bogus server path
-    // proves runtime() is never reached; otherwise startup error would mask
-    // the payload message. Sync has no cleanup, so a no-op trampoline suffices.
-    unsafe extern "C-unwind" fn noop(_p: *const u8, _n: usize, _s: *const (), _c: *const ()) {}
-    let handler = ResponseHandler::new(noop, None);
-    let huge = vec![0u8; MAX_PAYLOAD + 1];
-    unsafe {
-        dispatch_sync(
-            "/nonexistent/rust2go-ipc-test.sock",
-            0,
-            1,
-            &huge,
-            std::ptr::null(),
-            std::ptr::null(),
-            handler,
-        );
-    }
+    let err = dispatch_oneway_result("/nonexistent/rust2go-ipc-test.sock", 0, 1, "huge", &huge)
+        .unwrap_err();
+    assert!(matches!(err, IpcError::PayloadTooLarge { .. }));
 }
 
 #[test]

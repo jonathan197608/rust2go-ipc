@@ -70,7 +70,13 @@ pub enum IpcError {
         /// Human-readable mismatch description.
         detail: String,
     },
-    /// Response decode panicked. Only recoverable under `panic = "unwind"`.
+    /// Response decode panicked (malformed frame or a panicking `FromRef`).
+    ///
+    /// Only produced when the binary uses `panic = "unwind"`: the runtime wraps
+    /// the generated trampoline in `catch_unwind` and maps the panic here.
+    /// Under `panic = "abort"` a decode panic is **not** recoverable — the
+    /// process terminates before any `Result` can be returned. The library
+    /// cannot change that without coupling itself to business response types.
     Decode {
         /// Method name, for diagnostics.
         method: String,

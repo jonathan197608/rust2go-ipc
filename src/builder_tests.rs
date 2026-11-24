@@ -59,6 +59,21 @@ fn edge_schema_generates_valid_rust_and_go() {
     assert!(rust.contains("__r2g_try_CFirst_byval"));
     assert!(rust.contains("dispatch_sync_result"));
     assert!(rust.contains("dispatch_oneway_result"));
+    // Legacy stubs must keep their panic contract after the old public
+    // dispatch_sync/dispatch_oneway were removed in 0.2.2: they now call the
+    // Result variant and panic locally on Err.
+    assert!(
+        rust.contains("sync call to method"),
+        "legacy sync stub lost its panic wrapper"
+    );
+    assert!(
+        rust.contains("oneway call to method"),
+        "legacy oneway stub lost its panic wrapper"
+    );
+    assert!(
+        !rust.contains("ipc :: dispatch_sync (") && !rust.contains("ipc :: dispatch_oneway ("),
+        "generated code must not call the removed dispatch APIs"
+    );
 
     let go = generate_go_sources(&schema);
     assert!(go.contains("var FirstImpl First"));
