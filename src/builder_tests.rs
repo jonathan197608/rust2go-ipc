@@ -1074,3 +1074,100 @@ pub trait T {
         "every generated unsafe fn must allow unsafe_op_in_unsafe_fn (found {unsafe_fns} unsafe fns, {allowed} allows)"
     );
 }
+
+#[test]
+fn async_reference_param_attachment_keeps_borrow() {
+    // Upstream `ResponseFuture<Req, Resp>` attaches `(ReqTuple, Vec<u8>)` to
+    // the slot, where ReqTuple is the trait's ORIGINAL parameter tuple —
+    // including `&Req` for by-reference params. The type-erased slot pointer
+    // lets a mismatched `SlotWriter<A>` compile, but on timeout/cancel its
+    // Drop reinterprets `Some((&Req, ..))` as `Some((Req, ..))` and destructs
+    // a String/Vec behind a borrowed pointer. Keep the borrow in A.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Req { pub s: String }
+#[derive(R2G, Default)]
+pub struct Resp { pub ok: bool }
+#[r2g]
+pub trait T {
+    async fn get(req: &Req) -> Resp;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    let compact: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        compact
+            .matches("SlotWriter::<super::Resp,((&super::Req,),Vec<u8>)")
+            .count(),
+        2, // trampoline write + cleanup drop
+        "async reference param must keep & in both SlotWriter attachment types; got: {compact}"
+    );
+    assert!(
+        !compact.contains("SlotWriter::<super::Resp,((super::Req,),Vec<u8>)"),
+        "owned attachment type for a by-reference param is a memory-safety bug"
+    );
+}
+
+#[test]
+fn go_pass_struct_only_matches_bare_unqualified_path() {
+    // Upstream rust2go-common recognises `#[go_pass_struct]` only as a bare,
+    // argument-free Meta::Path via get_ident(). Match that exactly: treating
+    // `#[go_pass_struct()]` or `#[rust2go::go_pass_struct]` as present changes
+    // the generated Go interface from `*Req` to `Req` and breaks a handler
+    // written against upstream semantics.
+    let parse_go_ptr = |attr: &str| {
+        let schema_str = format!(
+            r#"
+#[derive(R2G, Default)]
+pub struct Req {{ pub v: i32 }}
+#[r2g]
+pub trait T {{
+    {attr}
+    fn f(req: Req) -> Req;
+}}
+"#
+        );
+        parse_schema(&schema_str).methods[0].go_ptr
+    };
+    assert!(
+        !parse_go_ptr("#[go_pass_struct]"),
+        "bare attribute must be recognised"
+    );
+    assert!(
+        parse_go_ptr("#[go_pass_struct()]"),
+        "attribute with arguments must be ignored like upstream"
+    );
+    assert!(
+        parse_go_ptr("#[rust2go::go_pass_struct]"),
+        "qualified attribute must be ignored like upstream"
+    );
+}
+
+#[test]
+fn unsupported_shared_memory_attrs_fail_fast() {
+    // `#[mem]` / `#[shm]` are upstream shared-memory calls. IPC cannot honour
+    // them (no rust2go_mem_ffi dependency, no ring handler in the Go template),
+    // so silently emitting an ordinary IPC stub would send a plain frame to a
+    // handler that expects a ring task. Reject at parse time with a clear
+    // diagnostic instead of failing later at link/run time.
+    for attr in ["mem", "shm"] {
+        let schema_str = format!(
+            r#"
+#[derive(R2G, Default)]
+pub struct Req {{ pub v: i32 }}
+#[r2g]
+pub trait T {{
+    #[{attr}]
+    async fn f(req: Req) -> Req;
+}}
+"#
+        );
+        let result = std::panic::catch_unwind(|| parse_schema(&schema_str));
+        assert!(
+            result.is_err(),
+            "#[{attr}] is not supported over IPC and must fail fast"
+        );
+    }
+}

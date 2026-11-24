@@ -646,6 +646,11 @@ struct ParamDef {
     /// so the Result try-stub must keep the reference in its signature and use
     /// `ToRef::calc_ref(id)` (not `&id`) for such parameters.
     is_reference: bool,
+    /// `&mut T` vs `&T`. The async slot attachment is type-erased, so its
+    /// `SlotWriter<A>` must match the upstream `ResponseFuture` attachment
+    /// exactly — including mutability — or its Drop reinterprets the borrowed
+    /// pointer with the wrong type.
+    is_mutable: bool,
 }
 
 #[derive(Clone)]
@@ -816,17 +821,26 @@ fn parse_schema(src: &str) -> Schema {
                     !reserved && !pname.starts_with(GENERATED_IDENT_PREFIX),
                     "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier; rename it"
                 );
+                let is_mutable = matches!(&*p.ty, Type::Reference(r) if r.mutability.is_some());
                 let (ty, is_reference) = strip_reference(&p.ty);
                 params.push(ParamDef {
                     name: pname,
                     ty,
                     is_reference,
+                    is_mutable,
                 });
             }
-            let go_ptr = !f
-                .attrs
-                .iter()
-                .any(|a| has_last_segment(a.path(), "go_pass_struct"));
+            // Shared-memory calls need rust2go_mem_ffi and a ring handler in
+            // the Go server, neither of which exists in the IPC transport.
+            // Reject any form of the attribute (including the qualified /
+            // parenthesised ones upstream ignores) instead of silently
+            // emitting an ordinary IPC stub for a handler that expects a ring
+            // task.
+            assert!(
+                !has_marker_attr(&f.attrs, "mem") && !has_marker_attr(&f.attrs, "shm"),
+                "rust2go-ipc: #[mem]/#[shm] shared-memory calls are not supported over IPC"
+            );
+            let go_ptr = !has_bare_marker_attr(&f.attrs, "go_pass_struct");
             let stub = format!("C{trait_name}_{name}");
             assert!(
                 stub_names.insert(stub.clone()),
@@ -930,6 +944,19 @@ fn has_last_segment(path: &syn::Path, name: &str) -> bool {
 
 fn has_marker_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| has_last_segment(a.path(), name))
+}
+
+/// Match upstream rust2go-common's marker-attribute rule exactly: a bare,
+/// argument-free single-segment path (`#[go_pass_struct]`, `#[mem]`, ...).
+/// `has_last_segment` would also accept `#[go_pass_struct()]` and
+/// `#[rust2go::go_pass_struct]`, which upstream ignores; the mismatch silently
+/// changes the Go interface signature and breaks handlers written against
+/// upstream semantics.
+fn has_bare_marker_attr(attrs: &[syn::Attribute], name: &str) -> bool {
+    let id = format_ident!("{}", name);
+    attrs
+        .iter()
+        .any(|a| matches!(&a.meta, syn::Meta::Path(p) if p.get_ident() == Some(&id)))
 }
 
 fn has_derive(s: &ItemStruct, name: &str) -> bool {
@@ -1763,10 +1790,29 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     });
                 }
 
+                // Upstream `ResponseFuture<Req, Resp>` attaches
+                // `(ReqTuple, Vec<u8>)` to the slot, where ReqTuple is the
+                // trait's ORIGINAL parameter tuple — including `&T` /
+                // `&mut T` for by-reference params. The slot pointer is
+                // type-erased, so a stripped owned type here compiles but
+                // makes cleanup reinterpret `Some((&T, ..))` as
+                // `Some((T, ..))` and destruct a String/Vec behind a borrowed
+                // pointer. Preserve the borrow (and mutability) in A.
                 let owned_types: Vec<TokenStream> = m
                     .params
                     .iter()
-                    .map(|p| rust_owned_path(&p.ty, schema))
+                    .map(|p| {
+                        let ty = rust_owned_path(&p.ty, schema);
+                        if p.is_reference {
+                            if p.is_mutable {
+                                quote! { &mut #ty }
+                            } else {
+                                quote! { &#ty }
+                            }
+                        } else {
+                            ty
+                        }
+                    })
                     .collect();
                 let write_back = if is_async {
                     // The slot writer's "drop exactly once" invariant must not
