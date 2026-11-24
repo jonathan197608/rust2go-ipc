@@ -1,7 +1,15 @@
 //! Build-time API mirroring `rust2go::Builder`. Instead of cgo + bindgen, this
 //! parses the Rust schema and emits pure-Go sources plus Rust binding mirrors.
 
-use std::{collections::HashSet, env, ffi::OsString, fs, path::PathBuf, process::Command};
+use std::{
+    collections::HashSet,
+    env,
+    ffi::OsString,
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -237,6 +245,67 @@ fn write_generated(dst: &std::path::Path, bytes: &[u8]) {
     let _ = fs::remove_file(&bak); // new file is in place; drop the backup
 }
 
+/// Format a generated Go file atomically. `gofmt -w` truncates the file
+/// in place, which would defeat [`write_generated`]'s atomic-install guarantee
+/// (a crash mid-format leaves a half-written .go that breaks `go build`, and
+/// on Windows an editor/AV holding the file makes `-w` fail). Instead feed the
+/// bytes on stdin, capture stdout, then atomically install the formatted result.
+/// On any failure the previously installed complete file is left untouched.
+fn gofmt_in_place(path: &std::path::Path, gofmt: &PathBuf) {
+    let src = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "cargo:warning=rust2go-ipc: cannot read {} for gofmt: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let mut child = match Command::new(gofmt)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            println!(
+                "cargo:warning=rust2go-ipc: cannot run gofmt for {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(&src) {
+            println!(
+                "cargo:warning=rust2go-ipc: gofmt stdin write failed for {}: {e}",
+                path.display()
+            );
+        }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            println!(
+                "cargo:warning=rust2go-ipc: gofmt wait failed for {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if !out.status.success() {
+        println!(
+            "cargo:warning=rust2go-ipc: gofmt exited with {} for {}",
+            out.status,
+            path.display()
+        );
+        return;
+    }
+    write_generated(path, &out.stdout);
+}
+
 /// Recursively collect every `.go` source under `dir`. `go build .` compiles
 /// imported sub-packages too, so watching only the top level would let edits
 /// to `go_dir/internal/*.go` leave a stale server binary in the Cargo cache.
@@ -372,23 +441,11 @@ impl<GOC: GoCompiler> Builder<PathBuf, GOC> {
         let main_src = generate_go_main();
         write_generated(&ipc_main, main_src.as_bytes());
 
-        // Keep generated Go sources gofmt-clean when the tool is available.
-        let gofmt = find_gofmt();
-        for path in [&regen_dst, &ipc_main] {
-            let result = match &gofmt {
-                Some(p) => Command::new(p).arg("-w").arg(path).status(),
-                None => Command::new("gofmt").arg("-w").arg(path).status(),
-            };
-            match result {
-                Ok(status) if status.success() => {}
-                Ok(status) => println!(
-                    "cargo:warning=rust2go-ipc: gofmt exited with {status} for {}",
-                    path.display()
-                ),
-                Err(e) => println!(
-                    "cargo:warning=rust2go-ipc: cannot run gofmt for {}: {e}",
-                    path.display()
-                ),
+        // Keep generated Go sources gofmt-clean when the tool is available,
+        // installing the formatted bytes atomically (see gofmt_in_place).
+        if let Some(gofmt) = find_gofmt() {
+            for path in [&regen_dst, &ipc_main] {
+                gofmt_in_place(path, &gofmt);
             }
         }
 

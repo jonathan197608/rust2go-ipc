@@ -59,6 +59,8 @@ Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives 
 | `RUST2GO_IPC_ASYNC_TIMEOUT_SECS` | Deadline applied by `#[r2g_result]` async wrappers. Default `600` (10 minutes). `0` is rejected. |
 | `RUST2GO_IPC_MAX_CONCURRENCY` | Max in-flight Go handlers per server. Default `NumCPU*4` (min 16). Lower it to bound downstream load; the read loop applies back-pressure when full. |
 
+The Rust side reads the timeout env vars on each call. The Go server samples `RUST2GO_IPC_SYNC_TIMEOUT_SECS` once at startup to size its backpressure wait; changing that value therefore needs a server restart (a reconnect alone reuses the running child).
+
 ## Failure semantics
 
 The generated Go dispatcher recovers handler panics and returns an error status. The Rust side logs it and drops the pending entry; the awaiting future is resolved by the caller's own timeout, since the rust2go callback signature has no error channel.

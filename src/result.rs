@@ -56,7 +56,8 @@ pub enum IpcError {
         method: String,
         /// Deadline that elapsed, in seconds.
         secs: u64,
-        /// Where the deadline expired (`connect`, `read`, ...).
+        /// Where the deadline expired. Currently always `read`: connect and
+        /// write failures map to the dedicated `Connect`/`Write` variants.
         stage: String,
     },
     /// The Go server could not be reached.
