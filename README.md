@@ -52,7 +52,7 @@ Wire format version is 1. The magic bytes are `R2GI`. All multi-byte primitives 
 | Variable | Purpose |
 |---|---|
 | `RUST2GO_IPC_SERVER_OVERRIDE` | Path to the Go server binary. Use this in stripped runtime images where the build-time `OUT_DIR` path does not exist. |
-| `RUST2GO_IPC_PORT_OVERRIDE` | Loopback port override (`0` is rejected). Both sides must agree; forwarded to the child process. Ignored on Unix, where the endpoint is a UDS path. |
+| `RUST2GO_IPC_PORT_OVERRIDE` | Port override (`0` is rejected). Both sides must agree; forwarded to the child process. On Unix it does not change the transport (still UDS) but does change the private socket directory name (`rust2go-ipc-{pid}-{port}.d`), so both processes still need the same value. |
 | `RUST2GO_IPC_ENDPOINT_OVERRIDE` | Full endpoint: socket path on Unix, `host:port` elsewhere. Both sides must agree. |
 | `RUST2GO_IPC_PENDING_TTL_SECS` | Pending table entry lifetime in seconds. Default `600`. `0` is rejected. |
 | `RUST2GO_IPC_SYNC_TIMEOUT_SECS` | Response deadline for synchronous calls, in seconds. Default `30`, independent of the async pending TTL. `0` is rejected. |
