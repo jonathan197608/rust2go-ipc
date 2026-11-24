@@ -1,7 +1,8 @@
 [package]
 name = "rust2go-ipc"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
+rust-version = "1.71"
 license = "MIT"
 description = "Drop-in rust2go replacement: Rust in main process, Go in child process over IPC"
 documentation = "https://docs.rs/rust2go-ipc"

@@ -1044,3 +1044,33 @@ pub trait T {
     let result = std::panic::catch_unwind(|| parse_schema(schema));
     assert!(result.is_err(), "cfg-gated parameter must fail fast");
 }
+
+#[test]
+fn generated_unsafe_fns_allow_unsafe_op_in_unsafe_fn() {
+    // Generated unsafe fns rely on edition-2021's default-allow for
+    // `unsafe_op_in_unsafe_fn`. Under edition 2024 that lint is warn-by-default,
+    // so a consumer with `#![deny(warnings)]` would fail to compile the binding.
+    // Every generated unsafe fn must carry an explicit `allow`.
+    let schema = parse_schema(
+        r#"
+#[derive(R2G, Default)]
+pub struct Req { pub v: i64 }
+#[derive(R2G, Default)]
+pub struct Resp { pub ok: bool }
+#[r2g]
+pub trait T {
+    fn sync(req: Req) -> Resp;
+    fn oneway(req: Req);
+    async fn call_async(req: Req) -> Resp;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    let unsafe_fns = rust.matches("unsafe fn").count() + rust.matches("unsafe extern").count();
+    let allowed = rust.matches("unsafe_op_in_unsafe_fn").count();
+    assert!(unsafe_fns > 0, "schema must generate unsafe fns");
+    assert_eq!(
+        unsafe_fns, allowed,
+        "every generated unsafe fn must allow unsafe_op_in_unsafe_fn (found {unsafe_fns} unsafe fns, {allowed} allows)"
+    );
+}

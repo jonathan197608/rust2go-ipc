@@ -16,10 +16,10 @@ Change two dependency lines. Build scripts and business sources stay byte-identi
 
 ```toml
 [dependencies]
-rust2go = { package = "rust2go-ipc", version = "0.1" }
+rust2go = { package = "rust2go-ipc", version = "0.2" }
 
 [build-dependencies]
-rust2go = { package = "rust2go-ipc", version = "0.1", features = ["build"] }
+rust2go = { package = "rust2go-ipc", version = "0.2", features = ["build"] }
 ```
 
 The `package =` alias makes `use rust2go::{...}`, `#[r2g]`, `#[derive(R2G)]`, `r2g_include_binding!()` and the `Builder` API resolve to this crate without touching any source file.

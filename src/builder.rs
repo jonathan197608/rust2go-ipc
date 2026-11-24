@@ -206,7 +206,12 @@ impl GoCompilerArgs for CustomArgGoCompiler {
 /// destination is always either the old complete file or the new complete one.
 fn write_generated(dst: &std::path::Path, bytes: &[u8]) {
     let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let tmp = dst.with_extension(format!("{ext}.tmp"));
+    // Include the process id so two concurrent `cargo build` processes sharing
+    // the same go_src cannot clobber each other's temp/backup files. Without
+    // it, process A could rename its temp into dst while process B is still
+    // writing the same path, or A's backup cleanup could delete B's backup.
+    let pid = std::process::id();
+    let tmp = dst.with_extension(format!("{ext}.{pid}.tmp"));
     fs::write(&tmp, bytes)
         .unwrap_or_else(|e| panic!("rust2go-ipc: cannot write temp {}: {e}", tmp.display()));
     // Unix rename() atomically replaces dst. Windows rename may refuse to
@@ -215,7 +220,7 @@ fn write_generated(dst: &std::path::Path, bytes: &[u8]) {
     // restore the backup instead of leaving dst missing (which would make the
     // subsequent `go build` fail on a file that used to be perfectly valid).
     #[cfg(windows)]
-    let bak = dst.with_extension(format!("{ext}.bak"));
+    let bak = dst.with_extension(format!("{ext}.{pid}.bak"));
     #[cfg(windows)]
     if dst.exists() {
         let _ = fs::remove_file(&bak); // drop a stale backup from a prior failed run
@@ -1450,7 +1455,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
             })
             .collect();
         out.extend(quote! {
-            #[allow(non_snake_case, clippy::all, unused_variables)]
+            #[allow(non_snake_case, clippy::all, unused_variables, unsafe_op_in_unsafe_fn)]
             unsafe fn #name(enc: &mut ::rust2go::ipc::Encoder, v: &#st_name) {
                 #(#fields)*
             }
@@ -1470,7 +1475,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
             })
             .collect();
         out.extend(quote! {
-            #[allow(non_snake_case, clippy::all, unused_variables)]
+            #[allow(non_snake_case, clippy::all, unused_variables, unsafe_op_in_unsafe_fn)]
             unsafe fn #name(dec: &mut ::rust2go::ipc::Decoder<'_>) -> #st_name {
                 // Bound recursion for self-referential schemas / hostile frames.
                 dec.enter();
@@ -1595,7 +1600,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     }
                 };
                 out.extend(quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
                     pub unsafe fn #stub(#(#param_decls,)* #slot_cb) {
                         let mut enc = ::rust2go::ipc::Encoder::new();
                         {
@@ -1645,7 +1650,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                         .collect();
                     let flatten_for_len = flatten_stmts.clone();
                     out.extend(quote! {
-                        #[allow(non_snake_case, clippy::all, unused_variables)]
+                        #[allow(non_snake_case, clippy::all, unused_variables, unsafe_op_in_unsafe_fn)]
                         pub unsafe fn #payload_len_stub(#(#len_param_decls,)*) -> usize {
                             let mut enc = ::rust2go::ipc::Encoder::new();
                             {
@@ -1663,7 +1668,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     let flatten_for_try = flatten_stmts.clone();
                     let to_ref_for_try = to_ref_stmts.clone();
                     out.extend(quote! {
-                        #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref)]
+                        #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref, unsafe_op_in_unsafe_fn)]
                         pub unsafe fn #try_stub(#(#owned_param_decls,)*)
                             -> ::core::result::Result<#resp_owned, ::rust2go::IpcError>
                         {
@@ -1747,7 +1752,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     }
                 };
                 out.extend(quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
                     unsafe extern "C-unwind" fn #tramp(
                         payload: *const u8,
                         len: usize,
@@ -1766,7 +1771,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 });
                 if is_async {
                     out.extend(quote! {
-                        #[allow(non_snake_case, clippy::missing_safety_doc)]
+                        #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
                         unsafe fn #cleanup(slot: *const ()) {
                             drop(::rust2go::SlotWriter::<
                                 #resp_owned,
@@ -1781,7 +1786,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 let flatten_for_try = flatten_stmts.clone();
                 let to_ref_for_try = to_ref_stmts.clone();
                 out.extend(quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
                     pub unsafe fn #stub(#(#param_decls,)*) {
                         let mut enc = ::rust2go::ipc::Encoder::new();
                         {
@@ -1801,7 +1806,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                         }
                     }
 
-                    #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref, unsafe_op_in_unsafe_fn)]
                     pub unsafe fn #try_stub(#(#owned_param_decls,)*)
                         -> ::core::result::Result<(), ::rust2go::IpcError>
                     {

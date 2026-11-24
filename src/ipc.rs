@@ -107,6 +107,17 @@ fn env_nonempty(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// Resolve the port override: a non-empty, parseable, non-zero `u16` wins,
+/// otherwise fall back to the build-time port. Kept as a pure function so the
+/// `0`-is-rejected contract can be unit-tested against the real parsing path
+/// rather than a copy of it.
+fn resolve_port_override(default: u16) -> u16 {
+    env_nonempty(ENV_PORT_OVERRIDE)
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 /// Read a positive seconds value from `key`, clamped to `1..=max`.
 ///
 /// Both bounds matter: 0 would disable the deadline entirely, while a huge but
@@ -665,10 +676,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
     // Build-time paths live under OUT_DIR and do not exist in a stripped
     // runtime image; let deployment point at the copied binary.
     let server = env_nonempty(ENV_SERVER_OVERRIDE).unwrap_or_else(|| server.to_string());
-    let port = env_nonempty(ENV_PORT_OVERRIDE)
-        .and_then(|v| v.parse::<u16>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(port);
+    let port = resolve_port_override(port);
     ATEXIT.call_once(|| {
         #[cfg(unix)]
         INIT_PID.store(process_id(), Ordering::SeqCst);

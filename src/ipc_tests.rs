@@ -170,15 +170,31 @@ fn unix_umask_regression_does_not_need_process_wide_restriction() {
 
 #[test]
 fn port_override_zero_is_rejected() {
-    // Mirrors the `runtime()` port parsing: 0 must fall back, never be used.
-    let parsed = "0".parse::<u16>().ok().filter(|v| *v > 0).unwrap_or(7777);
-    assert_eq!(parsed, 7777);
-    let parsed = "5555"
-        .parse::<u16>()
-        .ok()
-        .filter(|v| *v > 0)
-        .unwrap_or(7777);
-    assert_eq!(parsed, 5555);
+    // Exercise the real parsing path used by runtime(), not a copy of it — a
+    // copy would still pass if the production filter were deleted.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = env::var(ENV_PORT_OVERRIDE).ok();
+
+    std::env::set_var(ENV_PORT_OVERRIDE, "0");
+    assert_eq!(resolve_port_override(7777), 7777, "port 0 must fall back");
+
+    std::env::set_var(ENV_PORT_OVERRIDE, "not-a-port");
+    assert_eq!(resolve_port_override(7777), 7777, "garbage must fall back");
+
+    std::env::set_var(ENV_PORT_OVERRIDE, "65536");
+    assert_eq!(
+        resolve_port_override(7777),
+        7777,
+        "out-of-u16 must fall back"
+    );
+
+    std::env::set_var(ENV_PORT_OVERRIDE, "5555");
+    assert_eq!(resolve_port_override(7777), 5555, "valid port must win");
+
+    match saved {
+        Some(v) => std::env::set_var(ENV_PORT_OVERRIDE, v),
+        None => std::env::remove_var(ENV_PORT_OVERRIDE),
+    }
 }
 
 // A Read that yields a fixed set of byte chunks, then either blocks forever
