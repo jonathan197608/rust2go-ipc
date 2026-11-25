@@ -6,11 +6,10 @@
 //! the original rust2go `*_cb` function, which writes into the atomic slot and
 //! wakes the awaiting future.
 
-use crate::result::IpcError;
+use crate::result::{config, IpcError};
 use std::{
     any::Any,
     collections::HashMap,
-    env,
     io::{self, Error as IoError, ErrorKind, Read, Write},
     mem::size_of,
     net::{Shutdown, TcpListener, TcpStream},
@@ -44,28 +43,13 @@ const VERSION: u16 = 1;
 /// `SlotWriter` has no error channel, so an oversized async request discovered
 /// inside `dispatch` would panic at poll time (fatal under `panic = "abort"`).
 pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
-const DEFAULT_PENDING_TTL: u64 = 600;
-/// Upper bound for `RUST2GO_IPC_PENDING_TTL_SECS` (24 h). Beyond this a stuck
-/// request would pin its slot/writer essentially forever.
-const MAX_PENDING_TTL: u64 = 86_400;
 const SWEEP_INTERVAL: u64 = 30;
-/// A hung Go handler must not block a synchronous business thread for the
-/// async-scale TTL; sync calls get a shorter, independent timeout.
-const DEFAULT_SYNC_TIMEOUT: u64 = 30;
-/// Upper bound for `RUST2GO_IPC_SYNC_TIMEOUT_SECS` (24 h). Guards against a
-/// syntactically valid but absurd `u64::MAX` disabling the deadline entirely.
-const MAX_SYNC_TIMEOUT: u64 = 86_400;
 /// A self-referential struct (e.g. `Node { children: Vec<Node> }`) is legal Rust
 /// but produces unbounded mutual recursion in the generated restore helpers.
 /// A corrupt/hostile 64MB frame could otherwise drive millions of nested calls
 /// and overflow the stack — which `catch_unwind` cannot catch (it aborts). Both
 /// the Rust `Decoder` and the Go `dec` enforce this same limit symmetrically.
 const MAX_RESTORE_DEPTH: u32 = 64;
-
-const ENV_SERVER_OVERRIDE: &str = "RUST2GO_IPC_SERVER_OVERRIDE";
-const ENV_SYNC_TIMEOUT: &str = "RUST2GO_IPC_SYNC_TIMEOUT_SECS";
-const ENV_ENDPOINT_OVERRIDE: &str = "RUST2GO_IPC_ENDPOINT_OVERRIDE";
-const ENV_PORT_OVERRIDE: &str = "RUST2GO_IPC_PORT_OVERRIDE";
 
 /// Transport is chosen from the compile target, not from runtime probing:
 /// UDS on Unix, TCP loopback everywhere else (Windows, wasi, ...).
@@ -103,47 +87,19 @@ struct Endpoint {
     addr: String,
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    env::var(key).ok().filter(|v| !v.is_empty())
-}
-
-/// Resolve the port override: a non-empty, parseable, non-zero `u16` wins,
-/// otherwise fall back to the build-time port. Kept as a pure function so the
-/// `0`-is-rejected contract can be unit-tested against the real parsing path
-/// rather than a copy of it.
+/// Resolve the port override from the startup snapshot: a valid non-zero
+/// override wins, otherwise fall back to the build-time port. The pure parser
+/// lives in `result` so the `0`-is-rejected contract is tested against the very
+/// code that builds the snapshot.
 fn resolve_port_override(default: u16) -> u16 {
-    env_nonempty(ENV_PORT_OVERRIDE)
-        .and_then(|v| v.parse::<u16>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
+    config().port_override.unwrap_or(default)
 }
 
-/// Read a positive seconds value from `key`, clamped to `1..=max`.
-///
-/// Both bounds matter: 0 would disable the deadline entirely, while a huge but
-/// syntactically valid u64 (e.g. `u64::MAX`) turns "30 s timeout" into an
-/// effectively infinite wait, so a wedged Go handler blocks the caller forever
-/// with no diagnostic. Out-of-range values warn on stderr and fall back rather
-/// than panic — env parsing happens on business call paths and in the runtime
-/// init closure, and a panic there would either crash the process or poison the
-/// one-shot runtime for the entire process lifetime.
-fn bounded_env_secs(key: &'static str, max: u64, default: u64) -> u64 {
-    match env_nonempty(key) {
-        Some(v) => match v.parse::<u64>() {
-            Ok(n) if (1..=max).contains(&n) => n,
-            _ => {
-                crate::result::warn_invalid_env_once(key, &v, max, default);
-                default
-            }
-        },
-        None => default,
-    }
-}
-
-/// Read the synchronous-call timeout, rejecting 0 and absurdly large values so
-/// a misconfiguration cannot disable the deadline entirely.
+/// Synchronous-call read deadline from the startup snapshot. Rejecting 0 and
+/// absurdly large values happens once at startup in `Config`, so a
+/// misconfiguration cannot disable the deadline entirely.
 pub fn sync_timeout_secs() -> u64 {
-    bounded_env_secs(ENV_SYNC_TIMEOUT, MAX_SYNC_TIMEOUT, DEFAULT_SYNC_TIMEOUT)
+    config().sync_timeout_secs
 }
 
 /// Resolve the endpoint shared by the Rust client and the Go server.
@@ -155,8 +111,16 @@ pub fn sync_timeout_secs() -> u64 {
 /// owning uid (the generated Go server does exactly that). Allowing an override
 /// back to TCP would silently reopen that attack surface, so it is removed.
 fn resolve_endpoint(port: u16) -> Endpoint {
+    resolve_endpoint_with(port, config().endpoint_override.as_deref())
+}
+
+/// Pure endpoint resolution. Taking the override as a parameter lets tests
+/// exercise the real path without mutating process-global env (and without
+/// racing the startup snapshot), while production always feeds it the frozen
+/// value from [`config`].
+fn resolve_endpoint_with(port: u16, endpoint_override: Option<&str>) -> Endpoint {
     let transport = default_transport();
-    if let Some(addr) = env_nonempty(ENV_ENDPOINT_OVERRIDE) {
+    if let Some(addr) = endpoint_override {
         // The Go server fail-closes on >=100-byte UDS endpoints with a panic.
         // Apply the same bound here so Rust fails at startup with a clear
         // message instead of looping through respawns until the 30s deadline.
@@ -164,12 +128,15 @@ fn resolve_endpoint(port: u16) -> Endpoint {
         {
             if transport == Transport::Unix && addr.len() >= 100 {
                 panic!(
-                    "rust2go-ipc: {ENV_ENDPOINT_OVERRIDE} Unix socket path must be <100 bytes, got {}",
+                    "rust2go-ipc: RUST2GO_IPC_ENDPOINT_OVERRIDE Unix socket path must be <100 bytes, got {}",
                     addr.len()
                 );
             }
         }
-        return Endpoint { transport, addr };
+        return Endpoint {
+            transport,
+            addr: addr.to_owned(),
+        };
     }
     match transport {
         #[cfg(unix)]
@@ -188,7 +155,7 @@ fn resolve_endpoint(port: u16) -> Endpoint {
             // (bind lands in a non-existent dir -> 30s startup panic). Detect
             // that case and use the fixed ASCII fallback instead.
             let dir_name = format!("rust2go-ipc-{}-{}.d", process_id(), port);
-            let preferred = env::temp_dir().join(&dir_name);
+            let preferred = std::env::temp_dir().join(&dir_name);
             let preferred_addr = preferred.join("ipc.sock");
             let utf8_ok = preferred_addr
                 .to_str()
@@ -621,10 +588,27 @@ fn spawn_server_locked(server: &str, port: u16, endpoint: &Endpoint) -> Child {
     // os.WriteFile(0666) outputs into 0600. Socket isolation is instead done by
     // placing the UDS inside a 0700 private directory created in
     // resolve_endpoint(), so no process-wide setting leaks into user code.
+    // Pass the startup snapshot explicitly. The child would otherwise inherit
+    // whatever the process env holds at (re)spawn time, so a mid-process env
+    // mutation could give the Go server a *different* timeout/concurrency than
+    // the frozen Rust config. These values are set unconditionally: an absent
+    // override must clear any stale inherited value so a respawn sees exactly
+    // the snapshot. Go reads `os.Getenv(...) != ""`, so empty means "default".
+    let cfg = config();
     let child = Command::new(server)
         .env("RUST2GO_IPC_PORT", port.to_string())
         .env("RUST2GO_IPC_TRANSPORT", endpoint.transport.as_str())
         .env("RUST2GO_IPC_ENDPOINT", &endpoint.addr)
+        .env(
+            "RUST2GO_IPC_SYNC_TIMEOUT_SECS",
+            cfg.sync_timeout_secs.to_string(),
+        )
+        .env(
+            "RUST2GO_IPC_MAX_CONCURRENCY",
+            cfg.max_concurrency
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        )
         // Isolate the child from the parent's stdio. stdin is unused; stdout
         // has no protocol meaning here. stderr is deliberately inherited so
         // a Go-side panic remains diagnosable (the Rust side also logs the
@@ -675,7 +659,11 @@ fn set_stream_timeouts(writer: &mut IpcStream, reader: &mut IpcStream) -> std::i
 fn runtime(server: &str, port: u16) -> &'static Runtime {
     // Build-time paths live under OUT_DIR and do not exist in a stripped
     // runtime image; let deployment point at the copied binary.
-    let server = env_nonempty(ENV_SERVER_OVERRIDE).unwrap_or_else(|| server.to_string());
+    let cfg = config();
+    let server = cfg
+        .server_override
+        .clone()
+        .unwrap_or_else(|| server.to_string());
     let port = resolve_port_override(port);
     ATEXIT.call_once(|| {
         #[cfg(unix)]
@@ -700,7 +688,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
         // init closure — doing it on every dispatch would see our own live
         // server holding the port and falsely reselect each call.
         let mut port = port;
-        if env_nonempty(ENV_ENDPOINT_OVERRIDE).is_none()
+        if cfg.endpoint_override.is_none()
             && default_transport() == Transport::Tcp
             && TcpListener::bind(("127.0.0.1", port)).is_err()
         {
@@ -790,11 +778,7 @@ fn runtime(server: &str, port: u16) -> &'static Runtime {
             kill_and_reap(&mut child);
             panic!("rust2go-ipc: cannot configure IPC stream timeouts: {e}");
         }
-        let ttl = bounded_env_secs(
-            "RUST2GO_IPC_PENDING_TTL_SECS",
-            MAX_PENDING_TTL,
-            DEFAULT_PENDING_TTL,
-        );
+        let ttl = config().pending_ttl_secs;
 
         // Box::leak gives the reactor a `&'static Runtime` up front, removing
         // the startup spin-wait on OnceLock and letting a spawn failure below

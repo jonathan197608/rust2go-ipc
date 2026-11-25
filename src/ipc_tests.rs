@@ -1,10 +1,6 @@
 use super::*;
+use crate::result::{parse_bounded_secs, parse_port_override};
 use std::mem::align_of;
-
-// Env vars are process-global. cargo test runs tests in parallel threads, so
-// tests that set/remove any RUST2GO_IPC_* env var must serialize or one can
-// observe another's value and fail spuriously.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn child_pid_keeps_full_u32_range() {
@@ -125,20 +121,15 @@ fn empty_lists_use_null_pointer() {
 fn unix_transport_is_forced_to_uds_even_with_tcp_endpoint() {
     // Unix builds pin transport to UDS; no environment variable may switch it
     // to TCP. An endpoint override is still honoured, but only as a UDS path.
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(ENV_ENDPOINT_OVERRIDE, "127.0.0.1:9999");
-    let ep = resolve_endpoint(1234);
+    let ep = resolve_endpoint_with(1234, Some("127.0.0.1:9999"));
     assert_eq!(ep.transport, Transport::Unix);
     assert_eq!(ep.addr, "127.0.0.1:9999");
-    std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
 }
 
 #[cfg(unix)]
 #[test]
 fn unix_default_endpoint_is_a_uds_path() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
-    let ep = resolve_endpoint(4321);
+    let ep = resolve_endpoint_with(4321, None);
     assert_eq!(ep.transport, Transport::Unix);
     assert!(
         ep.addr.ends_with("/ipc.sock"),
@@ -160,9 +151,7 @@ fn unix_umask_regression_does_not_need_process_wide_restriction() {
     // Guard the reason the socket is in a private dir: a pre_exec umask would
     // leak into the Go business handlers. This test just asserts the endpoint
     // carries a directory component (so isolation is directory-based).
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(ENV_ENDPOINT_OVERRIDE);
-    let ep = resolve_endpoint(4322);
+    let ep = resolve_endpoint_with(4322, None);
     let p = std::path::Path::new(&ep.addr);
     assert!(p.parent().and_then(|d| d.file_name()).is_some());
     assert_eq!(p.file_name().unwrap(), "ipc.sock");
@@ -170,31 +159,34 @@ fn unix_umask_regression_does_not_need_process_wide_restriction() {
 
 #[test]
 fn port_override_zero_is_rejected() {
-    // Exercise the real parsing path used by runtime(), not a copy of it — a
-    // copy would still pass if the production filter were deleted.
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let saved = env::var(ENV_PORT_OVERRIDE).ok();
-
-    std::env::set_var(ENV_PORT_OVERRIDE, "0");
-    assert_eq!(resolve_port_override(7777), 7777, "port 0 must fall back");
-
-    std::env::set_var(ENV_PORT_OVERRIDE, "not-a-port");
-    assert_eq!(resolve_port_override(7777), 7777, "garbage must fall back");
-
-    std::env::set_var(ENV_PORT_OVERRIDE, "65536");
+    // Exercise the real parser used when the startup snapshot is built, not
+    // a copy — a copy would still pass if the production filter were deleted.
+    // Pure function: no env mutation, so it is immune to the frozen snapshot.
     assert_eq!(
-        resolve_port_override(7777),
-        7777,
-        "out-of-u16 must fall back"
+        parse_port_override(Some("0".into())),
+        None,
+        "port 0 rejected"
     );
+    assert_eq!(parse_port_override(Some("not-a-port".into())), None);
+    assert_eq!(parse_port_override(Some("65536".into())), None);
+    assert_eq!(parse_port_override(Some("5555".into())), Some(5555));
+    assert_eq!(parse_port_override(None), None);
+}
 
-    std::env::set_var(ENV_PORT_OVERRIDE, "5555");
-    assert_eq!(resolve_port_override(7777), 5555, "valid port must win");
-
-    match saved {
-        Some(v) => std::env::set_var(ENV_PORT_OVERRIDE, v),
-        None => std::env::remove_var(ENV_PORT_OVERRIDE),
-    }
+#[test]
+fn config_snapshot_is_frozen_after_first_access() {
+    // The whole point of the unified snapshot: all accessors read the SAME
+    // frozen values, and repeated access is stable. Mutating the real env here
+    // cannot be asserted reliably (the snapshot may already be initialized by
+    // another thread), so verify identity + range instead: every accessor must
+    // agree with the single Config instance.
+    let cfg = config();
+    assert_eq!(sync_timeout_secs(), cfg.sync_timeout_secs);
+    assert_eq!(crate::result::async_timeout_secs(), cfg.async_timeout_secs);
+    assert!(config().sync_timeout_secs == cfg.sync_timeout_secs);
+    assert!((1..=86_400).contains(&cfg.sync_timeout_secs));
+    assert!((1..=86_400).contains(&cfg.async_timeout_secs));
+    assert!((1..=86_400).contains(&cfg.pending_ttl_secs));
 }
 
 // A Read that yields a fixed set of byte chunks, then either blocks forever
@@ -354,19 +346,20 @@ fn sync_result_oversized_payload_returns_err_without_panicking() {
 
 #[test]
 fn bounded_env_secs_accepts_valid_range() {
-    let key = "RUST2GO_IPC_TEST_BOUNDED_SECS";
-    let _g = ENV_LOCK.lock().unwrap();
+    // Pure parser — the exact function the startup snapshot calls. No env
+    // mutation, so no race with the process-wide snapshot initialization.
     for (raw, expected) in [("1", 1), ("30", 30), ("86400", 86400)] {
-        std::env::set_var(key, raw);
-        assert_eq!(bounded_env_secs(key, 86400, 30), expected, "raw={raw}");
+        assert_eq!(
+            parse_bounded_secs("test", Some(raw.into()), 86400, 30),
+            expected,
+            "raw={raw}"
+        );
     }
-    std::env::remove_var(key);
+    assert_eq!(parse_bounded_secs("test", None, 86400, 30), 30);
 }
 
 #[test]
 fn bounded_env_secs_rejects_zero_overflow_and_garbage() {
-    let key = "RUST2GO_IPC_TEST_BOUNDED_SECS";
-    let _g = ENV_LOCK.lock().unwrap();
     // 0, negatives, float, leading whitespace, above-max, overflow and
     // absurd-but-valid u64 all fall back to the default.
     for raw in [
@@ -378,16 +371,15 @@ fn bounded_env_secs_rejects_zero_overflow_and_garbage() {
         "18446744073709551615",
         "abc",
     ] {
-        std::env::set_var(key, raw);
-        assert_eq!(bounded_env_secs(key, 86400, 30), 30, "raw={raw}");
+        assert_eq!(
+            parse_bounded_secs("test", Some(raw.into()), 86400, 30),
+            30,
+            "raw={raw}"
+        );
     }
     // A leading '+' is a valid integer literal for both Rust's u64::from_str
     // and Go's strconv.ParseInt, so both transports agree on the same value.
-    std::env::set_var(key, "+5");
-    assert_eq!(bounded_env_secs(key, 86400, 30), 5);
-    // Unset also yields the default.
-    std::env::remove_var(key);
-    assert_eq!(bounded_env_secs(key, 86400, 30), 30);
+    assert_eq!(parse_bounded_secs("test", Some("+5".into()), 86400, 30), 5);
 }
 
 #[test]

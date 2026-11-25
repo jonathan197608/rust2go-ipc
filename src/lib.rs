@@ -28,7 +28,9 @@ pub const DEFAULT_BINDING_FILE: &str = "_go_bindings.rs";
 /// Transport-level error and timeout config for the optional `#[r2g_result]`
 /// wrapper (companion crate `rust2go-ipc-result`). Dependency-free by design.
 pub mod result;
-pub use result::{async_timeout, async_timeout_secs, IpcError, DEFAULT_ASYNC_TIMEOUT};
+pub use result::{
+    async_timeout, async_timeout_secs, config, Config, IpcError, DEFAULT_ASYNC_TIMEOUT,
+};
 
 #[cfg(feature = "build")]
 mod builder;
