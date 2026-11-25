@@ -1266,3 +1266,64 @@ pub trait T {
         "every generated fn must allow unused_variables: {allow_lines:?}"
     );
 }
+
+#[test]
+fn nested_path_inside_generic_type_fails_fast() {
+    // Upstream converter recurses into List elements via ParamType::try_from
+    // (common.rs:827-841) and panics on a multi-segment path. The top-level
+    // `Vec` is single-segment, so a shallow check misses this.
+    let result = std::panic::catch_unwind(|| {
+        parse_schema(
+            r#"
+#[derive(R2G, Default)]
+pub struct Req { pub id: i32 }
+#[r2g]
+pub trait T { fn f(r: Vec<self::Req>) -> bool; }
+"#,
+        )
+    });
+    assert!(
+        result.is_err(),
+        "multi-segment type nested inside Vec must fail fast"
+    );
+}
+
+#[test]
+fn reference_return_type_fails_fast() {
+    // Upstream r2g.rs:95 accepts only Type::Path / impl Future for returns;
+    // Type::Reference is rejected. The builder's resp strips `&` before the
+    // path check, so without a raw-output guard it silently emits a stub.
+    let result = std::panic::catch_unwind(|| {
+        parse_schema(
+            r#"
+#[derive(R2G, Default)]
+pub struct Req { pub v: i32 }
+#[r2g]
+pub trait T { fn get() -> &Req; }
+"#,
+        )
+    });
+    assert!(result.is_err(), "reference return type must fail fast");
+}
+
+#[test]
+fn nested_path_in_struct_field_fails_fast() {
+    // Struct fields go through upstream ParamType::try_to_segment too; the
+    // method-level checks must not leave this path open.
+    let result = std::panic::catch_unwind(|| {
+        parse_schema(
+            r#"
+#[derive(R2G, Default)]
+pub struct Req { pub id: i32 }
+#[derive(R2G, Default)]
+pub struct Wrap { pub inner: self::Req }
+#[r2g]
+pub trait T { fn f(w: Wrap) -> bool; }
+"#,
+        )
+    });
+    assert!(
+        result.is_err(),
+        "multi-segment type in an R2G struct field must fail fast"
+    );
+}

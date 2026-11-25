@@ -802,23 +802,21 @@ fn parse_schema(src: &str) -> Schema {
                 !(f.sig.asyncness.is_some() && resp.is_none()),
                 "rust2go-ipc: async method `{name}` must have a return value (upstream #[r2g] rejects it)"
             );
-            // Upstream `type_to_segment` accepts single-segment paths only in
-            // method signatures. A nested module type must be imported with
-            // `use` and spelled as its bare name; spelling `types::Req` out
-            // only produces a binding the upstream macro cannot compile.
-            for ty in resp
-                .iter()
-                .cloned()
-                .chain(f.sig.inputs.iter().filter_map(|arg| match arg {
-                    FnArg::Typed(p) => Some(strip_reference(&p.ty).0),
-                    _ => None,
-                }))
-            {
-                if let Type::Path(p) = ty {
-                    assert!(
-                        p.path.leading_colon.is_none() && p.path.segments.len() == 1,
-                        "rust2go-ipc: multi-segment types in method `{name}` are rejected by upstream #[r2g]; use a single-segment alias (`use m::T;` then `T`)"
-                    );
+            // Upstream `type_to_segment` accepts single-segment paths only,
+            // and its List converter recurses into element types. Check the
+            // RAW types (before `strip_reference`) so `&types::Req` and
+            // `Vec<types::Req>` are rejected here instead of panicking inside
+            // the upstream macro at the consumer's compile time.
+            if let ReturnType::Type(_, ty) = &f.sig.output {
+                assert!(
+                    !matches!(&**ty, Type::Reference(_)),
+                    "rust2go-ipc: reference return type in method `{name}` is rejected by upstream #[r2g]; only path types and `impl Future` returns are supported"
+                );
+                reject_qualified_paths(ty, &format!("method `{name}` return"));
+            }
+            for arg in &f.sig.inputs {
+                if let FnArg::Typed(p) = arg {
+                    reject_qualified_paths(&p.ty, &format!("parameter in method `{name}`"));
                 }
             }
             let mut params = Vec::new();
@@ -973,6 +971,44 @@ fn path_last_segment(path: &syn::Path) -> String {
         .unwrap_or_default()
 }
 
+/// Upstream rust2go-common calls `type_to_segment` on every path type and
+/// recurses into List element types when building converters. Both require a
+/// single, unqualified path segment. Reject qualified paths recursively so a
+/// nested `types::Req` fails at schema parse time instead of panicking inside
+/// the upstream macro when the consumer compiles its generated code.
+fn reject_qualified_paths(ty: &Type, ctx: &str) {
+    match ty {
+        Type::Path(p) => {
+            assert!(
+                p.path.leading_colon.is_none() && p.path.segments.len() == 1,
+                "rust2go-ipc: multi-segment type in {ctx} is rejected by upstream #[r2g]; use a single-segment alias (`use m::T;` then `T`)"
+            );
+            for seg in &p.path.segments {
+                match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(args) => {
+                        for arg in &args.args {
+                            if let syn::GenericArgument::Type(t) = arg {
+                                reject_qualified_paths(t, ctx);
+                            }
+                        }
+                    }
+                    syn::PathArguments::Parenthesized(args) => {
+                        for t in &args.inputs {
+                            reject_qualified_paths(t, ctx);
+                        }
+                        if let ReturnType::Type(_, t) = &args.output {
+                            reject_qualified_paths(t, ctx);
+                        }
+                    }
+                    syn::PathArguments::None => {}
+                }
+            }
+        }
+        Type::Reference(r) => reject_qualified_paths(&r.elem, ctx),
+        _ => {}
+    }
+}
+
 fn has_last_segment(path: &syn::Path, name: &str) -> bool {
     path_last_segment(path) == name
 }
@@ -1038,6 +1074,10 @@ fn parse_struct(s: &ItemStruct, module_path: Vec<String>) -> StructDef {
                     &f.attrs,
                     &format!("field `{name}.{fname}`"),
                 );
+                // Struct fields go through the same upstream ParamType
+                // conversion as method params; a qualified path (including
+                // inside a List element) makes upstream panic at derive time.
+                reject_qualified_paths(&f.ty, &format!("field `{name}.{fname}`"));
                 FieldDef {
                     name: fname,
                     ty: strip_reference(&f.ty).0,
