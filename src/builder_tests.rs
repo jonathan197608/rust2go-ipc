@@ -530,14 +530,18 @@ trait T { fn f() -> maxRestoreDepth; }
 
 #[test]
 fn nested_module_r2g_types_are_collected() {
+    // A nested type must be imported with `use` and spelled as a bare name:
+    // upstream type_to_segment rejects multi-segment paths in signatures, but
+    // the struct's module_path is still needed to address it from `binding`.
     let src = r#"
 mod types {
     #[derive(R2G, Default)]
     pub struct Req { pub id: i32 }
 }
 mod api {
+    use super::types::Req;
     #[r2g]
-    pub trait T { fn f(r: types::Req) -> types::Req; }
+    pub trait T { fn f(r: Req) -> Req; }
 }
 "#;
     let schema = parse_schema(src);
@@ -1170,4 +1174,95 @@ pub trait T {{
             "#[{attr}] is not supported over IPC and must fail fast"
         );
     }
+}
+
+#[test]
+fn mutable_reference_params_fail_fast() {
+    // Upstream rust2go-common ParamType::to_tokens drops `mut` (only emits
+    // `&`), so a trait declaring `&mut T` makes its generated Impl signature
+    // `fn(&T)` — E0053 against the trait. There is no configuration in which
+    // the generated binding is usable; reject at parse time.
+    let result = std::panic::catch_unwind(|| {
+        parse_schema(
+            r#"
+#[derive(R2G, Default)]
+pub struct Buf { pub data: Vec<u8> }
+#[r2g]
+pub trait T {
+    fn sync_mut(b: &mut Buf);
+    async fn async_mut(b: &mut Buf) -> Buf;
+}
+"#,
+        )
+    });
+    assert!(
+        result.is_err(),
+        "&mut params are incompatible with upstream #[r2g] and must fail fast"
+    );
+}
+
+#[test]
+fn async_without_return_fails_fast() {
+    // Upstream rejects `async fn` without a return value ("async function must
+    // have a return value"). Without a guard the builder silently emits a
+    // oneway stub that can never be called from a successfully compiled crate.
+    let result = std::panic::catch_unwind(|| {
+        parse_schema(
+            r#"
+#[r2g]
+pub trait T { async fn ping(); }
+"#,
+        )
+    });
+    assert!(result.is_err(), "async without response must fail fast");
+}
+
+#[test]
+fn multi_segment_param_type_fails_fast() {
+    // Upstream type_to_segment rejects multi-segment paths in method
+    // signatures. `use types::Req;` + a single-segment `Req` stays supported
+    // (see nested_module_r2g_types_are_collected), but spelling the path out
+    // in the trait only produces a binding that cannot compile.
+    let result = std::panic::catch_unwind(|| {
+        parse_schema(
+            r#"
+mod types {
+    #[derive(R2G, Default)]
+    pub struct Req { pub id: i32 }
+}
+#[r2g]
+pub trait T { fn f(r: types::Req) -> types::Req; }
+"#,
+        )
+    });
+    assert!(
+        result.is_err(),
+        "multi-segment parameter/return types must fail fast"
+    );
+}
+
+#[test]
+fn generated_stubs_allow_unused_variables_for_zero_param_methods() {
+    // A zero-parameter method emits `let mut enc = Encoder::new(); { let enc =
+    // &mut enc; }` — the inner binding is unused. Consumers with
+    // `#![deny(warnings)]` would otherwise fail to compile the binding.
+    let schema = parse_schema(
+        r#"
+#[r2g]
+pub trait T {
+    fn ping();
+    async fn aping() -> bool;
+}
+"#,
+    );
+    let rust = generate_rust_bindings(&schema, 1).to_string();
+    let allow_lines: Vec<&str> = rust
+        .lines()
+        .filter(|l| l.contains("missing_safety_doc"))
+        .collect();
+    assert!(!allow_lines.is_empty(), "stub allow attributes missing");
+    assert!(
+        allow_lines.iter().all(|l| l.contains("unused_variables")),
+        "every generated fn must allow unused_variables: {allow_lines:?}"
+    );
 }

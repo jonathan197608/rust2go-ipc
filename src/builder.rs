@@ -794,6 +794,33 @@ fn parse_schema(src: &str) -> Schema {
                 ReturnType::Type(_, ty) => Some(strip_reference(ty).0),
                 ReturnType::Default => None,
             };
+            // Upstream rejects `async fn` without a response ("async function
+            // must have a return value"). Without this guard the builder
+            // silently emits a oneway stub that can never be called from a
+            // successfully compiled crate.
+            assert!(
+                !(f.sig.asyncness.is_some() && resp.is_none()),
+                "rust2go-ipc: async method `{name}` must have a return value (upstream #[r2g] rejects it)"
+            );
+            // Upstream `type_to_segment` accepts single-segment paths only in
+            // method signatures. A nested module type must be imported with
+            // `use` and spelled as its bare name; spelling `types::Req` out
+            // only produces a binding the upstream macro cannot compile.
+            for ty in resp
+                .iter()
+                .cloned()
+                .chain(f.sig.inputs.iter().filter_map(|arg| match arg {
+                    FnArg::Typed(p) => Some(strip_reference(&p.ty).0),
+                    _ => None,
+                }))
+            {
+                if let Type::Path(p) = ty {
+                    assert!(
+                        p.path.leading_colon.is_none() && p.path.segments.len() == 1,
+                        "rust2go-ipc: multi-segment types in method `{name}` are rejected by upstream #[r2g]; use a single-segment alias (`use m::T;` then `T`)"
+                    );
+                }
+            }
             let mut params = Vec::new();
             let mut param_names = HashSet::new();
             for arg in &f.sig.inputs {
@@ -822,6 +849,14 @@ fn parse_schema(src: &str) -> Schema {
                     "rust2go-ipc: parameter name `{pname}` conflicts with a generated identifier; rename it"
                 );
                 let is_mutable = matches!(&*p.ty, Type::Reference(r) if r.mutability.is_some());
+                // Upstream `ParamType::to_tokens` emits `&T` for any reference
+                // param and drops `mut`, so its generated Impl signature is
+                // `fn(&T)` while the trait declares `fn(&mut T)` — E0053 in
+                // every consumer. No configuration makes this usable.
+                assert!(
+                    !is_mutable,
+                    "rust2go-ipc: `&mut` parameter `{pname}` is unsupported by upstream #[r2g]; use an owned value or `&T`"
+                );
                 let (ty, is_reference) = strip_reference(&p.ty);
                 params.push(ParamDef {
                     name: pname,
@@ -1684,7 +1719,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     }
                 };
                 out.extend(quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, unused_variables, unsafe_op_in_unsafe_fn)]
                     pub unsafe fn #stub(#(#param_decls,)* #slot_cb) {
                         let mut enc = ::rust2go::ipc::Encoder::new();
                         {
@@ -1752,7 +1787,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     let flatten_for_try = flatten_stmts.clone();
                     let to_ref_for_try = to_ref_stmts.clone();
                     out.extend(quote! {
-                        #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref, unsafe_op_in_unsafe_fn)]
+                        #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref, unused_variables, unsafe_op_in_unsafe_fn)]
                         pub unsafe fn #try_stub(#(#owned_param_decls,)*)
                             -> ::core::result::Result<#resp_owned, ::rust2go::IpcError>
                         {
@@ -1855,7 +1890,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                     }
                 };
                 out.extend(quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, unused_variables, unsafe_op_in_unsafe_fn)]
                     unsafe extern "C-unwind" fn #tramp(
                         payload: *const u8,
                         len: usize,
@@ -1874,7 +1909,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 });
                 if is_async {
                     out.extend(quote! {
-                        #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
+                        #[allow(non_snake_case, clippy::missing_safety_doc, unused_variables, unsafe_op_in_unsafe_fn)]
                         unsafe fn #cleanup(slot: *const ()) {
                             drop(::rust2go::SlotWriter::<
                                 #resp_owned,
@@ -1889,7 +1924,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                 let flatten_for_try = flatten_stmts.clone();
                 let to_ref_for_try = to_ref_stmts.clone();
                 out.extend(quote! {
-                    #[allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, unused_variables, unsafe_op_in_unsafe_fn)]
                     pub unsafe fn #stub(#(#param_decls,)*) {
                         let mut enc = ::rust2go::ipc::Encoder::new();
                         {
@@ -1909,7 +1944,7 @@ fn generate_rust_bindings(schema: &Schema, port: u16) -> TokenStream {
                         }
                     }
 
-                    #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref, unsafe_op_in_unsafe_fn)]
+                    #[allow(non_snake_case, clippy::missing_safety_doc, clippy::useless_transmute, clippy::transmute_ptr_to_ref, unused_variables, unsafe_op_in_unsafe_fn)]
                     pub unsafe fn #try_stub(#(#owned_param_decls,)*)
                         -> ::core::result::Result<(), ::rust2go::IpcError>
                     {
