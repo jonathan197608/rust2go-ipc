@@ -36,13 +36,13 @@ use std::process::id as process_id;
 
 const MAGIC: [u8; 4] = *b"R2GI";
 const VERSION: u16 = 1;
-/// Maximum encoded request/response payload (64 MiB).
+/// Maximum encoded request/response payload (256 MiB).
 ///
 /// Public because generated `#[r2g_result]` async wrappers pre-flight the
 /// encoded payload length before creating the upstream future: the upstream
 /// `SlotWriter` has no error channel, so an oversized async request discovered
 /// inside `dispatch` would panic at poll time (fatal under `panic = "abort"`).
-pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+pub const MAX_PAYLOAD: usize = 256 * 1024 * 1024;
 const SWEEP_INTERVAL: u64 = 30;
 /// A self-referential struct (e.g. `Node { children: Vec<Node> }`) is legal Rust
 /// but produces unbounded mutual recursion in the generated restore helpers.

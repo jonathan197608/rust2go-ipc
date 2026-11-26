@@ -3,6 +3,11 @@ use crate::result::{parse_bounded_secs, parse_port_override};
 use std::mem::align_of;
 
 #[test]
+fn max_payload_is_256_mib() {
+    assert_eq!(MAX_PAYLOAD, 256 * 1024 * 1024);
+}
+
+#[test]
 fn child_pid_keeps_full_u32_range() {
     // Windows pids can exceed i32::MAX. The atexit hook must see the exact u32
     // value so taskkill targets the right process; storing as AtomicI32 would

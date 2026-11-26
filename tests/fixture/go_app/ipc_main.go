@@ -214,7 +214,7 @@ func serve(conn net.Conn) {
 		reqID := binary.LittleEndian.Uint64(hdr[6:14])
 		methodID := binary.LittleEndian.Uint32(hdr[14:18])
 		length32 := binary.LittleEndian.Uint32(hdr[18:22])
-		if length32 > 64*1024*1024 {
+		if length32 > 256*1024*1024 {
 			return
 		}
 		// Own the payload before handing it to a goroutine: the read buffer is
@@ -256,7 +256,7 @@ func serve(conn net.Conn) {
 				return
 			}
 			status := byte(0)
-			if !ok || len(resp) > 64*1024*1024 {
+			if !ok || len(resp) > 256*1024*1024 {
 				status = 1
 				resp = nil
 			}

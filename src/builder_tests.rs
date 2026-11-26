@@ -192,6 +192,16 @@ fn nested_struct_and_short_string_list_generate_correct_go() {
 }
 
 #[test]
+fn go_server_payload_cap_matches_rust_limit() {
+    let main = generate_go_main();
+    assert!(
+        main.contains("256*1024*1024"),
+        "Go server payload cap must be 256 MiB"
+    );
+    assert!(!main.contains("64*1024*1024"), "stale Go payload cap");
+}
+
+#[test]
 fn go_server_dispatches_concurrently_with_bounded_semaphore() {
     let main = generate_go_main();
     // Each accepted connection's serve loop must dispatch in a goroutine so a

@@ -85,7 +85,7 @@ If you need isolation from other local users on a non-Unix platform, run the who
 ## Limitations
 
 - Transport is fixed by compile target and cannot be overridden: **UDS on Unix, TCP loopback elsewhere**. On Unix the socket node is created with mode `0600`, and the Go server fails closed if it is ever asked to bind TCP. There is no `RUST2GO_IPC_TRANSPORT_OVERRIDE`; the unsuffixed `RUST2GO_IPC_TRANSPORT` / `RUST2GO_IPC_ENDPOINT` variables are forwarded to the Go child for internal use.
-- Request/response payloads are capped at 64 MiB. Go responses over the cap are converted to error status. With `#[r2g_result]`, oversized async requests are rejected before the upstream future is created and surface as `Err(IpcError::PayloadTooLarge)`; raw `#[r2g]` async calls still panic at poll time.
+- Request/response payloads are capped at 256 MiB. Go responses over the cap are converted to error status. With `#[r2g_result]`, oversized async requests are rejected before the upstream future is created and surface as `Err(IpcError::PayloadTooLarge)`; raw `#[r2g]` async calls still panic at poll time.
 - `i128`/`u128`, nested lists, and lists of empty structs are intentionally unsupported and fail at build time with an explicit message (an empty struct occupies zero wire bytes, so a non-empty list cannot round-trip).
 - The Rust process kills and reaps the Go child on normal exit via an atexit hook. A `SIGKILL`-style hard kill cannot be covered.
 - Go handlers run concurrently on the shared connection and responses may arrive out of order; they are matched by request id. Do not rely on handler execution order — make shared Go state concurrency-safe, as with the original cgo path.
